@@ -2716,12 +2716,12 @@ RUNTIME_FUNCTION(Runtime_WasmStringToUtf8Array) {
   HandleScope scope(isolate);
   DirectHandle<String> string(Cast<String>(args[0]), isolate);
   int32_t shared = args.smi_value_at(1);
+  string = String::Flatten(isolate, string);
   uint32_t length = MeasureWtf8(isolate, string);
   constexpr int kElemSize = wasm::kWasmI8.value_kind_size();
   if (length > static_cast<uint32_t>(WasmArray::MaxLength(kElemSize))) {
     return ThrowWasmError(isolate, MessageTemplate::kWasmTrapArrayTooLarge);
   }
-  wasm::WasmValue initial_value(int8_t{0});
   Tagged<WeakFixedArray> rtts = isolate->heap()->wasm_canonical_rtts();
   // This function can only get called from Wasm code, so we can safely assume
   // that the canonical RTT is still around.
@@ -2736,19 +2736,27 @@ RUNTIME_FUNCTION(Runtime_WasmStringToUtf8Array) {
       isolate);
   AllocationType allocation =
       shared ? AllocationType::kSharedOld : AllocationType::kYoung;
-  DirectHandle<WasmArray> array =
-      isolate->factory()->NewWasmArray(wasm::kWasmI8, length, initial_value,
-                                       map, allocation, SKIP_WRITE_BARRIER);
-  auto get_writable_bytes =
-      [&](const DisallowGarbageCollection&) -> base::Vector<char> {
-    return {reinterpret_cast<char*>(array->ElementAddress(0)), length};
-  };
-  Tagged<Object> write_result =
-      EncodeWtf8(isolate, unibrow::Utf8Variant::kLossyUtf8, string,
-                 get_writable_bytes, 0, MessageTemplate::kNone);
-  DCHECK(IsNumber(write_result) && Object::NumberValue(write_result) == length);
-  USE(write_result);
-  return *array;
+  // Every byte of the array gets written by {EncodeWtf8} below, so there is
+  // no need to zero-initialize it. No GC may happen between the allocation
+  // and the initialization.
+  SharedObjectConditionalSafePublishGuard publish_guard(allocation);
+  Tagged<WasmArray> array =
+      isolate->factory()->NewWasmArrayUninitialized(length, map, allocation);
+  DisallowGarbageCollection no_gc;
+  String::FlatContent content = string->GetFlatContent(no_gc);
+  DCHECK(content.IsFlat());
+  base::Vector<char> dst{reinterpret_cast<char*>(array->ElementAddress(0)),
+                         length};
+  constexpr auto kVariant = unibrow::Utf8Variant::kLossyUtf8;
+  MessageTemplate message = MessageTemplate::kNone;
+  int written = content.IsOneByte()
+                    ? EncodeWtf8(dst, 0, content.ToOneByteVector(), kVariant,
+                                 &message, MessageTemplate::kNone)
+                    : EncodeWtf8(dst, 0, content.ToUC16Vector(), kVariant,
+                                 &message, MessageTemplate::kNone);
+  DCHECK_EQ(written, static_cast<int>(length));
+  USE(written);
+  return array;
 }
 
 RUNTIME_FUNCTION(Runtime_WasmStringEncodeWtf16) {
