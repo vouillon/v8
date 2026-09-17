@@ -36,6 +36,9 @@ class WasmBuiltinsAssembler : public CodeStubAssembler {
   TNode<Float64T> StringToFloat64(TNode<String>);
 
   TNode<BoolT> InSharedSpace(TNode<HeapObject>);
+
+  // The isolate's table of canonical RTTs, indexed by canonical type index.
+  TNode<WeakFixedArray> LoadWasmCanonicalRtts();
 };
 
 }  // namespace internal

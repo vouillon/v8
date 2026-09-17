@@ -16,6 +16,10 @@ namespace v8::internal {
 
 #include "src/codegen/define-code-stub-assembler-macros.inc"
 
+TNode<WeakFixedArray> WasmBuiltinsAssembler::LoadWasmCanonicalRtts() {
+  return CAST(CodeAssembler::LoadRoot(RootIndex::kWasmCanonicalRtts));
+}
+
 TNode<WasmTrustedInstanceData>
 WasmBuiltinsAssembler::LoadInstanceDataFromFrame() {
 #ifdef DEBUG

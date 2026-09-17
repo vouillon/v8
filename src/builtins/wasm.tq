@@ -1290,9 +1290,42 @@ builtin WasmStringEncodeWtf8Array(
     return NumberToUint32(result);
   }
 }
+extern macro WasmBuiltinsAssembler::LoadWasmCanonicalRtts(): WeakFixedArray;
+
+// Index of the RTT for the predefined type {array i8} in the table of
+// canonical RTTs, i.e. {wasm::TypeCanonicalizer::kPredefinedArrayI8Index}.
+// Checked by a static_assert in runtime-wasm.cc.
+const kWasmCanonicalRttArrayI8Index: constexpr int31 = 0;
+
+macro LoadCanonicalArrayI8Rtt(): Map labels Cleared {
+  const rtts = LoadWasmCanonicalRtts();
+  const rtt = GetHeapObjectAssumeWeak(
+      rtts.objects[kWasmCanonicalRttArrayI8Index]) otherwise Cleared;
+  return UnsafeCast<Map>(rtt);
+}
+
 builtin WasmStringToUtf8Array(string: String, shared: int32): WasmArray {
-  return runtime::WasmStringToUtf8Array(
-      LoadContextFromFrame(), string, SmiFromInt32(shared));
+  try {
+    // Shared arrays have to be allocated by the runtime.
+    if (shared != 0) goto Runtime;
+    const slice = ShortAsciiStringToSlice(string) otherwise Runtime;
+    const length = Unsigned(string.length);
+    const rtt = LoadCanonicalArrayI8Rtt() otherwise Runtime;
+    // Every element gets written below, so the array need not be initialized.
+    const array = WasmAllocateArray_Uninitialized(rtt, length, 1);
+    const arrayContent = torque_internal::unsafe::NewMutableSlice<char8>(
+        array, kWasmArrayHeaderSize, string.length_intptr);
+    let fromIt = slice.Iterator();
+    let toIt = arrayContent.Iterator();
+    while (true) {
+      let toRef = toIt.NextReference() otherwise break;
+      *toRef = fromIt.NextNotEmpty();
+    }
+    return array;
+  } label Runtime deferred {
+    return runtime::WasmStringToUtf8Array(
+        LoadContextFromFrame(), string, SmiFromInt32(shared));
+  }
 }
 builtin WasmStringEncodeWtf16(string: String, offset: uintptr, memory: uint32):
     uint32 {

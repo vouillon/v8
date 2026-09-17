@@ -2711,6 +2711,10 @@ RUNTIME_FUNCTION(Runtime_WasmStringEncodeWtf8Array) {
                     MessageTemplate::kWasmTrapArrayOutOfBounds);
 }
 
+// The inline fast path in wasm.tq (kWasmCanonicalRttArrayI8Index) relies on
+// this index.
+static_assert(wasm::TypeCanonicalizer::kPredefinedArrayI8Index.index == 0);
+
 RUNTIME_FUNCTION(Runtime_WasmStringToUtf8Array) {
   DCHECK_EQ(2, args.length());
   HandleScope scope(isolate);
