@@ -956,17 +956,38 @@ builtin WasmStringNewWtf8(
 builtin WasmStringNewWtf8Array(
     start: uint32, end: uint32, array: WasmArray, utf8Variant: Smi,
     shared: Smi): String|WasmNull {
-  // This can be called from Wasm and from "JS String Builtins".
-  const context = LoadContextFromWasmOrJsFrame();
   try {
     if (array.length < end) goto OffsetOutOfRange;
     if (end < start) goto OffsetOutOfRange;
+    const length: uint32 = end - start;
+    if (length == 0) return kEmptyString;
+    // Shared strings have to be allocated by the runtime.
+    if (SmiToInt32(shared) != 0) goto Runtime;
+    // Short arrays containing only ASCII bytes are decoded inline: ASCII bytes
+    // are their own encoding in every UTF-8 variant, so the result is a
+    // one-byte string with the same content.
+    if (length > kWasmStringUtf8InlineMaxLength) goto Runtime;
+    const arrayContent = torque_internal::unsafe::NewConstSlice<char8>(
+        array, kWasmArrayHeaderSize, Convert<intptr>(array.length));
+    const bytes = Subslice(
+        arrayContent, Convert<intptr>(start), Convert<intptr>(length))
+        otherwise unreachable;
+    if (!IsAsciiSlice(bytes)) goto Runtime;
+    if (length == 1) {
+      // This makes sure we check the SingleCharacterStringTable.
+      return StringFromSingleCharCode(*bytes.UncheckedAtIndex(0));
+    }
+    return AllocateNonEmptySeqOneByteString(length, bytes.Iterator());
+  } label OffsetOutOfRange deferred {
+    // This can be called from Wasm and from "JS String Builtins".
+    const context = LoadContextFromWasmOrJsFrame();
+    const error = MessageTemplate::kWasmTrapArrayOutOfBounds;
+    runtime::ThrowWasmError(context, SmiConstant(error));
+  } label Runtime deferred {
+    const context = LoadContextFromWasmOrJsFrame();
     tail runtime::WasmStringNewWtf8Array(
         context, utf8Variant, array, SmiFromUint32(start), SmiFromUint32(end),
         shared);
-  } label OffsetOutOfRange deferred {
-    const error = MessageTemplate::kWasmTrapArrayOutOfBounds;
-    runtime::ThrowWasmError(context, SmiConstant(error));
   }
 }
 builtin WasmStringNewWtf16(memory: uint32, offset: uintptr, size: uint32):
