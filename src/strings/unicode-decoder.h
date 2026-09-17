@@ -75,6 +75,10 @@ class Utf8DecoderBase {
   Encoding encoding_;
   int non_ascii_start_;
   int utf16_length_;
+  // Set if the constructor has validated the non-ASCII tail of the input as
+  // UTF-8 using SIMD; {Decode} then uses the SIMD converters. Otherwise both
+  // passes use the byte-by-byte DFA decoder.
+  bool is_valid_utf8_ = false;
 };
 
 class V8_EXPORT_PRIVATE Utf8Decoder final

@@ -6,6 +6,7 @@
 
 #include "src/strings/unicode-inl.h"
 #include "src/utils/memcopy.h"
+#include "third_party/simdutf/simdutf.h"
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "third_party/utf8-decoder/generalized-utf8-decoder.h"
@@ -54,6 +55,21 @@ struct DecoderTraits<StrictUtf8Decoder> {
   using DfaDecoder = Utf8DfaDecoder;
 };
 #endif  // V8_ENABLE_WEBASSEMBLY
+
+// Non-ASCII tails shorter than this are decoded with the DFA; the per-call
+// overhead of the SIMD routines does not pay off for them.
+constexpr size_t kMinSimdTailLength = 16;
+
+// Precondition: {bytes} is valid UTF-8. Returns whether all code points are at
+// most U+00FF, i.e. whether the string fits in a one-byte string: U+0080 to
+// U+00FF are encoded as two-byte sequences with lead byte 0xC2 or 0xC3, all
+// larger code points have a lead byte of at least 0xC4, and continuation bytes
+// are below 0xC0.
+bool IsLatin1Utf8(const uint8_t* bytes, size_t length) {
+  uint8_t max = 0;
+  for (size_t i = 0; i < length; i++) max = std::max(max, bytes[i]);
+  return max < 0xC4;
+}
 }  // namespace
 
 template <class Decoder>
@@ -63,6 +79,30 @@ Utf8DecoderBase<Decoder>::Utf8DecoderBase(base::Vector<const uint8_t> data)
       utf16_length_(non_ascii_start_) {
   using Traits = DecoderTraits<Decoder>;
   if (non_ascii_start_ == data.length()) return;
+
+  // Fast path: if the tail is valid UTF-8, its UTF-16 length can be computed
+  // with SIMD, and {Decode} can use the SIMD converters. Valid UTF-8 is also
+  // valid WTF-8 (without surrogates), so this applies to all variants. Note
+  // that {NonAsciiStart} only returns positions at which all preceding bytes
+  // are ASCII, hence code point boundaries.
+  {
+    const char* tail =
+        reinterpret_cast<const char*>(data.begin() + non_ascii_start_);
+    size_t tail_length = data.length() - non_ascii_start_;
+    if (tail_length >= kMinSimdTailLength &&
+        simdutf::validate_utf8(tail, tail_length)) {
+      is_valid_utf8_ = true;
+      size_t tail_utf16_length =
+          simdutf::utf16_length_from_utf8(tail, tail_length);
+      // The result cannot exceed the number of input bytes.
+      DCHECK_LE(tail_utf16_length, tail_length);
+      utf16_length_ += static_cast<int>(tail_utf16_length);
+      encoding_ = IsLatin1Utf8(data.begin() + non_ascii_start_, tail_length)
+                      ? Encoding::kLatin1
+                      : Encoding::kUtf16;
+      return;
+    }
+  }
 
   bool is_one_byte = true;
   auto state = Traits::DfaDecoder::kAccept;
@@ -134,6 +174,24 @@ void Utf8DecoderBase<Decoder>::Decode(Char* out,
   CopyChars(out, data.begin(), non_ascii_start_);
 
   out += non_ascii_start_;
+
+  if (is_valid_utf8_) {
+    const char* tail =
+        reinterpret_cast<const char*>(data.begin() + non_ascii_start_);
+    size_t tail_length = data.length() - non_ascii_start_;
+    size_t written;
+    if constexpr (sizeof(Char) == 1) {
+      DCHECK(is_one_byte());
+      written = simdutf::convert_valid_utf8_to_latin1(
+          tail, tail_length, reinterpret_cast<char*>(out));
+    } else {
+      written = simdutf::convert_valid_utf8_to_utf16(
+          tail, tail_length, reinterpret_cast<char16_t*>(out));
+    }
+    DCHECK_EQ(written, static_cast<size_t>(utf16_length_ - non_ascii_start_));
+    USE(written);
+    return;
+  }
 
   auto state = Traits::DfaDecoder::kAccept;
   uint32_t current = 0;
