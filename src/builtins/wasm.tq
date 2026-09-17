@@ -1162,13 +1162,74 @@ builtin WasmStringConst(index: uint32): String {
       LoadContextFromInstanceData(trustedData), trustedData,
       SmiFromUint32(index));
 }
+// Strings up to this length that consist only of ASCII characters are
+// handled inline by the UTF-8 string builtins below; everything else goes to
+// the runtime. Calling into the runtime has a fixed overhead that dominates
+// for short strings. The threshold has been determined experimentally.
+const kWasmStringUtf8InlineMaxLength: uint32 = 32;
+
+// Returns true if all characters in {slice} are ASCII, i.e. below 0x80.
+macro IsAsciiSlice(slice: ConstSlice<char8>): bool {
+  const length = slice.length;
+  let i: intptr = 0;
+  if (length >= 8) {
+    const eightElementLoopEnd = length - 8;
+    while (i <= eightElementLoopEnd) {
+      const bits = Convert<intptr>(*slice.UncheckedAtIndex(i)) |
+          Convert<intptr>(*slice.UncheckedAtIndex(i + 1)) |
+          Convert<intptr>(*slice.UncheckedAtIndex(i + 2)) |
+          Convert<intptr>(*slice.UncheckedAtIndex(i + 3)) |
+          Convert<intptr>(*slice.UncheckedAtIndex(i + 4)) |
+          Convert<intptr>(*slice.UncheckedAtIndex(i + 5)) |
+          Convert<intptr>(*slice.UncheckedAtIndex(i + 6)) |
+          Convert<intptr>(*slice.UncheckedAtIndex(i + 7));
+      if ((bits & 0x80) != 0) return false;
+      i += 8;
+    }
+  }
+  let bits: intptr = 0;
+  while (i < length) {
+    bits |= Convert<intptr>(*slice.UncheckedAtIndex(i));
+    i += 1;
+  }
+  return (bits & 0x80) == 0;
+}
+
+// Fast path helper for the UTF-8 string builtins: returns the characters of
+// {string} if it is short and pure ASCII, so that its UTF-8 encoding is the
+// identity. Goes to {Runtime} otherwise.
+macro ShortAsciiStringToSlice(string: String): ConstSlice<char8>
+    labels Runtime {
+  if (Unsigned(string.length) > kWasmStringUtf8InlineMaxLength) goto Runtime;
+  try {
+    StringToSlice(string) otherwise OneByte, TwoByte;
+  } label OneByte(slice: ConstSlice<char8>) {
+    if (!IsAsciiSlice(slice)) goto Runtime;
+    return slice;
+  } label TwoByte(_slice: ConstSlice<char16>) {
+    goto Runtime;
+  }
+}
+
 builtin WasmStringMeasureUtf8(string: String): int32 {
-  const result = runtime::WasmStringMeasureUtf8(LoadContextFromFrame(), string);
-  return NumberToInt32(result);
+  try {
+    const _slice = ShortAsciiStringToSlice(string) otherwise Runtime;
+    return string.length;
+  } label Runtime deferred {
+    const result =
+        runtime::WasmStringMeasureUtf8(LoadContextFromFrame(), string);
+    return NumberToInt32(result);
+  }
 }
 builtin WasmStringMeasureWtf8(string: String): int32 {
-  const result = runtime::WasmStringMeasureWtf8(LoadContextFromFrame(), string);
-  return NumberToInt32(result);
+  try {
+    const _slice = ShortAsciiStringToSlice(string) otherwise Runtime;
+    return string.length;
+  } label Runtime deferred {
+    const result =
+        runtime::WasmStringMeasureWtf8(LoadContextFromFrame(), string);
+    return NumberToInt32(result);
+  }
 }
 builtin WasmStringEncodeWtf8(
     offset: uintptr, memory: uint32, utf8Variant: uint32,
@@ -1182,11 +1243,31 @@ builtin WasmStringEncodeWtf8(
 }
 builtin WasmStringEncodeWtf8Array(
     string: String, array: WasmArray, start: uint32, utf8Variant: Smi): uint32 {
-  const trustedData = LoadInstanceDataFromFrame();
-  const result = runtime::WasmStringEncodeWtf8Array(
-      LoadContextFromInstanceData(trustedData), utf8Variant, string, array,
-      WasmUint32ToNumber(start));
-  return NumberToUint32(result);
+  try {
+    const slice = ShortAsciiStringToSlice(string) otherwise Runtime;
+    const length = Unsigned(string.length);
+    // Let the runtime produce the trap for out-of-bounds writes.
+    if (start > array.length) goto Runtime;
+    if (array.length - start < length) goto Runtime;
+
+    // ASCII characters are their own UTF-8 encoding, in every variant.
+    const byteOffset: intptr = kWasmArrayHeaderSize + Convert<intptr>(start);
+    const arrayContent = torque_internal::unsafe::NewMutableSlice<char8>(
+        array, byteOffset, string.length_intptr);
+    let fromIt = slice.Iterator();
+    let toIt = arrayContent.Iterator();
+    while (true) {
+      let toRef = toIt.NextReference() otherwise break;
+      *toRef = fromIt.NextNotEmpty();
+    }
+    return length;
+  } label Runtime deferred {
+    const trustedData = LoadInstanceDataFromFrame();
+    const result = runtime::WasmStringEncodeWtf8Array(
+        LoadContextFromInstanceData(trustedData), utf8Variant, string, array,
+        WasmUint32ToNumber(start));
+    return NumberToUint32(result);
+  }
 }
 builtin WasmStringToUtf8Array(string: String, shared: int32): WasmArray {
   return runtime::WasmStringToUtf8Array(
