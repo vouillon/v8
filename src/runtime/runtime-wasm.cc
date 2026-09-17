@@ -26,6 +26,7 @@
 #include "src/objects/object-list-macros.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/property-descriptor.h"
+#include "src/objects/string-inl.h"
 #include "src/runtime/runtime-utils.h"
 #include "src/strings/unicode-inl.h"
 #include "src/trap-handler/trap-handler.h"
@@ -2490,12 +2491,15 @@ uint32_t MeasureWtf8(base::Vector<const T> wtf16) {
   return length;
 }
 uint32_t MeasureWtf8(Isolate* isolate, DirectHandle<String> string) {
-  string = String::Flatten(isolate, string);
-  DisallowGarbageCollection no_gc;
-  String::FlatContent content = string->GetFlatContent(no_gc);
-  DCHECK(content.IsFlat());
-  return content.IsOneByte() ? MeasureWtf8(content.ToOneByteVector())
-                             : MeasureWtf8(content.ToUC16Vector());
+  // {String::Utf8Length} computes the same value as the {MeasureWtf8} loop
+  // above (isolated surrogates count as three bytes, as their replacement
+  // U+FFFD does), but uses SIMD for one-byte strings and for well-formed
+  // two-byte strings.
+  size_t length = String::Utf8Length(isolate, string);
+  static_assert(String::kMaxLength <=
+                (kMaxInt / unibrow::Utf8::kMaxEncodedSize));
+  DCHECK_LE(length, static_cast<size_t>(kMaxInt));
+  return static_cast<uint32_t>(length);
 }
 size_t MaxEncodedSize(base::Vector<const uint8_t> wtf16) {
   DCHECK(wtf16.size() < std::numeric_limits<size_t>::max() /
