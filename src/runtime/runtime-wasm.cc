@@ -43,6 +43,7 @@
 #include "src/wasm/wasm-stack-wrapper-cache.h"
 #include "src/wasm/wasm-subtyping.h"
 #include "src/wasm/wasm-value.h"
+#include "third_party/simdutf/simdutf.h"
 
 #if V8_ENABLE_WEBASSEMBLY && V8_ENABLE_DRUMBRAKE
 #include "src/wasm/interpreter/wasm-interpreter.h"
@@ -2475,14 +2476,26 @@ RUNTIME_FUNCTION(Runtime_WasmStringNewSegmentWtf8) {
 }
 
 namespace {
-// TODO(12868): Consider unifying with api.cc:String::Utf8Length.
-template <typename T>
-uint32_t MeasureWtf8(base::Vector<const T> wtf16) {
-  int previous = unibrow::Utf16::kNoPreviousCharacter;
-  uint32_t length = 0;
+// Number of bytes needed to encode the one-byte string {latin1} in UTF-8.
+uint32_t MeasureWtf8(base::Vector<const uint8_t> latin1) {
+  return static_cast<uint32_t>(simdutf::utf8_length_from_latin1(
+      reinterpret_cast<const char*>(latin1.begin()), latin1.size()));
+}
+// Number of bytes needed to encode the two-byte string {wtf16} in WTF-8 or in
+// lossy UTF-8. Both agree: an isolated surrogate takes three bytes, and so
+// does its replacement character U+FFFD. {valid_utf16} tells whether {wtf16}
+// is free of isolated surrogates.
+uint32_t MeasureWtf8(base::Vector<const base::uc16> wtf16, bool valid_utf16) {
   DCHECK(wtf16.size() <= String::kMaxLength);
   static_assert(String::kMaxLength <=
                 (kMaxInt / unibrow::Utf8::kMaxEncodedSize));
+  if (valid_utf16) {
+    return static_cast<uint32_t>(simdutf::utf8_length_from_utf16(
+        reinterpret_cast<const char16_t*>(wtf16.begin()), wtf16.size()));
+  }
+  // TODO(419496232): Use simdutf once upstream bug is resolved.
+  int previous = unibrow::Utf16::kNoPreviousCharacter;
+  uint32_t length = 0;
   for (size_t i = 0; i < wtf16.size(); i++) {
     int current = wtf16[i];
     length += unibrow::Utf8::Length(current, previous);
@@ -2519,38 +2532,58 @@ template <typename T>
 int EncodeWtf8(base::Vector<char> bytes, size_t offset,
                base::Vector<const T> wtf16, unibrow::Utf8Variant variant,
                MessageTemplate* message, MessageTemplate out_of_bounds) {
+  constexpr bool kOneByte = sizeof(T) == 1;
+  // One-byte strings cannot contain surrogates.
+  const bool valid_utf16 = kOneByte || !HasUnpairedSurrogate(wtf16);
+
   // The first check is a quick estimate to decide whether the second check
   // is worth the computation.
-  if (!base::IsInBounds<size_t>(offset, MaxEncodedSize(wtf16), bytes.size()) &&
-      !base::IsInBounds<size_t>(offset, MeasureWtf8(wtf16), bytes.size())) {
-    *message = out_of_bounds;
-    return -1;
+  if (!base::IsInBounds<size_t>(offset, MaxEncodedSize(wtf16), bytes.size())) {
+    uint32_t needed;
+    if constexpr (kOneByte) {
+      needed = MeasureWtf8(wtf16);
+    } else {
+      needed = MeasureWtf8(wtf16, valid_utf16);
+    }
+    if (!base::IsInBounds<size_t>(offset, needed, bytes.size())) {
+      *message = out_of_bounds;
+      return -1;
+    }
   }
+  // From here on, the destination is known to be large enough for the whole
+  // encoding, whichever variant is used.
 
-  bool replace_invalid = false;
-  switch (variant) {
-    case unibrow::Utf8Variant::kWtf8:
-      break;
-    case unibrow::Utf8Variant::kUtf8:
-      if (HasUnpairedSurrogate(wtf16)) {
+  char* dst = bytes.begin() + offset;
+  size_t written;
+  if constexpr (kOneByte) {
+    written = simdutf::convert_latin1_to_utf8(
+        reinterpret_cast<const char*>(wtf16.begin()), wtf16.size(), dst);
+  } else if (valid_utf16) {
+    // Without isolated surrogates, all variants produce the same bytes.
+    written = simdutf::convert_valid_utf16_to_utf8(
+        reinterpret_cast<const char16_t*>(wtf16.begin()), wtf16.size(), dst);
+  } else {
+    bool replace_invalid = false;
+    switch (variant) {
+      case unibrow::Utf8Variant::kWtf8:
+        break;
+      case unibrow::Utf8Variant::kUtf8:
         *message = MessageTemplate::kWasmTrapStringIsolatedSurrogate;
         return -1;
-      }
-      break;
-    case unibrow::Utf8Variant::kLossyUtf8:
-      replace_invalid = true;
-      break;
-    default:
-      UNREACHABLE();
+      case unibrow::Utf8Variant::kLossyUtf8:
+        replace_invalid = true;
+        break;
+      default:
+        UNREACHABLE();
+    }
+    bool write_null = false;
+    unibrow::Utf8::EncodingResult result = unibrow::Utf8::Encode(
+        wtf16, dst, bytes.size() - offset, write_null, replace_invalid);
+    DCHECK_EQ(result.characters_processed, wtf16.size());
+    written = result.bytes_written;
   }
-
-  bool write_null = false;
-  unibrow::Utf8::EncodingResult result =
-      unibrow::Utf8::Encode(wtf16, bytes.begin() + offset,
-                            bytes.size() - offset, write_null, replace_invalid);
-  DCHECK_EQ(result.characters_processed, wtf16.size());
-  DCHECK_LE(result.bytes_written, kMaxInt);
-  return static_cast<int>(result.bytes_written);
+  DCHECK_LE(written, static_cast<size_t>(kMaxInt));
+  return static_cast<int>(written);
 }
 template <typename GetWritableBytes>
 Tagged<Object> EncodeWtf8(Isolate* isolate, unibrow::Utf8Variant variant,
@@ -2619,7 +2652,7 @@ RUNTIME_FUNCTION(Runtime_WasmStringMeasureUtf8) {
                                                code_units.size())) {
         return Smi::FromInt(-1);
       } else {
-        length = MeasureWtf8(code_units);
+        length = MeasureWtf8(code_units, true);
       }
     }
   }
