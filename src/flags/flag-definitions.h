@@ -1674,6 +1674,13 @@ DEFINE_BOOL(turboshaft_enable_debug_features, false,
 DEFINE_BOOL(turboshaft_wasm_load_elimination, true,
             "enable Turboshaft's WasmLoadElimination")
 
+DEFINE_EXPERIMENTAL_FEATURE(turboshaft_wasm_bounds_check_elimination,
+                            "enable Turboshaft's WasmBoundsCheckElimination")
+DEFINE_BOOL(turboshaft_verify_wasm_bounds_check_elimination, false,
+            "insert runtime checks to verify WasmBoundsCheckElimination")
+DEFINE_DEBUG_BOOL(turboshaft_trace_wasm_bounds_check_elimination, false,
+                  "trace Turboshaft's WasmBoundsCheckElimination")
+
 DEFINE_BOOL(
     wasm_in_js_inlining_body, true,
     "inline Wasm code into JS functions via Turboshaft. This requires "

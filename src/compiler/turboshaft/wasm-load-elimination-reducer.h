@@ -528,6 +528,13 @@ class V8_EXPORT_PRIVATE WasmLoadEliminationReducer : public Next {
     Next::Analyze();
   }
 
+  // Gives other reducers of the same phase access to the replacements
+  // computed by the analysis, once {Analyze} has run.
+  WasmLoadEliminationAnalyzer* GetWasmLoadEliminationAnalyzer() {
+    if (!v8_flags.turboshaft_wasm_load_elimination) return nullptr;
+    return &analyzer_;
+  }
+
 #if DEBUG
   void EmitReportLoadEliminationError() {
     CHECK(v8_flags.turboshaft_verify_load_elimination);

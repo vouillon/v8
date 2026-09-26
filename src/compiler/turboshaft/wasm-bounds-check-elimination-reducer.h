@@ -1,0 +1,825 @@
+// Copyright 2025 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef V8_COMPILER_TURBOSHAFT_WASM_BOUNDS_CHECK_ELIMINATION_REDUCER_H_
+#define V8_COMPILER_TURBOSHAFT_WASM_BOUNDS_CHECK_ELIMINATION_REDUCER_H_
+
+#if !V8_ENABLE_WEBASSEMBLY
+#error This header should only be included if WebAssembly is enabled.
+#endif  // !V8_ENABLE_WEBASSEMBLY
+
+#include <algorithm>
+#include <optional>
+
+#include "src/common/scoped-modification.h"
+#include "src/compiler/turboshaft/analyzer-iterator.h"
+#include "src/compiler/turboshaft/assembler.h"
+#include "src/compiler/turboshaft/graph.h"
+#include "src/compiler/turboshaft/loop-finder.h"
+#include "src/compiler/turboshaft/phase.h"
+#include "src/compiler/turboshaft/snapshot-table.h"
+#include "src/compiler/turboshaft/utils.h"
+#include "src/compiler/turboshaft/wasm-load-elimination-reducer.h"
+#include "src/zone/zone-containers.h"
+#include "src/zone/zone.h"
+
+#ifdef DEBUG
+#define TRACE(x)                                                 \
+  do {                                                           \
+    if (v8_flags.turboshaft_trace_wasm_bounds_check_elimination) \
+      StdoutStream() << x << std::endl;                          \
+  } while (false)
+#else
+#define TRACE(x)
+#endif
+
+namespace v8::internal::compiler::turboshaft {
+
+#include "src/compiler/turboshaft/define-assembler-macros.inc"
+
+// General overview
+//
+// The analysis tracks previous bounds checks for array accesses in
+// Wasm GC code, considering both explicit traps and branch conditions.
+// It handles accesses of the forms:
+//      a[offset]
+//      a[base +/- offset]
+// where `offset` is an integer constant.
+//
+// Redundant bounds check traps that are covered by earlier checks are
+// removed. For example, given the sequence:
+//     a[1] = 11;
+//     a[0] = 10;
+// the bounds check for the second access can be safely eliminated. Similarly,
+// for the sequence:
+//     a[i] = 11;
+//     a[i+2] = 12;
+//     a[i+1] = 11;
+// the last bounds check can be removed, since the index is guaranteed
+// to lie between the previous two indices.
+//
+// The analysis also tracks which offsets {n} are such that {base + n}
+// is known to be non-negative (as a signed 32-bit integer). This does
+// not depend on any particular array: since array lengths are less
+// than 2^31, any successful bounds check {base + n < a.length}
+// implies that {base + n} is non-negative. A single bounds check can
+// then cover a whole range of offsets of another array. For example,
+// given the sequence:
+//     a[i] = 10;
+//     b[i+1] = 11;
+//     b[i] = 12;
+// the first access shows that {i} is non-negative, so the second one
+// shows that both {i} and {i+1} are within the bounds of {b}, and the
+// last bounds check can be removed.
+//
+// When some bounds checks are later followed by stronger checks in
+// the same block, the instructions in between can be duplicated into
+// two paths:
+// 1. A fast path that executes without the redundant bounds checks. The
+//    guard protecting this fast path consists of the stronger checks.
+// 2. A fallback path that preserves the original bounds checks, ensuring
+//    correct semantics if the guard fails.
+// This approach guarantees that the program's semantics are preserved,
+// even when the duplicated instructions have observable side-effects,
+// and that traps are reported at the correct location in the source code.
+//
+// For example, consider:
+//     a[0] = 10;
+//     a[1] = 11;
+// This can be rewritten as:
+//     if (1 < a.length) {
+//         // Fast path: redundant bounds checks removed
+//         a[0] = 10;
+//         a[1] = 11;
+//     } else {
+//         // Fallback path: execute with original bounds checks
+//         a[0] = 10;
+//         a[1] = 11;
+//         // The above code is guaranteed to trap if out of bounds
+//         UNREACHABLE();
+//     }
+//
+// The guard checks the smallest and the largest offsets of the
+// bounds checks removed from the fast path, unless one of these two
+// checks is implied by what is already known when entering the
+// sequence. In the example above, the check {0 < a.length} is implied
+// by {1 < a.length}. But for a dynamic index, the sequence
+//     a[i] = 10;
+//     a[i+1] = 11;
+// needs a guard {i < a.length && i + 1 < a.length}, unless {i} is
+// already known to be non-negative, in which case {i + 1 < a.length}
+// is enough.
+
+// Key for grouping bounds checks by base and array
+struct BoundsCheckKey {
+  OpIndex base;  // Invalid means that we do not have a base.
+  OpIndex array;
+
+  bool operator==(const BoundsCheckKey& other) const = default;
+
+  bool operator<(const BoundsCheckKey& other) const {
+    return std::tie(base, array) < std::tie(other.base, other.array);
+  }
+
+  template <typename H>
+  friend H AbslHashValue(H h, const BoundsCheckKey& key) {
+    return H::combine(std::move(h), key.base, key.array);
+  }
+};
+
+// Identifies a specific bounds check by its key (base + array) and offset.
+struct BoundsCheck {
+  BoundsCheckKey key;
+  uint32_t offset;
+
+  bool operator<(const BoundsCheck& other) const {
+    return std::tie(key, offset) < std::tie(other.key, other.offset);
+  }
+};
+
+// Represents a contiguous range of 32-bit offsets [lower, upper],
+// correctly handling modular arithmetic.
+//
+// This ensures that bounds checks are properly handled even when the
+// range wraps around the 32-bit modulus. Allows checking whether a
+// given offset is inside the range, below it, above it, or otherwise
+// out of range.
+//
+// Correctness is supported by Z3 proofs (see below class definition).
+class OffsetRange {
+ public:
+  explicit OffsetRange(uint32_t lower, uint32_t upper)
+      : lower_(lower), upper_(upper) {
+    DCHECK(IsValid());
+  }
+
+  explicit OffsetRange(uint32_t single) : OffsetRange(single, single) {}
+
+  // Returns the inclusive lower bound.
+  uint32_t lower() const { return lower_; }
+
+  // Returns the inclusive upper bound.
+  uint32_t upper() const { return upper_; }
+
+  // Classifies a given offset relative to the range.
+  enum class RelativePosition {
+    kInside,     // Offset is within [lower, upper]
+    kBelow,      // Offset is less than lower
+    kAbove,      // Offset is greater than upper
+    kOutOfRange  // Offset is invalid for this range
+  };
+
+  RelativePosition Classify(uint32_t offset) const {
+    if (IsValidRange(lower_, offset) && IsValidRange(offset, upper_)) {
+      return RelativePosition::kInside;
+    }
+    if (IsValidRange(upper_, offset) && IsValidRange(lower_, offset)) {
+      return RelativePosition::kAbove;
+    }
+    if (IsValidRange(offset, lower_) && IsValidRange(offset, upper_)) {
+      return RelativePosition::kBelow;
+    }
+    return RelativePosition::kOutOfRange;
+  }
+
+  bool Contains(uint32_t offset) const {
+    return Classify(offset) == RelativePosition::kInside;
+  }
+
+  // Returns the smallest valid range containing both {this} and
+  // {other}, if there is one. It starts at the lower bound of one of
+  // the two ranges.
+  std::optional<OffsetRange> Hull(const OffsetRange& other) const {
+    std::optional<OffsetRange> result;
+    std::pair<const OffsetRange*, const OffsetRange*> candidates[] = {
+        {this, &other}, {&other, this}};
+    for (auto [first, second] : candidates) {
+      // Offsets relative to the lower bound of {first}.
+      uint32_t second_lower = second->lower_ - first->lower_;
+      uint32_t second_upper = second->upper_ - first->lower_;
+      // {second} should not wrap around the lower bound of {first}.
+      if (second_lower > second_upper) continue;
+      uint32_t size = std::max(first->upper_ - first->lower_, second_upper);
+      if (static_cast<int32_t>(size) < 0) continue;
+      if (!result.has_value() || size < result->upper_ - result->lower_) {
+        result = OffsetRange(first->lower_, first->lower_ + size);
+      }
+    }
+    return result;
+  }
+
+  // Checks whether the range [lower, upper] is valid in modular
+  // 32-bit arithmetic. Valid means the range spans at most 2^31
+  // values, ensuring {upper} hasn't wrapped around past {lower} in
+  // the circular address space.
+  static bool IsValidRange(uint32_t lower, uint32_t upper) {
+    return static_cast<int32_t>(upper - lower) >= 0;
+  }
+
+  bool operator==(const OffsetRange& other) const = default;
+
+ private:
+  bool IsValid() const { return IsValidRange(lower_, upper_); }
+  uint32_t lower_;
+  uint32_t upper_;
+};
+// The correctness of this implementation is supported by the
+// following Z3 proofs. They share these definitions:
+//
+//   (define-fun valid-range ((n1 (_ BitVec 32)) (n2 (_ BitVec 32))) Bool
+//     (bvsge (bvsub n2 n1) #x00000000))
+//   (define-fun non-negative ((v (_ BitVec 32))) Bool
+//     (bvsge v #x00000000))
+//
+// A bounds check is redundant when its offset is covered by the
+// range:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const n1 (_ BitVec 32))
+//   (declare-const n2 (_ BitVec 32))
+//   ; Assumptions
+//   (assert (bvsge l #x00000000)) ; the array length l not too large
+//   (assert (bvult (bvadd x n1) l)) ; x + n1 within bounds
+//   (assert (bvult (bvadd x n2) l)) ; x + n2 within bounds
+//   (assert (valid-range n1 n2))
+//   ; We check that n is covered by the range n1..n2
+//   (assert (valid-range n1 n))
+//   (assert (valid-range n n2))
+//   ; Then x + n is within bounds
+//   (assert (not (bvult (bvadd x n) l)))
+//   (check-sat)
+//
+// As a consequence, the hull of two ranges of offsets within bounds is
+// also within bounds, provided that it is a valid range.
+//
+// A redundant bounds check remains redundant when the upper bound is
+// updated:
+//
+//   (declare-const n (_ BitVec 32))
+//   (declare-const n1 (_ BitVec 32))
+//   (declare-const n2 (_ BitVec 32))
+//   (declare-const n3 (_ BitVec 32))
+//   (assert (valid-range n1 n2))
+//   ; Assumption: n is covered by the range n1..n2
+//   (assert (valid-range n1 n))
+//   (assert (valid-range n n2))
+//   ; What we check before updating the upper bound
+//   (assert (valid-range n2 n3))
+//   (assert (valid-range n1 n3))
+//   ; Then n is covered by the range n1..n3
+//   (assert (not (valid-range n n3)))
+//   (check-sat)
+//
+// A bounds check shows that the index is non-negative:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvult (bvadd x n) l))
+//   (assert (not (non-negative (bvadd x n))))
+//   (check-sat)
+//
+// Non-negative offsets form ranges:
+//
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const n1 (_ BitVec 32))
+//   (declare-const n2 (_ BitVec 32))
+//   (assert (non-negative (bvadd x n1)))
+//   (assert (non-negative (bvadd x n2)))
+//   (assert (valid-range n1 n2))
+//   (assert (valid-range n1 n))
+//   (assert (valid-range n n2))
+//   (assert (not (non-negative (bvadd x n))))
+//   (check-sat)
+//
+// If x + n is non-negative, a bounds check at offset m covers the
+// whole range n..m:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const m (_ BitVec 32))
+//   (declare-const k (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (non-negative (bvadd x n)))
+//   (assert (bvult (bvadd x m) l))
+//   (assert (valid-range n m))
+//   (assert (valid-range n k))
+//   (assert (valid-range k m))
+//   (assert (not (bvult (bvadd x k) l)))
+//   (check-sat)
+//
+// A guard for the range lo..hi only needs to check hi when some x + n
+// with n <= lo is known to be non-negative (in particular, when it is
+// known to be within bounds): this is the previous proof with m = hi.
+// Symmetrically, it only needs to check lo when x + n is known to be
+// within bounds for some n >= hi:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (declare-const hi (_ BitVec 32))
+//   (declare-const k (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvult (bvadd x n) l))
+//   (assert (bvult (bvadd x lo) l))
+//   (assert (valid-range lo hi))
+//   (assert (valid-range hi n))
+//   (assert (valid-range lo n))
+//   (assert (valid-range lo k))
+//   (assert (valid-range k hi))
+//   (assert (not (bvult (bvadd x k) l)))
+//   (check-sat)
+
+// Maps keys of type {K} to values of type {V}. Supports snapshotting
+// for control flow merge points.
+template <typename K, typename V>
+class KeyedSnapshotTable : public SnapshotTable<std::optional<V>> {
+ public:
+  using Base = SnapshotTable<std::optional<V>>;
+
+  explicit KeyedSnapshotTable(Zone* zone) : Base(zone), key_table_(zone) {}
+
+  std::optional<V> Get(const K& key) const {
+    auto it = key_table_.find(key);
+    if (it == key_table_.end()) return std::nullopt;
+    return Base::Get(it->second);
+  }
+
+  void Set(const K& key, const V& value) {
+    auto [it, inserted] = key_table_.try_emplace(key);
+    if (inserted) {
+      // The initial value of a key is visible in all snapshots, so we
+      // create keys without a value, and then set the value in the
+      // current snapshot only.
+      it->second = Base::NewKey(std::nullopt);
+    }
+    Base::Set(it->second, value);
+  }
+
+ private:
+  ZoneAbslFlatHashMap<K, typename Base::Key> key_table_;
+};
+
+// Maps (base, array) pairs to their known safe offset ranges.
+using BoundsCheckMap = KeyedSnapshotTable<BoundsCheckKey, OffsetRange>;
+
+// Maps bases to the range of offsets {n} such that {base + n} is
+// known to be non-negative.
+using NonNegativeOffsetMap = KeyedSnapshotTable<OpIndex, OffsetRange>;
+
+// Represents a sequence of instructions that could be duplicated:
+// - Fast path: execute without bounds checks (checks moved earlier)
+// - Fallback path: execute with original bounds checks intact
+struct FallbackInstructionSequence {
+  BoundsCheckKey key;
+  OpIndex array_length;
+
+  // The smallest range containing the offsets of the covered traps.
+  // Its bounds are offsets of covered traps.
+  OffsetRange offsets;
+
+  // What is known when entering the sequence: the offsets within
+  // bounds, and the offsets {n} for which {key.base + n} is
+  // non-negative.
+  std::optional<OffsetRange> known_offsets;
+  std::optional<OffsetRange> non_negative_offsets;
+
+  // Range of instructions to clone [start_index, end_index), and their
+  // positions in the block.
+  OpIndex start_index;
+  OpIndex end_index;
+  uint32_t start_position;
+  uint32_t end_position;
+
+  // Traps that become redundant on the fast path (they remain in
+  // fallback code), sorted by index.
+  ZoneVector<OpIndex> covered_traps;
+
+  // Heuristic: only generate fallback code if the instruction
+  // sequence is shorter than this factor times the number of
+  // eliminated bounds checks. This ensures an at most linear growth
+  // of the code size.
+  static constexpr uint32_t instruction_budget_per_trap = 20;
+
+  // Which bounds of {offsets} the guard needs to check.
+  struct Guard {
+    bool check_lower;
+    bool check_upper;
+    int check_count() const { return check_lower + check_upper; }
+  };
+
+  FallbackInstructionSequence(Zone* zone, const BoundsCheckKey& key,
+                              OpIndex array_length, OffsetRange offsets,
+                              std::optional<OffsetRange> known_offsets,
+                              std::optional<OffsetRange> non_negative_offsets,
+                              OpIndex start_index, OpIndex end_index,
+                              uint32_t start_position, uint32_t end_position,
+                              std::initializer_list<OpIndex> covered)
+      : key(key),
+        array_length(array_length),
+        offsets(offsets),
+        known_offsets(known_offsets),
+        non_negative_offsets(non_negative_offsets),
+        start_index(start_index),
+        end_index(end_index),
+        start_position(start_position),
+        end_position(end_position),
+        covered_traps(covered, zone) {
+    DCHECK_LT(start_index, end_index);
+    DCHECK_LT(start_position, end_position);
+    std::sort(covered_traps.begin(), covered_traps.end());
+  }
+
+  Guard ComputeGuard() const {
+    return ComputeGuard(offsets, known_offsets, non_negative_offsets);
+  }
+
+  uint32_t instruction_count() const { return end_position - start_position; }
+
+  bool ShouldKeep() const {
+    return IsProfitable(instruction_count(), covered_traps.size(),
+                        ComputeGuard());
+  }
+
+  // Whether {other}, which ends after {this}, can be merged into
+  // {this}: they must overlap, and the merged sequence must be
+  // profitable.
+  bool CanCoalesce(const FallbackInstructionSequence& other) const {
+    DCHECK_EQ(key, other.key);
+    DCHECK_LE(end_index, other.end_index);
+    if (end_index < other.start_index) return false;
+    const FallbackInstructionSequence& first =
+        start_index <= other.start_index ? *this : other;
+    // Both ranges are within the current known range, so their hull
+    // is valid.
+    std::optional<OffsetRange> merged_offsets = offsets.Hull(other.offsets);
+    if (!merged_offsets.has_value()) return false;
+    size_t trap_count = covered_traps.size();
+    for (OpIndex trap : other.covered_traps) {
+      if (!std::binary_search(covered_traps.begin(), covered_traps.end(),
+                              trap)) {
+        trap_count++;
+      }
+    }
+    return IsProfitable(other.end_position - first.start_position, trap_count,
+                        ComputeGuard(*merged_offsets, first.known_offsets,
+                                     first.non_negative_offsets));
+  }
+
+  void Coalesce(const FallbackInstructionSequence& other) {
+    DCHECK(CanCoalesce(other));
+    offsets = *offsets.Hull(other.offsets);
+    if (other.start_index < start_index) {
+      // The guard moves to the start of {other}, so it can only rely
+      // on what is known there.
+      known_offsets = other.known_offsets;
+      non_negative_offsets = other.non_negative_offsets;
+      start_index = other.start_index;
+      start_position = other.start_position;
+    }
+    end_index = other.end_index;
+    end_position = other.end_position;
+    for (OpIndex trap : other.covered_traps) {
+      auto it =
+          std::lower_bound(covered_traps.begin(), covered_traps.end(), trap);
+      if (it == covered_traps.end() || *it != trap) {
+        covered_traps.insert(it, 1, trap);
+      }
+    }
+  }
+
+  // Delete copy operations to avoid accidental copies
+  FallbackInstructionSequence(const FallbackInstructionSequence&) = delete;
+  FallbackInstructionSequence& operator=(const FallbackInstructionSequence&) =
+      delete;
+  // Move operations are allowed
+  FallbackInstructionSequence(FallbackInstructionSequence&&) noexcept = default;
+  FallbackInstructionSequence& operator=(
+      FallbackInstructionSequence&&) noexcept = default;
+
+ private:
+  static Guard ComputeGuard(const OffsetRange& offsets,
+                            const std::optional<OffsetRange>& known,
+                            const std::optional<OffsetRange>& non_negative) {
+    bool lower_implied =
+        (known && ImpliesLowerBound(*known, offsets)) ||
+        (non_negative && ImpliesLowerBound(*non_negative, offsets));
+    bool upper_implied = known && ImpliesUpperBound(*known, offsets);
+    // When both checks are implied, we still check the upper bound
+    // (which is enough given the lower bound) rather than proving that
+    // the guard can be omitted.
+    return {!lower_implied, lower_implied || !upper_implied};
+  }
+
+  // Whether some offset {n <= offsets.lower()} from {facts} is such
+  // that {base + n} is non-negative, so that only the upper bound of
+  // {offsets} needs to be checked. Offsets within bounds are
+  // non-negative, so {facts} can be either kind of range.
+  static bool ImpliesLowerBound(const OffsetRange& facts,
+                                const OffsetRange& offsets) {
+    OffsetRange::RelativePosition position = facts.Classify(offsets.lower());
+    // Either {n = offsets.lower()}, or {n = facts.upper()}.
+    return position == OffsetRange::RelativePosition::kInside ||
+           (position == OffsetRange::RelativePosition::kAbove &&
+            OffsetRange::IsValidRange(facts.upper(), offsets.upper()));
+  }
+
+  // Whether some offset {n >= offsets.upper()} from {known} is within
+  // bounds, so that only the lower bound of {offsets} needs to be
+  // checked.
+  static bool ImpliesUpperBound(const OffsetRange& known,
+                                const OffsetRange& offsets) {
+    OffsetRange::RelativePosition position = known.Classify(offsets.upper());
+    // Either {n = offsets.upper()}, or {n = known.lower()}.
+    return position == OffsetRange::RelativePosition::kInside ||
+           (position == OffsetRange::RelativePosition::kBelow &&
+            OffsetRange::IsValidRange(offsets.lower(), known.lower()));
+  }
+
+  // Whether the sequence removes more bounds checks than the guard
+  // adds, for a limited amount of duplicated code.
+  static bool IsProfitable(uint32_t instruction_count, size_t trap_count,
+                           Guard guard) {
+    int eliminated = static_cast<int>(trap_count) - guard.check_count();
+    return eliminated >= 1 &&
+           instruction_count <=
+               instruction_budget_per_trap * static_cast<uint32_t>(eliminated);
+  }
+};
+
+class WasmBoundsCheckEliminationAnalyzer {
+ public:
+  // {load_elimination} is optional. When provided, values replaced by
+  // load elimination are considered the same as their replacement.
+  WasmBoundsCheckEliminationAnalyzer(
+      const Graph& graph, Zone* phase_zone,
+      WasmLoadEliminationAnalyzer* load_elimination)
+      : graph_(graph),
+        phase_zone_(phase_zone),
+        load_elimination_(load_elimination),
+        redundant_traps_(phase_zone),
+        fallback_sequence_starts_(phase_zone),
+        known_bounds_checks_(phase_zone),
+        known_non_negative_offsets_(phase_zone),
+        block_to_snapshot_mapping_(graph.block_count(), phase_zone),
+        last_trap_bounds_checks_(phase_zone),
+        array_lengths_(phase_zone),
+        planned_fallbacks_by_key_(phase_zone),
+        predecessor_bounds_check_snapshots_(phase_zone),
+        predecessor_non_negative_snapshots_(phase_zone) {}
+
+  void Run() {
+    LoopFinder loop_finder(phase_zone_, &graph_, LoopFinder::Config{});
+    AnalyzerIterator iterator(phase_zone_, graph_, loop_finder);
+
+    while (iterator.HasNext()) {
+      const Block* block = iterator.Next();
+      ProcessBlock(*block);
+    }
+
+#if DEBUG
+    PrintStats();
+#endif
+  }
+
+  bool IsRedundantTrap(OpIndex index) const {
+    return redundant_traps_.contains(index);
+  }
+
+  const FallbackInstructionSequence* FindFallbackCode(OpIndex index) const {
+    auto it = fallback_sequence_starts_.find(index);
+    if (it == fallback_sequence_starts_.end()) return nullptr;
+    return &it->second;
+  }
+
+  void FinalizeFallbackSequence(const FallbackInstructionSequence& seq) {
+    for (auto trap_if : seq.covered_traps) {
+      redundant_traps_.insert(trap_if);
+    }
+  }
+
+ private:
+  // Snapshots of the tables at the end of a block.
+  struct Snapshot {
+    BoundsCheckMap::Snapshot bounds_checks;
+    NonNegativeOffsetMap::Snapshot non_negative_offsets;
+  };
+
+  // A trap that may start a fallback sequence, with what is known
+  // right before it.
+  struct TrapInfo {
+    OpIndex trap_if;
+    // The trap, or its condition when the condition is right before
+    // the trap.
+    OpIndex start_index;
+    uint32_t start_position;
+    std::optional<OffsetRange> known_offsets;
+    std::optional<OffsetRange> non_negative_offsets;
+  };
+
+  void ProcessBlock(const Block& block);
+  void ProcessTrapIf(OpIndex op_idx, const TrapIfOp& trap_if);
+  void ProcessBranch(const Block* block);
+
+  void BeginBlock(const Block* block);
+  void FinishBlock(const Block* block);
+
+  OpIndex ResolveAliases(OpIndex object) const;
+  OpIndex ResolveReplacements(OpIndex value) const;
+
+  void ProcessCondition(OpIndex trap_if, OpIndex condition, bool inverted);
+  void ProcessBoundsCheck(OpIndex trap_if, OpIndex condition,
+                          const BoundsCheck& bounds_check,
+                          OpIndex array_length);
+
+  void RecordFallbackSequence(const BoundsCheckKey& key, uint32_t prev_offset,
+                              OpIndex trap_if, uint32_t offset);
+  void UpdateKnownBoundsChecks(const BoundsCheckKey& key, uint32_t offset,
+                               const OffsetRange& offsets, OpIndex trap_if,
+                               OpIndex condition,
+                               const std::optional<OffsetRange>& known_before,
+                               const std::optional<OffsetRange>& non_negative);
+
+  void RegisterFallbackSequence(FallbackInstructionSequence&& sequence);
+
+  std::optional<OffsetRange> KnownOffsets(
+      const BoundsCheckKey& key,
+      const std::optional<OffsetRange>& non_negative) const;
+  std::optional<OffsetRange> NonNegativeOffsets(OpIndex base) const;
+  void RecordNonNegativeOffset(OpIndex base, uint32_t offset);
+
+  std::optional<std::pair<BoundsCheck, OpIndex>> TryExtractBoundChecksCondition(
+      OpIndex index, bool inverted) const;
+  std::optional<std::pair<OpIndex, uint32_t>> TryExtractNonNegativeIndex(
+      OpIndex condition, bool inverted) const;
+  std::pair<OpIndex, uint32_t> ExtractBaseAndOffset(OpIndex index) const;
+  std::optional<uint32_t> TryExtractI32Const(OpIndex expr) const;
+
+  const Graph& graph_;
+  Zone* phase_zone_;
+  WasmLoadEliminationAnalyzer* load_elimination_;
+
+  // Set of traps identified as redundant by the analysis.
+  ZoneAbslFlatHashSet<OpIndex> redundant_traps_;
+
+  // Fallback sequences keyed by their start index.
+  ZoneAbslFlatHashMap<OpIndex, FallbackInstructionSequence>
+      fallback_sequence_starts_;
+
+  // Summary of all the bounds check information collected so far.
+  BoundsCheckMap known_bounds_checks_;
+  NonNegativeOffsetMap known_non_negative_offsets_;
+
+  FixedBlockSidetable<std::optional<Snapshot>> block_to_snapshot_mapping_;
+
+  // Information about the current block:
+
+  // Position of the current operation in the block.
+  uint32_t current_position_ = 0;
+
+  // Previous bounds check traps that can start a fallback sequence.
+  ZoneAbslBTreeMap<BoundsCheck, TrapInfo> last_trap_bounds_checks_;
+
+  // Array lengths used in bounds checks within this block.
+  ZoneAbslBTreeMap<OpIndex, OpIndex> array_lengths_;
+
+  ZoneAbslBTreeMap<BoundsCheckKey, ZoneVector<FallbackInstructionSequence>>
+      planned_fallbacks_by_key_;
+
+  // The predecessor snapshots are used as temporary vectors when
+  // starting to process a block. We store them as members to avoid
+  // reallocation.
+  ZoneVector<BoundsCheckMap::Snapshot> predecessor_bounds_check_snapshots_;
+  ZoneVector<NonNegativeOffsetMap::Snapshot>
+      predecessor_non_negative_snapshots_;
+
+#if DEBUG
+  void PrintStats();
+  size_t total_trap_count_ = 0;
+#endif
+};
+
+template <class Next>
+class WasmBoundsCheckEliminationReducer : public Next {
+ public:
+  TURBOSHAFT_REDUCER_BOILERPLATE(WasmBoundsCheckElimination)
+
+  void Analyze() {
+    // Load elimination is analyzed first, so that we can take its
+    // replacements into account.
+    Next::Analyze();
+    if (v8_flags.turboshaft_wasm_bounds_check_elimination) {
+      WasmLoadEliminationAnalyzer* load_elimination = nullptr;
+      if constexpr (reducer_list_contains<ReducerList,
+                                          WasmLoadEliminationReducer>::value) {
+        load_elimination = __ GetWasmLoadEliminationAnalyzer();
+      }
+      analyzer_.emplace(__ input_graph(), __ phase_zone(), load_elimination);
+      analyzer_->Run();
+    }
+  }
+
+  OpIndex REDUCE_INPUT_GRAPH(TrapIf)(OpIndex ig_index,
+                                     const TrapIfOp& trap_if) {
+    if (analyzer_.has_value()) {
+      MaybeInsertFallbackSequence(ig_index);
+      if (analyzer_->IsRedundantTrap(ig_index)) {
+        if (v8_flags.turboshaft_verify_wasm_bounds_check_elimination) {
+          VerifyRedundantBoundsCheck(trap_if);
+        }
+        return OpIndex::Invalid();
+      }
+    }
+    return Next::ReduceInputGraphTrapIf(ig_index, trap_if);
+  }
+
+  OpIndex REDUCE_INPUT_GRAPH(Comparison)(OpIndex ig_index,
+                                         const ComparisonOp& comparison) {
+    if (analyzer_.has_value()) {
+      MaybeInsertFallbackSequence(ig_index);
+    }
+    return Next::ReduceInputGraphComparison(ig_index, comparison);
+  }
+
+ private:
+  // Only constructed when the optimization is enabled.
+  std::optional<WasmBoundsCheckEliminationAnalyzer> analyzer_;
+
+  bool in_fallback_code_ = false;
+
+  // Inserts fallback code if the analyzer planned it here.
+  void MaybeInsertFallbackSequence(OpIndex ig_index) {
+    if (in_fallback_code_) return;
+
+    if (auto* sequence = analyzer_->FindFallbackCode(ig_index)) {
+      TRACE("Insert fallback sequence: [" << sequence->start_index << ", "
+                                          << sequence->end_index << ")");
+      EmitFallbackSequence(*sequence);
+      analyzer_->FinalizeFallbackSequence(*sequence);
+    }
+  }
+
+  void VerifyRedundantBoundsCheck(const TrapIfOp& trap_if) {
+    V<Word32> condition = __ MapToNewGraph(trap_if.condition());
+    // The trap fires when the condition is false if the trap is
+    // negated, and when it is true otherwise.
+    V<Word32> in_bounds =
+        trap_if.negated ? condition : __ Word32Equal(condition, 0);
+    IF_NOT (LIKELY(in_bounds)) {
+      __ WasmCallRuntime(
+          __ phase_zone(), Runtime::kAbort,
+          {__ TagSmi(static_cast<int>(
+              AbortReason::kTurboshaftWasmBoundsCheckEliminationError))},
+          __ NoContextConstant());
+      __ Unreachable();
+    }
+  }
+
+  void EmitFallbackSequence(const FallbackInstructionSequence& seq) {
+    ScopedModification<bool> set_true(&in_fallback_code_, true);
+
+    const Block* current_input_block = __ current_input_block();
+    Label<> fallback_code(this);
+    Label<> done(this);
+    FallbackInstructionSequence::Guard guard = seq.ComputeGuard();
+    if (guard.check_upper) {
+      EmitBoundsCheck(seq, seq.offsets.upper(), fallback_code);
+    }
+    if (guard.check_lower) {
+      EmitBoundsCheck(seq, seq.offsets.lower(), fallback_code);
+    }
+    GOTO(done);
+    BIND(fallback_code);
+    __ CloneAndInlineTrappingInstructions(seq.start_index, seq.end_index,
+                                          current_input_block);
+    BIND(done);
+  }
+
+  // Emits a bounds check that compares {base} + {offset} against the
+  // array length and jumps to {fallback_code} if the index would go
+  // out of bounds.
+  void EmitBoundsCheck(const FallbackInstructionSequence& seq, uint32_t offset,
+                       Label<>& fallback_code) {
+    V<Word32> index = __ Word32Constant(offset);
+    if (seq.key.base.valid()) {
+      index = __ Word32Add(__ MapToNewGraph(seq.key.base), index);
+    }
+    V<Word32> length = __ MapToNewGraph(seq.array_length);
+    GOTO_IF_NOT(LIKELY(__ Uint32LessThan(index, length)), fallback_code);
+  }
+};
+
+#include "src/compiler/turboshaft/undef-assembler-macros.inc"
+
+}  // namespace v8::internal::compiler::turboshaft
+
+#undef TRACE
+
+#endif  // V8_COMPILER_TURBOSHAFT_WASM_BOUNDS_CHECK_ELIMINATION_REDUCER_H_
