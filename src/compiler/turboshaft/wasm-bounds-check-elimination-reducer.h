@@ -636,6 +636,18 @@ class WasmBoundsCheckEliminationAnalyzer {
 #endif
   }
 
+  // Whether {graph} contains any array bounds check. If not, there is no
+  // need to run the analysis.
+  static bool HasArrayBoundsChecks(const Graph& graph) {
+    for (const Operation& op : graph.AllOperations()) {
+      const TrapIfOp* trap_if = op.TryCast<TrapIfOp>();
+      if (trap_if && trap_if->trap_id == TrapId::kTrapArrayOutOfBounds) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool IsRedundantTrap(OpIndex index) const {
     return redundant_traps_.contains(index);
   }
@@ -778,7 +790,9 @@ class WasmBoundsCheckEliminationReducer : public Next {
     // Load elimination is analyzed first, so that we can take its
     // replacements into account.
     Next::Analyze();
-    if (v8_flags.turboshaft_wasm_bounds_check_elimination) {
+    if (v8_flags.turboshaft_wasm_bounds_check_elimination &&
+        WasmBoundsCheckEliminationAnalyzer::HasArrayBoundsChecks(
+            __ input_graph())) {
       WasmLoadEliminationAnalyzer* load_elimination = nullptr;
       if constexpr (reducer_list_contains<ReducerList,
                                           WasmLoadEliminationReducer>::value) {
