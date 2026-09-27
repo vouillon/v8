@@ -548,6 +548,10 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
     ltULength1: {test: [...length, ...wasmI32Const(1), kExprI32Sub, ...k(0),
                         kExprI32LeU],
                  model: (k, n) => !((k >>> 0) < ((n - 1) >>> 0))},
+    leSLength: {test: [...k(0), ...length, kExprI32GtS],
+                model: (k, n) => !(k <= n)},
+    leULength: {test: [...k(0), ...length, kExprI32GtU],
+                model: (k, n) => !((k >>> 0) <= n)},
     neLength1: {ne: 1, guard: 0}, neLength2: {ne: 2, guard: 0},
     neLength1Guard1: {ne: 1, guard: 1},
     neLength1NoGuard: {ne: 1},
@@ -575,6 +579,17 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
       for (let init = 0x7ffffff0; init < 0x7ffffffc; init++) {
         cases.push({init, step, exitName, exit: exits[exitName],
                     accesses: init == 0x7ffffff0 ? [0] : [], store: false});
+      }
+    }
+  }
+  // Large steps: they cannot overflow for an index at most an array
+  // length (less than 2^30) when they are at most 2^30.
+  for (let step of [0x40000000, 0x40000001, 0x7fffffff]) {
+    for (let exitName of ['leSLength', 'leULength', 'ltSLength0',
+                          'ltULength']) {
+      for (let init of [0, 1]) {
+        cases.push({init, step, exitName, exit: exits[exitName],
+                    accesses: [0], store: false});
       }
     }
   }

@@ -1250,6 +1250,42 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, LengthAliasAfterLoopInElse) {
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
 }
 
+TEST_F(WasmBoundsCheckEliminationReducerTest, LengthAliasAtLoopExit) {
+  // hi = (c ? a.length : 0) - 1; if (0 <= hi) for (k = 0; ; k++) {
+  //   a[k]; if (k == hi) { a[i]; if (i == hi) fail; a[i+1]; break; }
+  // }
+  // The loop exit is dominated by the loop header, so hi is still
+  // a.length - 1 there.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    Label<Word32> merge(&Asm);
+    IF (c) {
+      GOTO(merge, __ ArrayLength(a, compiler::kWithNullCheck));
+    } ELSE {
+      GOTO(merge, __ Word32Constant(0));
+    }
+    BIND(merge, length);
+    V<Word32> hi = __ Word32Sub(length, __ Word32Constant(1));
+    Label<> done(&Asm);
+    GOTO_IF_NOT(__ Int32LessThanOrEqual(__ Word32Constant(0), hi), done);
+    LoopLabel<Word32> loop(&Asm);
+    GOTO(loop, __ Word32Constant(0));
+    BIND_LOOP(loop, k) {
+      BoundsCheck(Asm, a, k, 0);
+      IF (__ Word32Equal(k, hi)) {
+        BoundsCheck(Asm, a, i, 0);
+        FailIf(Asm, __ Word32Equal(i, hi));
+        BoundsCheck(Asm, a, i, 1);
+        GOTO(done);
+      }
+      GOTO(loop, __ Word32Add(k, __ Word32Constant(1)));
+    }
+    BIND(done);
+  });
+  Run(test);
+  // Only a[i] is checked.
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
 TEST_F(WasmBoundsCheckEliminationReducerTest, FallbackSequenceWithAliasLength) {
   // hi = c ? a.length : 0; if (1 <= hi) for (k = 1; ; k++) {
   //   if (!(k < hi)) trap; a[k+1]; a[k+2]; if (k == hi) break;
@@ -1278,6 +1314,104 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, FallbackSequenceWithAliasLength) {
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+}
+
+// for (k = 0; ; k += step) {
+//   if (!(a.length - 1 <=s k)) { a[k+1]; a[k]; }
+//   if (a.length <s k) break;
+// }
+// The accesses come before the exit test, so that only the induction
+// shows that k is non-negative.
+template <typename Asm_t>
+static void LoopWithInclusiveLengthBound(Asm_t& Asm, V<WasmArrayNullable> a,
+                                         int32_t step) {
+  using Test = WasmBoundsCheckEliminationReducerTest;
+  Loop(
+      Asm, 0, step,
+      [&](V<Word32> k) {
+        return __ Int32LessThan(__ ArrayLength(a, compiler::kWithNullCheck), k);
+      },
+      [&](V<Word32> k) {},
+      [&](V<Word32> k) {
+        Label<> next(&Asm);
+        GOTO_IF(__ Int32LessThanOrEqual(Test::ReducedLength(Asm, a, 1), k),
+                next);
+        Test::BoundsCheck(Asm, a, k, 1);
+        Test::BoundsCheck(Asm, a, k, 0);
+        GOTO(next);
+        BIND(next);
+      });
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       LoopWithInclusiveLengthBoundAndLargeStep) {
+  // With k <= a.length < 2^30, k + 2^30 cannot overflow.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    LoopWithInclusiveLengthBound(Asm, a, 1 << 30);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       LoopWithInclusiveLengthBoundAndTooLargeStep) {
+  // With k <= a.length, k + 2^30 + 1 may overflow.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    LoopWithInclusiveLengthBound(Asm, a, (1 << 30) + 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, InterleavedSequences) {
+  // if (i <s 0) fail; if (c <s 0) fail;
+  // a[i]; b[c]; a[i+1]; b[c+1]; a[i+2]; b[c+2];
+  // The sequence for b starts within the one for a. Its fallback code
+  // is emitted on the fast path of the sequence for a, so it does not
+  // contain the checks of a, while the fallback code of the sequence
+  // for a contains the first two checks of b.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    FailIf(Asm, __ Int32LessThan(i, __ Word32Constant(0)));
+    FailIf(Asm, __ Int32LessThan(c, __ Word32Constant(0)));
+    for (int32_t offset = 0; offset < 3; offset++) {
+      BoundsCheck(Asm, a, i, offset);
+      BoundsCheck(Asm, b, c, offset);
+    }
+  });
+  Run(test);
+  // Two FailIf, and two fallback sequences.
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 4u);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 5u + 3u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NoCoalescingBeyondBudget) {
+  // if (i <s 0) fail; a[i]; a[i+1]; a[i+2]; f = c * c * ... * c;
+  // a[i+3]; b[f];
+  // Merging the sequence for a[i] to a[i+2] with the one for a[i+2] and
+  // a[i+3] would duplicate the computation of f, which exceeds the
+  // budget, and the latter does not eliminate enough checks on its own.
+  static constexpr int kFillerSize = 70;
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    FailIf(Asm, __ Int32LessThan(i, __ Word32Constant(0)));
+    for (int32_t offset = 0; offset < 3; offset++) {
+      BoundsCheck(Asm, a, i, offset);
+    }
+    V<Word32> f = c;
+    for (int k = 0; k < kFillerSize; k++) f = __ Word32Mul(f, c);
+    BoundsCheck(Asm, a, i, 3);
+    BoundsCheck(Asm, b, f, 0);
+  });
+  Run(test);
+  size_t multiplications = 0;
+  for (const Operation& op : test.graph().AllOperations()) {
+    const WordBinopOp* binop = op.TryCast<WordBinopOp>();
+    if (binop && binop->kind == WordBinopOp::Kind::kMul) multiplications++;
+  }
+  ASSERT_EQ(multiplications, static_cast<size_t>(kFillerSize));
+  // A FailIf, and one fallback sequence.
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 2u);
+  // a[i+3] and b[f], and the three checks in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 5u);
 }
 
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"

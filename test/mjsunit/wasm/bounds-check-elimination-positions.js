@@ -98,6 +98,28 @@ builder.addFunction('nested',
   ])
   .exportFunc();
 
+// a[i] + b[j] + a[i+1] + b[j+1] + a[i+2] + b[j+2]: the fallback code for
+// b starts within the fallback sequence for a, and each one contains
+// checks of the other array.
+function loadAt(local, offset) {
+  return [
+    kExprLocalGet, local,
+    kExprLocalGet, local + 1,
+    ...wasmI32Const(offset),
+    kExprI32Add,
+    kGCPrefix, kExprArrayGet, array,
+  ];
+}
+builder.addFunction('interleaved',
+                    makeSig([wasmRefNullType(array), kWasmI32,
+                             wasmRefNullType(array), kWasmI32], [kWasmI32]))
+  .addBody([
+    ...loadAt(0, 0), ...loadAt(2, 0), kExprI32Add,
+    ...loadAt(0, 1), kExprI32Add, ...loadAt(2, 1), kExprI32Add,
+    ...loadAt(0, 2), kExprI32Add, ...loadAt(2, 2), kExprI32Add,
+  ])
+  .exportFunc();
+
 let instance = builder.instantiate();
 let exports = instance.exports;
 
@@ -123,15 +145,19 @@ for (let k = 0; k < kLength; k++) {
 }
 const kIndices = [-4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 0x7fffffff,
                   -0x80000000];
+let b = exports.make(kLength - 2);
 let cases = [];
 for (let i of kIndices) {
   cases.push(['loads', () => exports.loads(a, i)]);
   cases.push(['loadsBelow', () => exports.loadsBelow(a, i)]);
   cases.push(['nested', () => exports.nested(aa, i)]);
+  for (let j of kIndices) {
+    cases.push(['interleaved', () => exports.interleaved(a, i, b, j)]);
+  }
 }
 
 let expected = cases.map(([name, f]) => run(f));
-for (let name of ['loads', 'loadsBelow', 'nested']) {
+for (let name of ['loads', 'loadsBelow', 'nested', 'interleaved']) {
   %WasmTierUpFunction(exports[name]);
 }
 for (let k = 0; k < cases.length; k++) {
