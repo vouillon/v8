@@ -94,6 +94,21 @@ namespace v8::internal::compiler::turboshaft {
 // {x | y} does not hold, neither {x} nor {y} holds, and when {x & y}
 // holds for two comparisons (whose values are 0 or 1), both hold.
 //
+// Loop variables are shown to be non-negative by induction. A loop phi
+// {i = phi(c0, i + c)}, with constants {c0 >= 0} and {c > 0}, is
+// non-negative in the whole loop (and after it) if its back edge is only
+// taken when {i < x}, for a bound {x} small enough that {i + c} cannot
+// overflow: an array length minus a constant, or a constant at most
+// {2^31 - c}. Loops written {for (i = c0; i != x; i++)}, as OCaml {for}
+// loops are compiled, are handled too, when the loop is only entered if
+// {c0 <= x}, for a loop-invariant {x}: {i} is then at most {x} in the
+// loop, and when {x} is an array length minus {r >= 1}, the offsets 0
+// to {r - 1} of {i} are within bounds. After loop unrolling, the step is
+// {c > 1} and the back edge is taken when {i + k != x} for all {k} from
+// 0 to {c - 1}, which works the same way. In the unrolled copies, a
+// test {x + k != a.length - r} then shows that {x + k + r} is within
+// bounds when {x + k + r - 1} is.
+//
 // When some bounds checks are later followed by stronger checks in
 // the same block, the instructions in between can be duplicated into
 // two paths:
@@ -454,6 +469,75 @@ class OffsetRange {
 //   (assert (bvult (bvadd x m) l))
 //   (assert (bvule d #x40000000))
 //   (assert (not (non-negative (bvadd (bvadd x m) d))))
+//   (check-sat)
+//
+// Induction for loop phis {i = phi(c0, i + c)}: if {i} is non-negative
+// and the back edge is only taken when {i < x}, then {i + c} is
+// non-negative for a constant bound at most {2^31 - c} (signed or
+// unsigned comparison):
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (assert (non-negative i))
+//   (assert (bvult i x)) ; or (bvslt i x)
+//   (assert (bvugt c #x00000000))
+//   (assert (bvule c #x40000000))
+//   (assert (bvule x (bvadd (bvsub #x7fffffff c) #x00000001)))
+//   (assert (not (non-negative (bvadd i c))))
+//   (check-sat)
+//
+// and for a bound {l - r}, where {l} is an array length:
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const l (_ BitVec 32))
+//   (declare-const r (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (assert (bvule l #x40000000))
+//   (assert (bvult r #x40000000))
+//   (assert (non-negative i))
+//   (assert (bvslt i (bvsub l r)))
+//   (assert (bvugt c #x00000000))
+//   (assert (bvule c #x40000000))
+//   (assert (not (non-negative (bvadd i c))))
+//   (check-sat)
+//
+// For {i != x} loops, {i <= x} is preserved by each increment of 1
+// (and so by an unrolled step {c}, with {i + k != x} for all {k} below
+// {c}):
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (assert (bvsle i x))
+//   (assert (not (= i x)))
+//   (assert (not (bvsle (bvadd i #x00000001) x)))
+//   (check-sat)
+//
+// and {0 <= i <= l - r} shows that the offsets 0 to {r - 1} of {i} are
+// within bounds:
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const l (_ BitVec 32))
+//   (declare-const r (_ BitVec 32))
+//   (declare-const k (_ BitVec 32))
+//   (assert (bvule l #x40000000))
+//   (assert (bvuge r #x00000001))
+//   (assert (bvule r #x40000000))
+//   (assert (non-negative i))
+//   (assert (bvsle i (bvsub l r)))
+//   (assert (bvult k r))
+//   (assert (not (bvult (bvadd i k) l)))
+//   (check-sat)
+//
+// A test {x + m + 1 != l} extends a known range ending at {x + m}:
+//
+//   (declare-const x (_ BitVec 32))
+//   (declare-const m (_ BitVec 32))
+//   (declare-const l (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvult (bvadd x m) l))
+//   (assert (not (= (bvadd (bvadd x m) #x00000001) l)))
+//   (assert (not (bvult (bvadd (bvadd x m) #x00000001) l)))
 //   (check-sat)
 
 // Maps keys of type {K} to values of type {V}. Supports snapshotting
@@ -854,6 +938,19 @@ class WasmBoundsCheckEliminationAnalyzer {
 
   void ProcessCondition(OpIndex trap_if, OpIndex condition, bool inverted,
                         int depth = 0);
+  void ProcessLoopHeader(const Block* header);
+  // Calls {f(comparison, holds)} for the comparisons combined by
+  // {condition} (with and, or, and comparisons to 0) whose value is
+  // known when {condition} holds, or does not hold if not {holds}.
+  template <typename F>
+  void ForEachComparison(OpIndex condition, bool holds, const F& f,
+                         int depth = 0) const;
+  // Calls {f(comparison, holds)} for the comparisons of the branches
+  // leading to {block} from {stop} (excluded) in the dominator tree.
+  template <typename F>
+  void ForEachDominatingComparison(const Block* block, const Block* stop,
+                                   const F& f) const;
+  bool Dominates(const Block* dominator, const Block* block) const;
   void ProcessBoundsCheck(OpIndex trap_if, OpIndex condition,
                           const BoundsCheck& bounds_check, OpIndex base_value,
                           OpIndex array_length, uint32_t extent);

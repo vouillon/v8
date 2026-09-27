@@ -736,6 +736,332 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, ReducedLengthTooLarge) {
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
 }
 
+// Loops over {k}, starting at {init} and adding {step}, with {exit}
+// testing whether to leave the loop before {body}, and after {before}.
+template <typename Asm_t, typename Exit, typename Body,
+          typename Before = void (*)(V<Word32>)>
+static void Loop(
+    Asm_t& Asm, int32_t init, int32_t step, const Exit& exit, const Body& body,
+    const Before& before = [](V<Word32>) {}) {
+  LoopLabel<Word32> loop(&Asm);
+  Label<> done(&Asm);
+  GOTO(loop, __ Word32Constant(init));
+  BIND_LOOP(loop, k) {
+    before(k);
+    GOTO_IF(exit(k), done);
+    body(k);
+    GOTO(loop, __ Word32Add(k, __ Word32Constant(step)));
+  }
+  BIND(done);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LoopWithSignedBound) {
+  // for (k = 0; k <s a.length - 2; k += 3) { a[k]; a[k+1]; a[k+2]; }
+  // k is non-negative, since it starts at 0, and its increments cannot
+  // overflow, so the signed comparison covers the three accesses.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    Loop(
+        Asm, 0, 3,
+        [&](V<Word32> k) {
+          return __ Int32LessThanOrEqual(ReducedLength(Asm, a, 2), k);
+        },
+        [&](V<Word32> k) {
+          BoundsCheck(Asm, a, k, 0);
+          BoundsCheck(Asm, a, k, 1);
+          BoundsCheck(Asm, a, k, 2);
+        });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LoopWithNegativeStart) {
+  // for (k = -1; k <s a.length - 1; k += 1) { a[k+1]; a[k]; }
+  // k may be negative.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    Loop(
+        Asm, -1, 1,
+        [&](V<Word32> k) {
+          return __ Int32LessThanOrEqual(ReducedLength(Asm, a, 1), k);
+        },
+        [&](V<Word32> k) {
+          BoundsCheck(Asm, a, k, 1);
+          BoundsCheck(Asm, a, k, 0);
+        });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LoopWithNegativeStep) {
+  // for (k = 0; k <s a.length - 1; k -= 1) { a[k+1]; a[k]; }
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    Loop(
+        Asm, 0, -1,
+        [&](V<Word32> k) {
+          return __ Int32LessThanOrEqual(ReducedLength(Asm, a, 1), k);
+        },
+        [&](V<Word32> k) {
+          BoundsCheck(Asm, a, k, 1);
+          BoundsCheck(Asm, a, k, 0);
+        });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+template <typename Asm_t>
+static void LoopWithConstantBound(Asm_t& Asm, V<WasmArrayNullable> a,
+                                  int32_t bound, bool is_signed = true) {
+  // for (k = 0; ; k += 3) {
+  //   if (!(a.length - 1 <=s k)) { a[k+1]; a[k]; }
+  //   if (!(k < bound)) break;
+  // }
+  // The accesses come before the exit test, so that only the induction
+  // shows that k is non-negative.
+  using Test = WasmBoundsCheckEliminationReducerTest;
+  Loop(
+      Asm, 0, 3,
+      [&](V<Word32> k) {
+        return is_signed ? __ Int32LessThanOrEqual(__ Word32Constant(bound), k)
+                         : __ Uint32LessThanOrEqual(__ Word32Constant(bound),
+                                                    k);
+      },
+      [&](V<Word32> k) {},
+      [&](V<Word32> k) {
+        Label<> next(&Asm);
+        GOTO_IF(__ Int32LessThanOrEqual(Test::ReducedLength(Asm, a, 1), k),
+                next);
+        Test::BoundsCheck(Asm, a, k, 1);
+        Test::BoundsCheck(Asm, a, k, 0);
+        GOTO(next);
+        BIND(next);
+      });
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LoopWithSmallConstantBound) {
+  // With k < 0x7ffffffd, k + 3 cannot overflow.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    LoopWithConstantBound(Asm, a, 0x7ffffffd);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       LoopWithSmallUnsignedConstantBound) {
+  // With k <u 0x7ffffffd, k + 3 cannot overflow.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    LoopWithConstantBound(Asm, a, 0x7ffffffd, false);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       LoopWithLargeUnsignedConstantBound) {
+  // With k <u 0x7ffffffe, k + 3 may overflow (as a signed integer).
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    LoopWithConstantBound(Asm, a, 0x7ffffffe, false);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LoopWithLargeConstantBound) {
+  // With k < 0x7ffffffe, k + 3 may overflow.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    LoopWithConstantBound(Asm, a, 0x7ffffffe);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+// for (k = init; k != hi; k++) body, where the loop is only entered if
+// {guard} holds.
+template <typename Asm_t, typename Guard, typename Body>
+static void NotEqualLoop(Asm_t& Asm, V<Word32> hi, int32_t init, int32_t step,
+                         const Guard& guard, const Body& body) {
+  Label<> done(&Asm);
+  GOTO_IF_NOT(guard(), done);
+  LoopLabel<Word32> loop(&Asm);
+  GOTO(loop, __ Word32Constant(init));
+  BIND_LOOP(loop, k) {
+    body(k);
+    for (int32_t n = 0; n < step; n++) {
+      GOTO_IF(__ Word32Equal(__ Word32Add(k, __ Word32Constant(n)), hi), done);
+    }
+    GOTO(loop, __ Word32Add(k, __ Word32Constant(step)));
+  }
+  BIND(done);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NotEqualLoop) {
+  // hi = a.length - 1; if (0 <= hi) for (k = 0; ; k++) {
+  //   a[k]; if (k == hi) break;
+  // }
+  // As for an OCaml loop {for k = 0 to Array.length a - 1}: k is at
+  // most hi in the loop.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> hi = ReducedLength(Asm, a, 1);
+    NotEqualLoop(
+        Asm, hi, 0, 1,
+        [&] { return __ Int32LessThanOrEqual(__ Word32Constant(0), hi); },
+        [&](V<Word32> k) { BoundsCheck(Asm, a, k, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NotEqualLoopWithoutGuard) {
+  // Without the guard, k may start above hi, and go past it.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> hi = ReducedLength(Asm, a, 1);
+    NotEqualLoop(
+        Asm, hi, 0, 1, [&] { return c; },
+        [&](V<Word32> k) { BoundsCheck(Asm, a, k, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NotEqualLoopAboveGuard) {
+  // if (0 <= hi) for (k = 1; ; k++): k may start above hi.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> hi = ReducedLength(Asm, a, 1);
+    NotEqualLoop(
+        Asm, hi, 1, 1,
+        [&] { return __ Int32LessThanOrEqual(__ Word32Constant(0), hi); },
+        [&](V<Word32> k) { BoundsCheck(Asm, a, k, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NotEqualLoopExcludedValue) {
+  // if (0 <= hi && hi != 0) for (k = 1; ; k++), as after peeling the
+  // first iteration of a loop from 0: k starts at most at hi.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> hi = ReducedLength(Asm, a, 1);
+    Label<> done(&Asm);
+    GOTO_IF(__ Int32LessThan(hi, __ Word32Constant(0)), done);
+    NotEqualLoop(
+        Asm, hi, 1, 1, [&] { return hi; },
+        [&](V<Word32> k) { BoundsCheck(Asm, a, k, 0); });
+    GOTO(done);
+    BIND(done);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NotEqualLoopAboveExcludedValue) {
+  // if (0 <= hi && hi != 0) for (k = 2; ; k++): hi may be 1.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> hi = ReducedLength(Asm, a, 1);
+    Label<> done(&Asm);
+    GOTO_IF(__ Int32LessThan(hi, __ Word32Constant(0)), done);
+    NotEqualLoop(
+        Asm, hi, 2, 1, [&] { return hi; },
+        [&](V<Word32> k) { BoundsCheck(Asm, a, k, 0); });
+    GOTO(done);
+    BIND(done);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NotEqualLoopWhenZero) {
+  // if (0 <= hi && !hi) for (k = 1; ; k++): k starts above hi.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> hi = ReducedLength(Asm, a, 1);
+    Label<> done(&Asm);
+    GOTO_IF(__ Int32LessThan(hi, __ Word32Constant(0)), done);
+    // The loop is entered on the false edge of a branch on hi.
+    GOTO_IF(hi, done);
+    NotEqualLoop(
+        Asm, hi, 1, 1, [&] { return c; },
+        [&](V<Word32> k) { BoundsCheck(Asm, a, k, 0); });
+    GOTO(done);
+    BIND(done);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, UnrolledNotEqualLoop) {
+  // if (0 <= hi) for (k = 0; ; k += 2) {
+  //   a[k]; if (k == hi) break; if (k + 1 == hi) break;
+  // }
+  // As after unrolling: k still does not go past hi.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> hi = ReducedLength(Asm, a, 1);
+    NotEqualLoop(
+        Asm, hi, 0, 2,
+        [&] { return __ Int32LessThanOrEqual(__ Word32Constant(0), hi); },
+        [&](V<Word32> k) { BoundsCheck(Asm, a, k, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, SteppingOverNotEqual) {
+  // if (0 <= hi) for (k = 0; ; k += 2) { a[k]; if (k == hi) break; }
+  // k may step over hi.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> hi = ReducedLength(Asm, a, 1);
+    Label<> done(&Asm);
+    GOTO_IF_NOT(__ Int32LessThanOrEqual(__ Word32Constant(0), hi), done);
+    Loop(
+        Asm, 0, 2, [&](V<Word32> k) { return __ Word32Constant(0); },
+        [&](V<Word32> k) {
+          BoundsCheck(Asm, a, k, 0);
+          GOTO_IF(__ Word32Equal(k, hi), done);
+        });
+    GOTO(done);
+    BIND(done);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NotEqualToLength) {
+  // a[i]; if (i + 1 == a.length) fail; a[i+1];
+  // i + 1 is at most the length, and not equal to it.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Word32Equal(__ Word32Add(i, __ Word32Constant(1)), length));
+    BoundsCheck(Asm, a, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, EqualToLength) {
+  // a[i]; if (i + 1 == a.length) a[i+1];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm, __ Word32Equal(__ Word32Add(i, __ Word32Constant(1)), length),
+       [&] { BoundsCheck(Asm, a, i, 1); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NotEqualToLengthTooFar) {
+  // a[i]; if (i + 2 == a.length) fail; a[i+1];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Word32Equal(__ Word32Add(i, __ Word32Constant(2)), length));
+    BoundsCheck(Asm, a, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"
 
 }  // namespace v8::internal::compiler::turboshaft

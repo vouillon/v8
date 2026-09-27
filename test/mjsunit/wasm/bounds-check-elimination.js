@@ -508,6 +508,196 @@ function store(array, param, offset, value) {
 const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
     ? Number(arguments[0]) : 0x2545f491;
 
+(function TestLoops() {
+  print(arguments.callee.name);
+  // Loops over k, from {init} by {step}, with various exit conditions,
+  // accessing a[k + d] for each offset d of {accesses}. The loops stop
+  // after {kMaxIterations} iterations in any case.
+  const kMaxIterations = 20;
+  let builder = new WasmModuleBuilder();
+  let array = builder.addArray(kWasmI32);
+  addArrayHelpers(builder, array);
+  const kA = 0, kK = 1, kCount = 2, kAcc = 3, kHi = 4;
+  let length = [kExprLocalGet, kA, kGCPrefix, kExprArrayLen];
+  let k = (d) => d == 0 ? [kExprLocalGet, kK]
+                        : [kExprLocalGet, kK, ...wasmI32Const(d), kExprI32Add];
+  // Exits: {test} is true to leave the loop at the top of an iteration;
+  // with {ne}, the loop is left after the accesses when k == hi, and it
+  // is only entered if {guard} (hi >= guard) holds.
+  let exits = {
+    ltSLength0: {test: [...length, ...k(0), kExprI32LeS],
+                 model: (k, n) => !(k < n)},
+    ltSLength2: {test: [...length, ...wasmI32Const(2), kExprI32Sub, ...k(0),
+                        kExprI32LeS],
+                 model: (k, n) => !(k < ((n - 2) | 0))},
+    ltSmall: {test: [...wasmI32Const(6), ...k(0), kExprI32LeS],
+              model: (k, n) => !(k < 6)},
+    ltHuge: {test: [...wasmI32Const(0x7ffffffe), ...k(0), kExprI32LeS],
+             model: (k, n) => !(k < 0x7ffffffe)},
+    ltULength: {test: [...length, ...k(0), kExprI32LeU],
+                model: (k, n) => !((k >>> 0) < n)},
+    ltUHuge: {test: [...wasmI32Const(0x7fffffff), ...k(0), kExprI32LeU],
+              model: (k, n) => !((k >>> 0) < 0x7fffffff)},
+    ltUMedium: {test: [...wasmI32Const(0x7ffffffe), ...k(0), kExprI32LeU],
+                model: (k, n) => !((k >>> 0) < 0x7ffffffe)},
+    // k - 0x20 <s 0x7fffffe0 holds up to k = 0x7fffffff.
+    ltSOffset: {test: [...wasmI32Const(0x7fffffe0), ...k(-0x20),
+                       kExprI32LeS],
+                model: (k, n) => !(((k - 0x20) | 0) < 0x7fffffe0)},
+    // a.length - 1 wraps around for an empty array.
+    ltULength1: {test: [...length, ...wasmI32Const(1), kExprI32Sub, ...k(0),
+                        kExprI32LeU],
+                 model: (k, n) => !((k >>> 0) < ((n - 1) >>> 0))},
+    neLength1: {ne: 1, guard: 0}, neLength2: {ne: 2, guard: 0},
+    neLength1Guard1: {ne: 1, guard: 1},
+    neLength1NoGuard: {ne: 1},
+  };
+  let cases = [];
+  for (let init of [-1, 0, 1, 2]) {
+    for (let step of [-1, 1, 2, 3]) {
+      for (let [exitName, exit] of Object.entries(exits)) {
+        for (let accesses of [[0], [0, 1], [2, 1, 0], [-1, 0], [1]]) {
+          cases.push({init, step, exitName, exit, accesses,
+                      store: cases.length % 2 == 0});
+        }
+      }
+    }
+  }
+  // Starting close to 2^31, so that k can wrap around within the maximal
+  // number of iterations when the bound does not prevent it.
+  // Without accesses in the loop, which would trap first, so that the
+  // access after the loop uses what is known about k once it wrapped.
+  // Loop unrolling makes the loop variable take one value every few
+  // steps, so a few starting values are tried for it to wrap around.
+  for (let step of [1, 2, 3]) {
+    for (let exitName of ['ltHuge', 'ltSmall', 'ltUHuge', 'ltUMedium',
+                          'ltULength1', 'ltSOffset', 'neLength1NoGuard']) {
+      for (let init = 0x7ffffff0; init < 0x7ffffffc; init++) {
+        cases.push({init, step, exitName, exit: exits[exitName],
+                    accesses: init == 0x7ffffff0 ? [0] : [], store: false});
+      }
+    }
+  }
+  let sig = makeSig([wasmRefNullType(array)], [kWasmI32]);
+  // if (k <s a.length) acc += a[k] + 1, which uses what is known about k
+  // at the top of the loop, or after it.
+  let useK = [...k(0), ...length, kExprI32LtS,
+              kExprIf, kWasmVoid,
+                kExprLocalGet, kAcc, ...wasmI32Const(1), kExprI32Add,
+                kExprLocalGet, kA, ...k(0), kGCPrefix, kExprArrayGet, array,
+                kExprI32Add, kExprLocalSet, kAcc,
+              kExprEnd];
+  for (let [n, c] of cases.entries()) {
+    let body = [];
+    for (let [m, d] of c.accesses.entries()) {
+      if (c.store) {
+        body.push(kExprLocalGet, kA, ...k(d), ...wasmI32Const(m + 1),
+                  kGCPrefix, kExprArraySet, array);
+      } else {
+        body.push(kExprLocalGet, kAcc, ...wasmI32Const(31), kExprI32Mul,
+                  kExprLocalGet, kA, ...k(d), kGCPrefix, kExprArrayGet, array,
+                  kExprI32Add, kExprLocalSet, kAcc);
+      }
+    }
+    let code = [];
+    if (c.exit.ne !== undefined) {
+      // hi = a.length - ne; if (hi >= guard) { loop }
+      code.push(...length, ...wasmI32Const(c.exit.ne), kExprI32Sub,
+                kExprLocalSet, kHi);
+      if (c.exit.guard !== undefined) {
+        code.push(kExprLocalGet, kHi, ...wasmI32Const(c.exit.guard),
+                  kExprI32LtS, kExprIf, kWasmVoid,
+                    kExprLocalGet, kAcc, kExprReturn,
+                  kExprEnd);
+      }
+    }
+    code.push(...wasmI32Const(c.init), kExprLocalSet, kK,
+              kExprBlock, kWasmVoid,
+                kExprLoop, kWasmVoid,
+                  ...useK,
+                  // if (count++ == kMaxIterations) break;
+                  kExprLocalGet, kCount, ...wasmI32Const(kMaxIterations),
+                  kExprI32Eq, kExprBrIf, 1,
+                  kExprLocalGet, kCount, ...wasmI32Const(1), kExprI32Add,
+                  kExprLocalSet, kCount,
+                  ...(c.exit.test ? [...c.exit.test, kExprBrIf, 1] : []),
+                  ...body,
+                  ...(c.exit.ne !== undefined
+                      ? [...k(0), kExprLocalGet, kHi, kExprI32Eq,
+                         kExprBrIf, 1]
+                      : []),
+                  ...k(c.step), kExprLocalSet, kK,
+                  kExprBr, 0,
+                kExprEnd,
+              kExprEnd,
+              ...useK,
+              kExprLocalGet, kAcc);
+    builder.addFunction(`loop${n}`, sig)
+      .addLocals(kWasmI32, 4)
+      .addBody(code)
+      .exportFunc();
+  }
+  let instance = builder.instantiate();
+  // The model.
+  function run(c, a) {
+    let n = a.length, acc = 0, count = 0, hi;
+    if (c.exit.ne !== undefined) {
+      hi = (n - c.exit.ne) | 0;
+      if (c.exit.guard !== undefined && hi < c.exit.guard) return acc;
+    }
+    let k = c.init;
+    let useK = () => {
+      if (k < n) {
+        if ((k >>> 0) >= n) throw new Error(kOutOfBounds);
+        acc = (acc + 1 + a[k]) | 0;
+      }
+    };
+    while (true) {
+      useK();
+      if (count == kMaxIterations) break;
+      count++;
+      if (c.exit.model && c.exit.model(k, n)) break;
+      for (let [m, d] of c.accesses.entries()) {
+        let index = (k + d) | 0;
+        if ((index >>> 0) >= n) throw new Error(kOutOfBounds);
+        if (c.store) {
+          a[index] = m + 1;
+        } else {
+          acc = (Math.imul(acc, 31) + a[index]) | 0;
+        }
+      }
+      if (c.exit.ne !== undefined && k == hi) break;
+      k = (k + c.step) | 0;
+    }
+    useK();
+    return acc;
+  }
+  for (let [n, c] of cases.entries()) {
+    for (let len of [0, 1, 2, 3, 5, 8]) {
+      let a = instance.exports.make(len);
+      let model = new Array(len).fill(0);
+      for (let m = 0; m < len; m++) {
+        instance.exports.set?.(a, m, m);
+      }
+      let expected;
+      try {
+        expected = run(c, model);
+      } catch (e) {
+        expected = e;
+      }
+      let name = `${c.exitName} init ${c.init} step ${c.step} ` +
+                 `accesses ${c.accesses} length ${len}`;
+      if (expected instanceof Error) {
+        assertTraps(kTrapArrayOutOfBounds,
+                    () => instance.exports[`loop${n}`](a), name);
+      } else {
+        assertEquals(expected, instance.exports[`loop${n}`](a), name);
+      }
+      assertEquals(model, contents(instance, a, len), name);
+    }
+  }
+})();
+
 (function TestRandomAccessSequences() {
   print(arguments.callee.name);
 

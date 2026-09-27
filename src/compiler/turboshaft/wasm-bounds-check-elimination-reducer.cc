@@ -5,6 +5,8 @@
 #include "src/compiler/turboshaft/wasm-bounds-check-elimination-reducer.h"
 
 #include <iomanip>
+#include <map>
+#include <set>
 
 #include "src/wasm/wasm-objects.h"
 
@@ -91,6 +93,10 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
       base::VectorOf(predecessor_non_negative_snapshots_));
   known_min_lengths_.StartNewSnapshot(
       base::VectorOf(predecessor_min_length_snapshots_));
+
+  if (block->IsLoop() && !ShouldSkipOptimizationStep()) {
+    ProcessLoopHeader(block);
+  }
 
   if (block->IsBranchTarget() && !ShouldSkipOptimizationStep()) {
     // The current block is a branch target, so we see if the branch
@@ -191,6 +197,37 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessCondition(OpIndex trap_if,
                          depth + 1);
         return;
       }
+    }
+  }
+  if (const ComparisonOp* comparison =
+          graph_.Get(condition).TryCast<ComparisonOp>();
+      comparison && inverted &&
+      comparison->kind == ComparisonOp::Kind::kEqual &&
+      comparison->rep == RegisterRepresentation::Word32()) {
+    // {x + k != a.length - r}: if {x + k + r - 1} is known to be within
+    // bounds, then so is {x + k + r} (see the proofs in the header).
+    for (auto [index, length] :
+         {std::pair{comparison->left(), comparison->right()},
+          std::pair{comparison->right(), comparison->left()}}) {
+      std::optional<std::pair<OpIndex, uint32_t>> array_length =
+          TryExtractArrayLength(length);
+      if (!array_length) continue;
+      const auto& [length_op, reduction] = *array_length;
+      auto [base, base_value, offset] = ExtractBaseAndOffset(index);
+      OpIndex array =
+          ResolveAliases(graph_.Get(length_op).Cast<ArrayLengthOp>().array());
+      BoundsCheckKey key(base, array);
+      uint32_t last = offset + reduction - 1;
+      std::optional<OffsetRange> known =
+          KnownOffsets(key, NonNegativeOffsets(base));
+      if (!known.has_value() || !known->Contains(last) ||
+          known->Contains(last + 1)) {
+        continue;
+      }
+      TRACE("  Not equal to the array length");
+      ProcessBoundsCheck(OpIndex::Invalid(), condition,
+                         BoundsCheck(key, last + 1), base_value, length_op, 0);
+      return;
     }
   }
   if (auto signed_decoded =
@@ -551,6 +588,279 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractSignedBoundsCheckCondition(
   if (!is_non_negative) return std::nullopt;
   return BoundsCheckCondition{BoundsCheck(BoundsCheckKey(base, array), offset),
                               base_value, length_op, reduction};
+}
+
+template <typename F>
+void WasmBoundsCheckEliminationAnalyzer::ForEachComparison(OpIndex condition,
+                                                           bool holds,
+                                                           const F& f,
+                                                           int depth) const {
+  static constexpr int kMaxDepth = 4;
+  const Operation& op = graph_.Get(condition);
+  if (depth < kMaxDepth) {
+    if (const WordBinopOp* binop = op.TryCast<WordBinopOp>();
+        binop && binop->rep == WordRepresentation::Word32()) {
+      if (binop->kind == WordBinopOp::Kind::kBitwiseOr && !holds) {
+        ForEachComparison(binop->left(), false, f, depth + 1);
+        ForEachComparison(binop->right(), false, f, depth + 1);
+        return;
+      }
+      if (binop->kind == WordBinopOp::Kind::kBitwiseAnd && holds &&
+          graph_.Get(binop->left()).Is<ComparisonOp>() &&
+          graph_.Get(binop->right()).Is<ComparisonOp>()) {
+        ForEachComparison(binop->left(), true, f, depth + 1);
+        ForEachComparison(binop->right(), true, f, depth + 1);
+        return;
+      }
+    }
+  }
+  if (const ComparisonOp* comparison = op.TryCast<ComparisonOp>();
+      comparison && comparison->rep == RegisterRepresentation::Word32()) {
+    if (depth < kMaxDepth && comparison->kind == ComparisonOp::Kind::kEqual) {
+      if (auto constant = TryExtractI32Const(comparison->right());
+          constant.has_value() && *constant == 0) {
+        ForEachComparison(comparison->left(), !holds, f, depth + 1);
+        return;
+      }
+    }
+    f(*comparison, holds);
+  }
+}
+
+template <typename F>
+void WasmBoundsCheckEliminationAnalyzer::ForEachDominatingComparison(
+    const Block* block, const Block* stop, const F& f) const {
+  for (const Block* b = block; b != nullptr && b != stop;
+       b = b->GetDominator()) {
+    if (!b->IsBranchTarget()) continue;
+    const BranchOp* branch =
+        b->LastPredecessor()->LastOperation(graph_).TryCast<BranchOp>();
+    if (!branch) continue;
+    ForEachComparison(branch->condition(), b == branch->if_true, f);
+  }
+}
+
+bool WasmBoundsCheckEliminationAnalyzer::Dominates(const Block* dominator,
+                                                   const Block* block) const {
+  for (const Block* b = block; b != nullptr; b = b->GetDominator()) {
+    if (b == dominator) return true;
+  }
+  return false;
+}
+
+// Loop induction. A loop phi {i = phi(c0, i + c)}, where {c0 >= 0} and
+// {c > 0} are constants, is non-negative in the whole loop when the back
+// edge is only taken if {i < x} (signed or unsigned), for a bound {x}
+// small enough that {i + c} cannot overflow (an array length minus a
+// constant, or a constant). With {c = 1}, it is also non-negative when
+// the back edge is only taken if {i != x}, for a loop-invariant {x}, and
+// the loop is only entered if {c0 <= x}: {i} is then at most {x} in the
+// whole loop, which is a bounds check fact when {x} is an array length
+// minus a constant (see the proofs in the header).
+void WasmBoundsCheckEliminationAnalyzer::ProcessLoopHeader(
+    const Block* header) {
+  if (header->PredecessorCount() != 2) return;
+  const Block* back_edge = header->LastPredecessor();
+  const Block* forward = back_edge->NeighboringPredecessor();
+  for (OpIndex index : graph_.OperationIndices(*header)) {
+    const PhiOp* phi = graph_.Get(index).TryCast<PhiOp>();
+    if (!phi) continue;
+    if (phi->rep != RegisterRepresentation::Word32() || phi->input_count != 2) {
+      continue;
+    }
+    std::optional<uint32_t> init = TryExtractI32Const(phi->input(0));
+    if (!init.has_value() || static_cast<int32_t>(*init) < 0) continue;
+    OpIndex value = CanonicalValue(index);
+    BaseAndOffset step = ExtractBaseAndOffset(phi->back_edge());
+    if (step.base != value) continue;
+    uint32_t c = step.offset;
+    if (c == 0 || c > kMaxArrayLength) continue;
+
+    // Whether {x}, for {i < x} (or {i <= x} if {inclusive}), bounds {i}
+    // enough for {i + c} not to overflow.
+    auto small_bound = [&](OpIndex x, bool is_signed, bool inclusive) {
+      if (auto constant = TryExtractI32Const(x)) {
+        // {i < x <= 2^31 - c} (or {i <= x <= 2^31 - 1 - c}), so that
+        // {i + c <= 2^31 - 1}. A negative {x} is fine for a signed
+        // comparison: the back edge is then never taken.
+        uint32_t limit = uint32_t{kMaxInt} - c + (inclusive ? 0 : 1);
+        return is_signed ? static_cast<int32_t>(*constant) <=
+                               static_cast<int32_t>(limit)
+                         : *constant <= limit;
+      }
+      BaseAndOffset bound = ExtractBaseAndOffset(x);
+      if (!bound.base.valid() || !graph_.Get(bound.base).Is<ArrayLengthOp>()) {
+        return false;
+      }
+      // {x = a.length + bound.offset}: signed, a non-positive offset
+      // keeps {x} below the maximal length; unsigned, {x} could wrap
+      // around unless the offset is 0.
+      return is_signed ? static_cast<int32_t>(bound.offset) <= 0 &&
+                             static_cast<int32_t>(bound.offset) >
+                                 -static_cast<int32_t>(kMaxArrayLength)
+                       : bound.offset == 0;
+    };
+    auto is_value = [&](OpIndex v) {
+      BaseAndOffset b = ExtractBaseAndOffset(v);
+      return b.base == value && b.offset == 0;
+    };
+    auto is_loop_invariant = [&](OpIndex v) {
+      return TryExtractI32Const(v).has_value() ||
+             Dominates(&graph_.Get(graph_.BlockOf(v)), forward);
+    };
+
+    bool non_negative = false;
+    OpIndex upper = OpIndex::Invalid();  // {i <= upper} in the loop.
+    // For the comparisons {i + k != x}: the offsets {k} for each {x}.
+    std::map<OpIndex, std::set<uint32_t>> not_equal_offsets;
+    std::map<OpIndex, OpIndex> not_equal_values;
+    ForEachDominatingComparison(
+        back_edge, header, [&](const ComparisonOp& cmp, bool holds) {
+          using Kind = ComparisonOp::Kind;
+          // Normalize to {left kind right}, which holds, or {left != right}.
+          OpIndex left = cmp.left(), right = cmp.right();
+          Kind kind = cmp.kind;
+          bool not_equal = false;
+          if (!holds) {
+            if (kind == Kind::kEqual) {
+              not_equal = true;
+            } else {
+              std::swap(left, right);
+              kind =
+                  kind == Kind::kSignedLessThan ? Kind::kSignedLessThanOrEqual
+                  : kind == Kind::kSignedLessThanOrEqual ? Kind::kSignedLessThan
+                  : kind == Kind::kUnsignedLessThan
+                      ? Kind::kUnsignedLessThanOrEqual
+                      : Kind::kUnsignedLessThan;
+            }
+          } else if (kind == Kind::kEqual) {
+            return;
+          }
+          if (not_equal) {
+            // {i + k != x}: record {k} for {x}.
+            BaseAndOffset l = ExtractBaseAndOffset(left);
+            BaseAndOffset r = ExtractBaseAndOffset(right);
+            if (l.base == value) {
+              not_equal_offsets[CanonicalValue(right)].insert(l.offset);
+              not_equal_values.try_emplace(CanonicalValue(right), right);
+            } else if (r.base == value) {
+              not_equal_offsets[CanonicalValue(left)].insert(r.offset);
+              not_equal_values.try_emplace(CanonicalValue(left), left);
+            }
+            return;
+          }
+          if (!is_value(left)) return;
+          bool is_signed = kind == Kind::kSignedLessThan ||
+                           kind == Kind::kSignedLessThanOrEqual;
+          bool inclusive = kind == Kind::kSignedLessThanOrEqual ||
+                           kind == Kind::kUnsignedLessThanOrEqual;
+          if (small_bound(right, is_signed, inclusive)) non_negative = true;
+        });
+    // With {i + k != x} for all {k} from 0 to {c - 1} on the path to the
+    // back edge (as after unrolling a loop with a step of 1), {i} never
+    // goes past {x} if it starts at most at {x}.
+    static constexpr uint32_t kMaxUnrolledStep = 16;
+    for (const auto& [x, offsets] : not_equal_offsets) {
+      if (upper.valid() || c > kMaxUnrolledStep) break;
+      bool covered = true;
+      for (uint32_t k = 0; k < c; k++) covered &= offsets.contains(k);
+      OpIndex x_value = not_equal_values[x];
+      if (!covered || !is_loop_invariant(x_value)) continue;
+      // The loop must only be entered if {c0 <= x}: look for a lower
+      // bound of {x} ({k <= x} or {k < x}), raised by the values that
+      // {x} is known to differ from.
+      std::optional<int64_t> lower;
+      std::set<int64_t> excluded;
+      if (auto constant = TryExtractI32Const(x_value)) {
+        lower = static_cast<int32_t>(*constant);
+      }
+      using Kind = ComparisonOp::Kind;
+      auto guard = [&](const ComparisonOp& cmp, bool holds) {
+        Kind kind = cmp.kind;
+        OpIndex l = cmp.left(), r = cmp.right();
+        if (kind == Kind::kEqual) {
+          if (holds) return;
+          OpIndex other = CanonicalValue(l) == x   ? r
+                          : CanonicalValue(r) == x ? l
+                                                   : OpIndex::Invalid();
+          if (!other.valid()) return;
+          if (auto k = TryExtractI32Const(other)) {
+            excluded.insert(static_cast<int32_t>(*k));
+          }
+          return;
+        }
+        if (!holds) {
+          if (kind == Kind::kSignedLessThan) {
+            std::swap(l, r);
+            kind = Kind::kSignedLessThanOrEqual;
+          } else if (kind == Kind::kSignedLessThanOrEqual) {
+            std::swap(l, r);
+            kind = Kind::kSignedLessThan;
+          } else {
+            return;
+          }
+        }
+        if (CanonicalValue(r) != x) return;
+        auto k = TryExtractI32Const(l);
+        if (!k.has_value()) return;
+        int64_t bound = static_cast<int32_t>(*k);
+        if (kind == Kind::kSignedLessThan) {
+          bound += 1;
+        } else if (kind != Kind::kSignedLessThanOrEqual) {
+          return;
+        }
+        if (!lower.has_value() || bound > *lower) lower = bound;
+      };
+      for (const Block* b = forward; b != nullptr; b = b->GetDominator()) {
+        if (!b->IsBranchTarget()) continue;
+        const BranchOp* branch =
+            b->LastPredecessor()->LastOperation(graph_).TryCast<BranchOp>();
+        if (!branch) continue;
+        bool holds = b == branch->if_true;
+        // A branch on {x} itself shows that {x != 0} when taken.
+        if (holds && CanonicalValue(branch->condition()) == x) {
+          excluded.insert(0);
+          continue;
+        }
+        ForEachComparison(branch->condition(), holds, guard);
+      }
+      bool entered = false;
+      if (lower.has_value()) {
+        int64_t bound = *lower;
+        while (excluded.contains(bound)) bound++;
+        entered = static_cast<int32_t>(*init) <= bound;
+      }
+      if (entered) {
+        non_negative = true;
+        upper = x_value;
+      }
+    }
+    if (!non_negative) continue;
+    TRACE("  Loop induction: " << index << " is non-negative");
+    RecordNonNegativeOffset(value, 0);
+    if (!upper.valid()) continue;
+    // {i <= a.length - r} with {r >= 1}: the offsets 0 to {r - 1} of {i}
+    // are within bounds.
+    BaseAndOffset bound = ExtractBaseAndOffset(upper);
+    if (!bound.base.valid()) continue;
+    const ArrayLengthOp* length =
+        graph_.Get(bound.base).TryCast<ArrayLengthOp>();
+    if (!length) continue;
+    int32_t offset = static_cast<int32_t>(bound.offset);
+    if (offset >= 0 || offset < -static_cast<int32_t>(kMaxArrayLength)) {
+      continue;
+    }
+    OpIndex array = ResolveAliases(length->array());
+    uint32_t last = static_cast<uint32_t>(-offset) - 1;
+    TRACE("  Loop induction: offsets [0, " << last << "] of " << index
+                                           << " within bounds of " << array);
+    BoundsCheckKey key(value, array);
+    std::optional<OffsetRange> known = known_bounds_checks_.Get(key);
+    std::optional<OffsetRange> range = OffsetRange(0, last);
+    if (known.has_value()) range = known->Hull(*range);
+    if (range.has_value()) known_bounds_checks_.Set(key, *range);
+    RecordMinLength(array, uint64_t{last} + 1);
+  }
 }
 
 // Recognizes {a.length} and {a.length - c} (possibly written
