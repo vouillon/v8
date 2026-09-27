@@ -97,6 +97,23 @@ class WasmBoundsCheckEliminationReducerTest : public ReducerTest {
     test.Run<WasmBoundsCheckEliminationReducer>();
   }
 
+  // The number of comparisons of a guard checking both bounds.
+  static constexpr size_t kTwoSidedGuardComparisons =
+      FallbackInstructionSequence::single_comparison_two_sided_guard ? 1 : 2;
+
+  // The number of 64-bit comparisons, as used by single-comparison
+  // guards checking both bounds.
+  static size_t CountWord64Comparisons(TestInstance& test) {
+    size_t count = 0;
+    for (const Operation& op : test.graph().AllOperations()) {
+      const ComparisonOp* comparison = op.TryCast<ComparisonOp>();
+      if (comparison && comparison->rep == RegisterRepresentation::Word64()) {
+        count++;
+      }
+    }
+    return count;
+  }
+
  private:
   const FlagScope<bool> flag_bounds_check_elimination_;
 };
@@ -168,7 +185,8 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, NoFallbackForSingleCheck) {
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, NoFallbackForTwoSidedGuard) {
-  // a[i]; a[i+1]; would need a guard with two checks.
+  // a[i]; a[i+1]; would need a guard checking both bounds, which does
+  // not eliminate enough checks.
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     BoundsCheck(Asm, a, i, 0);
     BoundsCheck(Asm, a, i, 1);
@@ -179,7 +197,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, NoFallbackForTwoSidedGuard) {
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, NoFallbackForTwoSidedGuardBelow) {
-  // a[i+1]; a[i]; would need a guard with two checks.
+  // a[i+1]; a[i]; would need a guard checking both bounds.
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     BoundsCheck(Asm, a, i, 1);
     BoundsCheck(Asm, a, i, 0);
@@ -191,7 +209,8 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, NoFallbackForTwoSidedGuardBelow) {
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForFourChecks) {
   // a[i]; a[i+1]; a[i+2]; a[i+3];
-  // -> guarded by i < a.length && i+3 < a.length
+  // -> guarded by i < a.length && i+3 < a.length, or on 64-bit targets
+  // by zext(i) + 3 < zext(a.length)
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     BoundsCheck(Asm, a, i, 0);
     BoundsCheck(Asm, a, i, 1);
@@ -201,8 +220,26 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForFourChecks) {
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 4u);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
-  // 4 original comparisons, 2 guards, 4 in the fallback code.
-  ASSERT_EQ(test.CountOp(Opcode::kComparison), 10u);
+  // 4 original comparisons, the guard, 4 in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kComparison), 8u + kTwoSidedGuardComparisons);
+  ASSERT_EQ(CountWord64Comparisons(test),
+            FallbackInstructionSequence::single_comparison_two_sided_guard);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForThreeChecks) {
+  // a[i]; a[i+1]; a[i+2];
+  // With a single comparison for the guard, it eliminates two checks.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    BoundsCheck(Asm, a, i, 1);
+    BoundsCheck(Asm, a, i, 2);
+  });
+  Run(test);
+  bool fallback =
+      FallbackInstructionSequence::single_comparison_two_sided_guard;
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
+  ASSERT_EQ(CountWord64Comparisons(test), fallback ? 1u : 0u);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForChainBelow) {
@@ -216,7 +253,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForChainBelow) {
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 4u);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
-  ASSERT_EQ(test.CountOp(Opcode::kComparison), 10u);
+  ASSERT_EQ(test.CountOp(Opcode::kComparison), 8u + kTwoSidedGuardComparisons);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest,

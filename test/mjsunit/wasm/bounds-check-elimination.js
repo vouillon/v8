@@ -112,6 +112,12 @@ function store(array, param, offset, value) {
     zigzag: [2, 3, 1, 4, 0],
     wrapAround: [-2, -1, 0, 1],
     large: [0x7ffffffd, 0x7ffffffe, 0x7fffffff, -0x80000000],
+    // With a single-comparison guard checking both bounds (on 64-bit
+    // targets), three accesses are enough for a fallback sequence.
+    three: [0, 1, 2],
+    threeBelow: [2, 1, 0],
+    threeWrapAround: [-1, 0, 1],
+    threeLarge: [0x7ffffffe, 0x7fffffff, -0x80000000],
   };
   for (let [name, offsets] of Object.entries(sequences)) {
     builder.addFunction(name, sig)

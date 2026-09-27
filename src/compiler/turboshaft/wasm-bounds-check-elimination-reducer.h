@@ -120,7 +120,8 @@ namespace v8::internal::compiler::turboshaft {
 //     a[i+1] = 11;
 // needs a guard {i < a.length && i + 1 < a.length}, unless {i} is
 // already known to be non-negative, in which case {i + 1 < a.length}
-// is enough.
+// is enough. On 64-bit targets, the two checks are done with a single
+// 64-bit comparison {zext(i) + 1 < zext(a.length)}.
 
 // Key for grouping bounds checks by base and array
 struct BoundsCheckKey {
@@ -378,6 +379,42 @@ class OffsetRange {
 //   (assert (valid-range k hi))
 //   (assert (not (bvult (bvadd x k) l)))
 //   (check-sat)
+//
+// On 64-bit targets, a guard checking both bounds of the range lo..hi
+// is the single comparison zext(x + lo) + (hi - lo) < zext(l), with
+// 64-bit zero extensions. It shows that all the offsets of the range
+// are within bounds:
+//
+//   (define-fun zext ((v (_ BitVec 32))) (_ BitVec 64)
+//     ((_ zero_extend 32) v))
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (declare-const hi (_ BitVec 32))
+//   (declare-const k (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (valid-range lo hi))
+//   (assert (bvult (bvadd (zext (bvadd x lo)) (zext (bvsub hi lo)))
+//                  (zext l)))
+//   (assert (valid-range lo k))
+//   (assert (valid-range k hi))
+//   (assert (not (bvult (bvadd x k) l)))
+//   (check-sat)
+//
+// It holds whenever both bounds are within bounds, so it never sends
+// to the fallback code a sequence whose checks would all succeed:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (declare-const hi (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (valid-range lo hi))
+//   (assert (bvult (bvadd x lo) l))
+//   (assert (bvult (bvadd x hi) l))
+//   (assert (not (bvult (bvadd (zext (bvadd x lo)) (zext (bvsub hi lo)))
+//                       (zext l))))
+//   (check-sat)
 
 // Maps keys of type {K} to values of type {V}. Supports snapshotting
 // for control flow merge points.
@@ -467,11 +504,21 @@ struct FallbackInstructionSequence {
   // elimination).
   static constexpr int min_eliminated_checks = 2;
 
+  // On 64-bit targets, a guard checking both bounds is a single
+  // comparison, done on 64 bits (see {EmitTwoSidedBoundsCheck}).
+  static constexpr bool single_comparison_two_sided_guard = Is64();
+
   // Which bounds of {offsets} the guard needs to check.
   struct Guard {
     bool check_lower;
     bool check_upper;
-    int check_count() const { return check_lower + check_upper; }
+    // The number of comparisons of the guard.
+    int check_count() const {
+      if (check_lower && check_upper && single_comparison_two_sided_guard) {
+        return 1;
+      }
+      return check_lower + check_upper;
+    }
   };
 
   FallbackInstructionSequence(Zone* zone, const BoundsCheckKey& key,
@@ -922,11 +969,16 @@ class WasmBoundsCheckEliminationReducer : public Next {
     Label<> fallback_code(this);
     Label<> done(this);
     FallbackInstructionSequence::Guard guard = seq.ComputeGuard();
-    if (guard.check_upper) {
-      EmitBoundsCheck(seq, seq.offsets.upper(), fallback_code);
-    }
-    if (guard.check_lower) {
-      EmitBoundsCheck(seq, seq.offsets.lower(), fallback_code);
+    if (guard.check_lower && guard.check_upper &&
+        FallbackInstructionSequence::single_comparison_two_sided_guard) {
+      EmitTwoSidedBoundsCheck(seq, fallback_code);
+    } else {
+      if (guard.check_upper) {
+        EmitBoundsCheck(seq, seq.offsets.upper(), fallback_code);
+      }
+      if (guard.check_lower) {
+        EmitBoundsCheck(seq, seq.offsets.lower(), fallback_code);
+      }
     }
     GOTO(done);
     BIND(fallback_code);
@@ -947,6 +999,29 @@ class WasmBoundsCheckEliminationReducer : public Next {
     }
     V<Word32> length = __ MapToNewGraph(seq.array_length);
     GOTO_IF_NOT(LIKELY(__ Uint32LessThan(index, length)), fallback_code);
+  }
+
+  // Emits a single comparison checking that all the offsets of
+  // {seq.offsets} are within bounds, and jumps to {fallback_code}
+  // otherwise: with {lo} and {hi} the bounds of the range,
+  //     zext(base + lo) + (hi - lo) < zext(length)
+  // computed on 64 bits, so that it cannot wrap around (see the proof
+  // in the header).
+  void EmitTwoSidedBoundsCheck(const FallbackInstructionSequence& seq,
+                               Label<>& fallback_code) {
+    DCHECK(FallbackInstructionSequence::single_comparison_two_sided_guard);
+    uint32_t lower = seq.offsets.lower();
+    uint32_t size = seq.offsets.upper() - lower;
+    V<Word32> start = __ Word32Constant(lower);
+    DCHECK_EQ(seq.key.base.valid(), seq.base_value.valid());
+    if (seq.base_value.valid()) {
+      start = __ Word32Add(__ MapToNewGraph(seq.base_value), start);
+    }
+    V<Word64> end = __ Word64Add(__ ChangeUint32ToUint64(start),
+                                 __ Word64Constant(uint64_t{size}));
+    V<Word32> length = __ MapToNewGraph(seq.array_length);
+    GOTO_IF_NOT(LIKELY(__ Uint64LessThan(end, __ ChangeUint32ToUint64(length))),
+                fallback_code);
   }
 };
 
