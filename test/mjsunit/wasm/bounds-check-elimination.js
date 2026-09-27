@@ -102,7 +102,8 @@ function store(array, param, offset, value) {
   addArrayHelpers(builder, array);
   let sig = makeSig([wasmRefNullType(array), kWasmI32], []);
   let sequences = {
-    // Each sequence of accesses is a list of offsets.
+    // Each sequence of accesses is a list of offsets. On 64-bit targets,
+    // pairs of accesses with no known bound get fallback code.
     below: [1, 0],
     above: [0, 1],
     middle: [0, 2, 1],

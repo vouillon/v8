@@ -131,14 +131,17 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, RedundantConstantIndex) {
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, RedundantBetweenChecks) {
   // a[i]; a[i+2]; a[i+1];
+  // On 64-bit targets, a[i]; a[i+2]; also get fallback code.
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     BoundsCheck(Asm, a, i, 0);
     BoundsCheck(Asm, a, i, 2);
     BoundsCheck(Asm, a, i, 1);
   });
   Run(test);
+  bool fallback =
+      FallbackInstructionSequence::single_comparison_two_sided_guard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
-  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, NestedConstantAdditions) {
@@ -184,26 +187,45 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, NoFallbackForSingleCheck) {
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
 }
 
-TEST_F(WasmBoundsCheckEliminationReducerTest, NoFallbackForTwoSidedGuard) {
-  // a[i]; a[i+1]; would need a guard checking both bounds, which does
-  // not eliminate enough checks.
+TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForTwoChecks) {
+  // a[i]; a[i+1]; needs a guard checking both bounds. With a single
+  // comparison, it eliminates one check, which is enough for such a
+  // guard.
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     BoundsCheck(Asm, a, i, 0);
     BoundsCheck(Asm, a, i, 1);
   });
   Run(test);
+  bool fallback =
+      FallbackInstructionSequence::single_comparison_two_sided_guard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
-  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
 
-TEST_F(WasmBoundsCheckEliminationReducerTest, NoFallbackForTwoSidedGuardBelow) {
-  // a[i+1]; a[i]; would need a guard checking both bounds.
+TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForTwoChecksBelow) {
+  // a[i+1]; a[i];
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     BoundsCheck(Asm, a, i, 1);
     BoundsCheck(Asm, a, i, 0);
   });
   Run(test);
+  bool fallback =
+      FallbackInstructionSequence::single_comparison_two_sided_guard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       NoFallbackForOneSidedGuardEliminatingOneCheck) {
+  // a[i]; b[i]; b[i+1]; could be guarded by i+1 < b.length, since i
+  // is known to be non-negative, but this only eliminates one check.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    BoundsCheck(Asm, b, i, 0);
+    BoundsCheck(Asm, b, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
 }
 
@@ -283,14 +305,17 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, NonNegativeIndexLearntLater) {
 TEST_F(WasmBoundsCheckEliminationReducerTest,
        NonNegativeIndexDoesNotCoverSmallerOffsets) {
   // a[i+2]; b[i+1]; b[i];
+  // On 64-bit targets, b[i+1]; b[i]; also get fallback code.
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     BoundsCheck(Asm, a, i, 2);
     BoundsCheck(Asm, b, i, 1);
     BoundsCheck(Asm, b, i, 0);
   });
   Run(test);
+  bool fallback =
+      FallbackInstructionSequence::single_comparison_two_sided_guard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
-  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, NonNegativeIndexOneSidedGuard) {

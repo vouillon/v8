@@ -502,6 +502,15 @@ struct FallbackInstructionSequence {
   // little at run time, while the duplicated code makes compilation
   // noticeably slower (mostly in later phases, such as late load
   // elimination).
+  //
+  // The exception is a sequence whose guard checks both bounds with a
+  // single comparison (on 64-bit targets), which is accepted when it
+  // eliminates a single check. Such sequences are typical
+  // of byte accesses to an array with no known bound, as in
+  //     a[i] = v; a[i+1] = v >> 8;
+  // while sequences eliminating a single check in code produced by
+  // wasm_of_ocaml almost always have a known bound, and are frequent
+  // enough to make compilation noticeably slower.
   static constexpr int min_eliminated_checks = 2;
 
   // On 64-bit targets, a guard checking both bounds is a single
@@ -657,7 +666,11 @@ struct FallbackInstructionSequence {
   static bool IsProfitable(uint32_t instruction_count, size_t trap_count,
                            Guard guard) {
     int eliminated = static_cast<int>(trap_count) - guard.check_count();
-    return eliminated >= min_eliminated_checks &&
+    int min_eliminated = guard.check_lower && guard.check_upper &&
+                                 single_comparison_two_sided_guard
+                             ? 1
+                             : min_eliminated_checks;
+    return eliminated >= min_eliminated &&
            instruction_count <=
                instruction_budget_per_trap * static_cast<uint32_t>(eliminated);
   }
