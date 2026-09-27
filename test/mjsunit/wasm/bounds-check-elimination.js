@@ -587,9 +587,16 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
     let add = (index) => {
       if (index && index.base != 'none') offsets.push(index.offset);
     };
+    let addCondition = (condition) => {
+      if (!condition) return;
+      add(condition.index);
+      addCondition(condition.condition);
+      addCondition(condition.left);
+      addCondition(condition.right);
+    };
     for (let s of statements) {
       add(s.index);
-      if (s.condition) add(s.condition.index);
+      addCondition(s.condition);
       for (let nested of [s.then, s.else, s.body]) {
         if (nested) collectOffsets(nested, offsets);
       }
@@ -611,10 +618,10 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
   }
 
   // A condition, on {index} if given.
-  function randomCondition(bases, anchors, index) {
+  function randomCondition(bases, anchors, index, depth = 0) {
     let allow_flag = index === undefined;
     index ??= randomIndex(bases, anchors);
-    switch (allow_flag ? random(10) : 1 + random(9)) {
+    switch (allow_flag ? random(13) : 1 + random(12)) {
       case 0:
         return {kind: 'flag'};
       case 1:
@@ -636,6 +643,31 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
       case 8:
         return {kind: 'outOfBoundsMinus', array: pick(kArrays), index,
                 reduction: 1 + random(2)};
+      case 9:
+        // Signed comparisons, as used by Java, Kotlin or Dart for their
+        // loops.
+        return {kind: random(2) == 0 ? 'boundsMinusS' : 'outOfBoundsMinusS',
+                array: pick(kArrays), index, reduction: random(3)};
+      case 10:
+      case 11:
+        if (depth == 0) {
+          // Combined conditions.
+          let other = random(2) == 0 ? index : randomIndex(bases, anchors);
+          switch (random(3)) {
+            case 0:
+              return {kind: 'not',
+                      condition: randomCondition(bases, anchors, index, 1)};
+            case 1:
+              return {kind: 'or',
+                      left: randomCondition(bases, anchors, index, 1),
+                      right: randomCondition(bases, anchors, other, 1)};
+            default:
+              return {kind: 'and',
+                      left: randomCondition(bases, anchors, index, 1),
+                      right: randomCondition(bases, anchors, other, 1)};
+          }
+        }
+        // Fall through.
       default:
         return {kind: 'ltU', bound: randomUnsignedBound(), index};
     }
@@ -681,7 +713,9 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
         let anchor = (pick(anchors) + random(9) - 4) | 0;
         let condition = randomCondition(
             bases, anchors, {base, offset: anchor, sub: random(2) == 0});
-        let then = randomBurst(condition.array ?? pick(kArrays), base, anchor,
+        let array = condition.array ?? condition.left?.array ??
+                    condition.condition?.array ?? pick(kArrays);
+        let then = randomBurst(array, base, anchor,
                                anchors);
         let otherwise = randomStatements(depth + 1, bases, anchors, random(2));
         statements.push(random(2) == 0
@@ -742,6 +776,22 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
         return [...length(condition.array),
                 ...wasmI32Const(condition.reduction), kExprI32Sub,
                 ...emitIndex(condition.index), kExprI32LeU];
+      case 'boundsMinusS':
+        return [...emitIndex(condition.index), ...length(condition.array),
+                ...wasmI32Const(condition.reduction), kExprI32Sub,
+                kExprI32LtS];
+      case 'outOfBoundsMinusS':
+        return [...length(condition.array),
+                ...wasmI32Const(condition.reduction), kExprI32Sub,
+                ...emitIndex(condition.index), kExprI32LeS];
+      case 'not':
+        return [...emitCondition(condition.condition), kExprI32Eqz];
+      case 'or':
+        return [...emitCondition(condition.left),
+                ...emitCondition(condition.right), kExprI32Ior];
+      case 'and':
+        return [...emitCondition(condition.left),
+                ...emitCondition(condition.right), kExprI32And];
       case 'geS':
         return [...emitIndex(condition.index), ...wasmI32Const(condition.bound),
                 kExprI32GeS];
@@ -848,6 +898,19 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
         return index < condition.bound;
       case 'ltU':
         return (index >>> 0) < (condition.bound >>> 0);
+      case 'boundsMinusS':
+        return index < ((length(condition.array) - condition.reduction) | 0);
+      case 'outOfBoundsMinusS':
+        return ((length(condition.array) - condition.reduction) | 0) <= index;
+      case 'not':
+        return !evalCondition(condition.condition, env);
+      case 'or':
+      case 'and': {
+        // Both conditions are evaluated.
+        let left = evalCondition(condition.left, env);
+        let right = evalCondition(condition.right, env);
+        return condition.kind == 'or' ? left || right : left && right;
+      }
     }
   }
 

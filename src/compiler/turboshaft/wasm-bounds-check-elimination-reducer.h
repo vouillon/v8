@@ -84,6 +84,16 @@ namespace v8::internal::compiler::turboshaft {
 // the Wasm access {a[i+1]} is within bounds, as long as some previous
 // access to {a} showed that its length is at least 1.
 //
+// Signed conditions {base + n <s a.length - c}, as produced by languages
+// with signed integers (Java, Kotlin, Dart...), are taken into account
+// when {base + n} is known to be non-negative: the condition then shows
+// that {a.length - c} is positive, and that {base + n <u a.length - c}.
+// Since array lengths are at most 2^30, {base + n} is non-negative when
+// some {base + m} is within bounds and {n - m} is at most 2^30. Branch
+// conditions combining comparisons are also taken into account: when
+// {x | y} does not hold, neither {x} nor {y} holds, and when {x & y}
+// holds for two comparisons (whose values are 0 or 1), both hold.
+//
 // When some bounds checks are later followed by stronger checks in
 // the same block, the instructions in between can be duplicated into
 // two paths:
@@ -414,6 +424,36 @@ class OffsetRange {
 //   (assert (bvult (bvadd x hi) l))
 //   (assert (not (bvult (bvadd (zext (bvadd x lo)) (zext (bvsub hi lo)))
 //                       (zext l))))
+//   (check-sat)
+
+//
+// A signed condition {x + n <s l - c} with {x + n} non-negative (and a
+// small constant {c}) shows the unsigned condition, and that {l - c}
+// does not wrap around:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvule c #x00010000))
+//   (assert (non-negative (bvadd x n)))
+//   (assert (bvslt (bvadd x n) (bvsub l c)))
+//   (assert (not (and (bvult (bvadd x n) (bvsub l c))
+//                     (bvuge l (bvadd c #x00000001)))))
+//   (check-sat)
+//
+// With array lengths at most 2^30, if {x + m} is within bounds, then
+// {x + m + d} is non-negative for {d} at most 2^30:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const m (_ BitVec 32))
+//   (declare-const d (_ BitVec 32))
+//   (assert (bvule l #x40000000))
+//   (assert (bvult (bvadd x m) l))
+//   (assert (bvule d #x40000000))
+//   (assert (not (non-negative (bvadd (bvadd x m) d))))
 //   (check-sat)
 
 // Maps keys of type {K} to values of type {V}. Supports snapshotting
@@ -812,7 +852,8 @@ class WasmBoundsCheckEliminationAnalyzer {
   OpIndex ResolveAliases(OpIndex object) const;
   OpIndex ResolveReplacements(OpIndex value) const;
 
-  void ProcessCondition(OpIndex trap_if, OpIndex condition, bool inverted);
+  void ProcessCondition(OpIndex trap_if, OpIndex condition, bool inverted,
+                        int depth = 0);
   void ProcessBoundsCheck(OpIndex trap_if, OpIndex condition,
                           const BoundsCheck& bounds_check, OpIndex base_value,
                           OpIndex array_length, uint32_t extent);
@@ -837,6 +878,8 @@ class WasmBoundsCheckEliminationAnalyzer {
 
   std::optional<BoundsCheckCondition> TryExtractBoundChecksCondition(
       OpIndex index, bool inverted) const;
+  std::optional<BoundsCheckCondition> TryExtractSignedBoundsCheckCondition(
+      OpIndex condition, bool inverted) const;
   std::optional<std::pair<OpIndex, uint32_t>> TryExtractArrayLength(
       OpIndex length) const;
   bool IsArrayLengthWithoutWrapAround(OpIndex length) const;

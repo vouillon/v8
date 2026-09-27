@@ -479,6 +479,170 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, OCamlBoundsCheckAsAddition) {
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
 }
 
+TEST_F(WasmBoundsCheckEliminationReducerTest, OrOfConditions) {
+  // if ((a.length <= i) | (b.length <= i)) fail; a[i]; b[i];
+  // When the or does not hold, neither condition holds.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    V<Word32> b_length = __ ArrayLength(b, compiler::kWithNullCheck);
+    FailIf(Asm, __ Word32BitwiseOr(__ Uint32LessThanOrEqual(a_length, i),
+                                   __ Uint32LessThanOrEqual(b_length, i)));
+    BoundsCheck(Asm, a, i, 0);
+    BoundsCheck(Asm, b, i, 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, OrOfConditionsHolding) {
+  // if ((i < a.length) | c) a[i];
+  // The or holding does not show that one of its conditions holds.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm, __ Word32BitwiseOr(__ Uint32LessThan(i, a_length), c),
+       [&] { BoundsCheck(Asm, a, i, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, OrOfConditionsHoldingNegated) {
+  // if ((a.length <= i) | c) a[i];
+  // The or holding does not show that its conditions do not hold.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm, __ Word32BitwiseOr(__ Uint32LessThanOrEqual(a_length, i), c),
+       [&] { BoundsCheck(Asm, a, i, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, AndOfConditions) {
+  // if ((i < a.length) & (i < b.length)) { a[i]; b[i]; }
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    V<Word32> b_length = __ ArrayLength(b, compiler::kWithNullCheck);
+    If(Asm,
+       __ Word32BitwiseAnd(__ Uint32LessThan(i, a_length),
+                           __ Uint32LessThan(i, b_length)),
+       [&] {
+         BoundsCheck(Asm, a, i, 0);
+         BoundsCheck(Asm, b, i, 0);
+       });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, AndOfValues) {
+  // if ((i < a.length) & c) a[i];
+  // {c} is not a comparison, so the and may not hold when it is not 0:
+  // (1 & 2) is 0, for instance. Nothing is learnt.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm, __ Word32BitwiseAnd(__ Uint32LessThan(i, a_length), c),
+       [&] { BoundsCheck(Asm, a, i, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NegatedCondition) {
+  // if ((i < a.length) == 0) fail; a[i];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Word32Equal(__ Uint32LessThan(i, a_length), 0));
+    BoundsCheck(Asm, a, i, 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, SignedComparison) {
+  // b[i]; if (a.length - 2 <=s i) fail; a[i]; a[i+1]; a[i+2];
+  // b[i] shows that i is non-negative, so the signed comparison shows
+  // that i + 2 < a.length, without knowing the length of a.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, b, i, 0);
+    FailIf(Asm, __ Int32LessThanOrEqual(ReducedLength(Asm, a, 2), i));
+    BoundsCheck(Asm, a, i, 0);
+    BoundsCheck(Asm, a, i, 1);
+    BoundsCheck(Asm, a, i, 2);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, SignedComparisonWithUnknownSign) {
+  // if (a.length - 2 <=s i) fail; a[i];
+  // i may be negative.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    FailIf(Asm, __ Int32LessThanOrEqual(ReducedLength(Asm, a, 2), i));
+    BoundsCheck(Asm, a, i, 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       SignedComparisonAboveCheckedOffset) {
+  // a[i]; if (!(i + 5 <s a.length)) fail; a[i+5];
+  // i + 5 is non-negative, since i is within bounds and array lengths
+  // are small.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Int32LessThanOrEqual(a_length,
+                                        __ Word32Add(i, __ Word32Constant(5))));
+    BoundsCheck(Asm, a, i, 5);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, SignedLessThanOrEqual) {
+  // b[i]; if (i <=s a.length - 2) a[i+2];
+  // i + 2 may be the length of a.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, b, i, 0);
+    If(Asm, __ Int32LessThanOrEqual(i, ReducedLength(Asm, a, 2)),
+       [&] { BoundsCheck(Asm, a, i, 2); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       SignedComparisonFarAboveCheckedOffset) {
+  // a[i]; if (!(i + 0x7fffffff <s a.length)) fail; a[i+0x7fffffff];
+  // i + 0x7fffffff may be negative.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Int32LessThanOrEqual(
+                    a_length, __ Word32Add(i, __ Word32Constant(0x7fffffff))));
+    BoundsCheck(Asm, a, i, 0x7fffffff);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, SignedComparisonMinLength) {
+  // b[i]; if (a.length - 1 <=s i) fail; if (a.length - 3 <= c) fail;
+  // a[c+3];
+  // The signed comparison shows that the length of a is at least 2, not
+  // 3: a.length - 3 may wrap around, and a[c+3] may be out of bounds.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, b, i, 0);
+    FailIf(Asm, __ Int32LessThanOrEqual(ReducedLength(Asm, a, 1), i));
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 3), c));
+    BoundsCheck(Asm, a, c, 3);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
 TEST_F(WasmBoundsCheckEliminationReducerTest, OCamlBoundsCheckUnknownLength) {
   // if (a.length - 1 <= i) fail; a[i+1];
   // The array might be empty, in which case a.length - 1 wraps around

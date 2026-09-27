@@ -24,6 +24,10 @@ namespace v8::internal::compiler::turboshaft {
 // for modular arithmetic. MaxLength(1) returns the largest possible array
 // length (using element size of 1 byte, the smallest possible element).
 static_assert(v8::internal::WasmArray::MaxLength(1) < (1u << 31));
+// Loop induction relies on array lengths being much smaller, so that
+// adding a step to an index bounded by an array length cannot overflow.
+static_assert(v8::internal::WasmArray::MaxLength(1) <= (1 << 30));
+static constexpr uint32_t kMaxArrayLength = 1u << 30;
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBlock(const Block& block) {
   BeginBlock(&block);
@@ -155,8 +159,58 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBranch(const Block* block) {
 // OpIndex::Invalid().
 void WasmBoundsCheckEliminationAnalyzer::ProcessCondition(OpIndex trap_if,
                                                           OpIndex condition,
-                                                          bool inverted) {
-  if (auto decoded = TryExtractBoundChecksCondition(condition, inverted)) {
+                                                          bool inverted,
+                                                          int depth) {
+  // Combined conditions: {a | b} does not hold when neither {a} nor {b}
+  // holds, {a & b} of two comparisons (which are 0 or 1) holds when both
+  // hold, and {a == 0} holds when {a} does not.
+  static constexpr int kMaxDepth = 4;
+  if (depth < kMaxDepth) {
+    const Operation& op = graph_.Get(condition);
+    if (const WordBinopOp* binop = op.TryCast<WordBinopOp>();
+        binop && binop->rep == WordRepresentation::Word32()) {
+      if (binop->kind == WordBinopOp::Kind::kBitwiseOr && inverted) {
+        ProcessCondition(OpIndex::Invalid(), binop->left(), true, depth + 1);
+        ProcessCondition(OpIndex::Invalid(), binop->right(), true, depth + 1);
+        return;
+      }
+      if (binop->kind == WordBinopOp::Kind::kBitwiseAnd && !inverted &&
+          graph_.Get(binop->left()).Is<ComparisonOp>() &&
+          graph_.Get(binop->right()).Is<ComparisonOp>()) {
+        ProcessCondition(OpIndex::Invalid(), binop->left(), false, depth + 1);
+        ProcessCondition(OpIndex::Invalid(), binop->right(), false, depth + 1);
+        return;
+      }
+    }
+    if (const ComparisonOp* comparison = op.TryCast<ComparisonOp>();
+        comparison && comparison->kind == ComparisonOp::Kind::kEqual &&
+        comparison->rep == RegisterRepresentation::Word32()) {
+      if (auto constant = TryExtractI32Const(comparison->right());
+          constant.has_value() && *constant == 0) {
+        ProcessCondition(OpIndex::Invalid(), comparison->left(), !inverted,
+                         depth + 1);
+        return;
+      }
+    }
+  }
+  if (auto signed_decoded =
+          TryExtractSignedBoundsCheckCondition(condition, inverted)) {
+    // A signed comparison {x + n < a.length - c}, where {x + n} is known
+    // to be non-negative, shows that {a.length - c} is positive, and so
+    // that it does not wrap around, and that {x + n < a.length - c} as
+    // unsigned integers (see the proofs in the header).
+    const auto& [bounds_check, base_value, array_length, reduction] =
+        *signed_decoded;
+    const auto& [key, offset] = bounds_check;
+    TRACE("  Signed bounds check");
+    ProcessBoundsCheck(OpIndex::Invalid(), condition, bounds_check, base_value,
+                       array_length, reduction);
+    uint64_t index_bound = key.base.valid() ? 0 : offset;
+    if (index_bound <= kMaxInt) {
+      RecordMinLength(key.array, index_bound + reduction + 1);
+    }
+  } else if (auto decoded =
+                 TryExtractBoundChecksCondition(condition, inverted)) {
     const auto& [bounds_check, base_value, array_length, reduction] = *decoded;
     const auto& [key, offset] = bounds_check;
     // Unless the length is known to be at least {reduction},
@@ -455,6 +509,46 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundChecksCondition(
   auto [base, base_value, offset] = ExtractBaseAndOffset(index);
   OpIndex array =
       ResolveAliases(graph_.Get(length_op).Cast<ArrayLengthOp>().array());
+  return BoundsCheckCondition{BoundsCheck(BoundsCheckKey(base, array), offset),
+                              base_value, length_op, reduction};
+}
+
+// Attempts to decode a signed condition {n < a.length - c} or
+// {base + n < a.length - c} where the index is known to be
+// non-negative, which then implies the unsigned condition.
+std::optional<WasmBoundsCheckEliminationAnalyzer::BoundsCheckCondition>
+WasmBoundsCheckEliminationAnalyzer::TryExtractSignedBoundsCheckCondition(
+    OpIndex condition, bool inverted) const {
+  const ComparisonOp* comparison =
+      graph_.Get(condition).TryCast<ComparisonOp>();
+  if (!comparison || comparison->rep != RegisterRepresentation::Word32()) {
+    return std::nullopt;
+  }
+  const auto expected_kind = inverted
+                                 ? ComparisonOp::Kind::kSignedLessThanOrEqual
+                                 : ComparisonOp::Kind::kSignedLessThan;
+  if (comparison->kind != expected_kind) return std::nullopt;
+  OpIndex index = inverted ? comparison->right() : comparison->left();
+  OpIndex length = inverted ? comparison->left() : comparison->right();
+  std::optional<std::pair<OpIndex, uint32_t>> array_length =
+      TryExtractArrayLength(length);
+  if (!array_length) return std::nullopt;
+  const auto& [length_op, reduction] = *array_length;
+  auto [base, base_value, offset] = ExtractBaseAndOffset(index);
+  OpIndex array =
+      ResolveAliases(graph_.Get(length_op).Cast<ArrayLengthOp>().array());
+  std::optional<OffsetRange> non_negative = NonNegativeOffsets(base);
+  bool is_non_negative = non_negative && non_negative->Contains(offset);
+  if (!is_non_negative && base.valid()) {
+    // If {base + m} is within the bounds of an array, {base + m + d} is
+    // non-negative for {0 <= d <= kMaxArrayLength}, since array lengths
+    // are at most {kMaxArrayLength} (see the proofs in the header).
+    if (std::optional<OffsetRange> known =
+            known_bounds_checks_.Get(BoundsCheckKey(base, array))) {
+      is_non_negative = offset - known->upper() <= kMaxArrayLength;
+    }
+  }
+  if (!is_non_negative) return std::nullopt;
   return BoundsCheckCondition{BoundsCheck(BoundsCheckKey(base, array), offset),
                               base_value, length_op, reduction};
 }
