@@ -26,10 +26,11 @@ namespace v8::internal::compiler::turboshaft {
 // for modular arithmetic. MaxLength(1) returns the largest possible array
 // length (using element size of 1 byte, the smallest possible element).
 static_assert(v8::internal::WasmArray::MaxLength(1) < (1u << 31));
-// Loop induction relies on array lengths being much smaller, so that
-// adding a step to an index bounded by an array length cannot overflow.
-static_assert(v8::internal::WasmArray::MaxLength(1) <= (1 << 30));
+// Loop induction relies on array lengths being less than 2^30, so that
+// adding a step of up to 2^30 to an index at most an array length cannot
+// overflow.
 static constexpr uint32_t kMaxArrayLength = 1u << 30;
+static_assert(v8::internal::WasmArray::MaxLength(1) < kMaxArrayLength);
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBlock(const Block& block) {
   BeginBlock(&block);
@@ -434,10 +435,20 @@ void WasmBoundsCheckEliminationAnalyzer::RecordFallbackSequence(
   TRACE("    Instruction range: [" << previous.start_index << ", "
                                    << fallback_end_index << ")");
 
+  // The guard is emitted at the start of the sequence, so it needs an
+  // array length computed before it. The length recorded for the array
+  // is usually the one used by the previous trap, or an earlier one. But
+  // the previous trap may have used a length known from
+  // {known_length_aliases_}, which is not recorded if not available in
+  // this block, and a later condition may then have recorded another
+  // length.
   auto array_length_it = array_lengths_.find(key.array);
-  // The guard needs an array length available in this block.
   if (array_length_it == array_lengths_.end()) return;
   OpIndex array_length = array_length_it->second;
+  if (graph_.BlockIndexOf(array_length) == current_block_->index() &&
+      array_length >= previous.start_index) {
+    return;
+  }
 
   FallbackInstructionSequence new_sequence(
       phase_zone_, key, previous.base_value, array_length, *offsets,
@@ -1184,6 +1195,15 @@ OpIndex WasmBoundsCheckEliminationAnalyzer::CanonicalValue(OpIndex value,
     }
     case Opcode::kTaggedBitcast: {
       const TaggedBitcastOp& bitcast = op.Cast<TaggedBitcastOp>();
+      // The bitcast of a reference to a heap object is its address, which
+      // a moving GC can change, so two bitcasts of the same reference may
+      // give different values. This is not the case for a Smi, such as a
+      // non-null i31 reference, which {i31.get} converts this way.
+      if (bitcast.from == RegisterRepresentation::Tagged() &&
+          bitcast.kind != TaggedBitcastOp::Kind::kSmi &&
+          !IsKnownSmi(bitcast.input())) {
+        break;
+      }
       key = StructuralKey{op.opcode,
                           static_cast<uint64_t>(bitcast.kind) |
                               static_cast<uint64_t>(bitcast.from.value()) << 8 |
@@ -1201,6 +1221,35 @@ OpIndex WasmBoundsCheckEliminationAnalyzer::CanonicalValue(OpIndex value,
   }
   canonical_values_.emplace(value, result);
   return result;
+}
+
+// Whether {object} is known to be a Smi: a non-null i31 reference, as
+// shown by a cast, a type annotation or a null check.
+bool WasmBoundsCheckEliminationAnalyzer::IsKnownSmi(OpIndex object) const {
+  bool non_null = false;
+  while (true) {
+    object = ResolveReplacements(object);
+    const Operation& op = graph_.Get(object);
+    wasm::ValueType type;
+    if (const WasmTypeCastOp* cast = op.TryCast<WasmTypeCastOp>()) {
+      type = cast->config.to;
+      object = cast->object();
+    } else if (const AssertNotNullOp* check = op.TryCast<AssertNotNullOp>()) {
+      type = check->type;
+      non_null = true;
+      object = check->object();
+    } else if (const WasmTypeAnnotationOp* annotation =
+                   op.TryCast<WasmTypeAnnotationOp>()) {
+      type = annotation->type;
+      object = annotation->value();
+    } else {
+      return false;
+    }
+    if (type.is_reference_to(wasm::GenericKind::kI31) &&
+        (non_null || type.is_non_nullable())) {
+      return true;
+    }
+  }
 }
 
 std::optional<uint32_t> WasmBoundsCheckEliminationAnalyzer::TryExtractI32Const(

@@ -88,8 +88,8 @@ namespace v8::internal::compiler::turboshaft {
 // with signed integers (Java, Kotlin, Dart...), are taken into account
 // when {base + n} is known to be non-negative: the condition then shows
 // that {a.length - c} is positive, and that {base + n <u a.length - c}.
-// Since array lengths are at most 2^30, {base + n} is non-negative when
-// some {base + m} is within bounds and {n - m} is at most 2^30. Branch
+// Since array lengths are less than 2^30, {base + n} is non-negative
+// when some {base + m} is within bounds and {n - m} is at most 2^30. Branch
 // conditions combining comparisons are also taken into account: when
 // {x | y} does not hold, neither {x} nor {y} holds, and when {x & y}
 // holds for two comparisons (whose values are 0 or 1), both hold.
@@ -464,14 +464,14 @@ class OffsetRange {
 //                     (bvuge l (bvadd c #x00000001)))))
 //   (check-sat)
 //
-// With array lengths at most 2^30, if {x + m} is within bounds, then
+// With array lengths less than 2^30, if {x + m} is within bounds, then
 // {x + m + d} is non-negative for {d} at most 2^30:
 //
 //   (declare-const l (_ BitVec 32))
 //   (declare-const x (_ BitVec 32))
 //   (declare-const m (_ BitVec 32))
 //   (declare-const d (_ BitVec 32))
-//   (assert (bvule l #x40000000))
+//   (assert (bvult l #x40000000))
 //   (assert (bvult (bvadd x m) l))
 //   (assert (bvule d #x40000000))
 //   (assert (not (non-negative (bvadd (bvadd x m) d))))
@@ -493,16 +493,19 @@ class OffsetRange {
 //   (assert (not (non-negative (bvadd i c))))
 //   (check-sat)
 //
-// and for a bound {l - r}, where {l} is an array length:
+// and for a bound {l - r}, where {l} is an array length, with a signed
+// comparison {i < l - r} or {i <= l - r}, or for the bound {l} with an
+// unsigned comparison (the inclusive comparison needs {l} less than
+// 2^30):
 //
 //   (declare-const i (_ BitVec 32))
 //   (declare-const l (_ BitVec 32))
 //   (declare-const r (_ BitVec 32))
 //   (declare-const c (_ BitVec 32))
-//   (assert (bvule l #x40000000))
+//   (assert (bvult l #x40000000))
 //   (assert (bvult r #x40000000))
 //   (assert (non-negative i))
-//   (assert (bvslt i (bvsub l r)))
+//   (assert (or (bvsle i (bvsub l r)) (bvule i l)))
 //   (assert (bvugt c #x00000000))
 //   (assert (bvule c #x40000000))
 //   (assert (not (non-negative (bvadd i c))))
@@ -526,7 +529,7 @@ class OffsetRange {
 //   (declare-const l (_ BitVec 32))
 //   (declare-const r (_ BitVec 32))
 //   (declare-const k (_ BitVec 32))
-//   (assert (bvule l #x40000000))
+//   (assert (bvult l #x40000000))
 //   (assert (bvuge r #x00000001))
 //   (assert (bvule r #x40000000))
 //   (assert (non-negative i))
@@ -603,6 +606,8 @@ struct FallbackInstructionSequence {
   // emitted, while this one is computed before the start of the
   // sequence.
   OpIndex base_value;
+  // The array length used by the guard, computed before the start of
+  // the sequence.
   OpIndex array_length;
 
   // The smallest range containing the offsets of the covered traps.
@@ -733,6 +738,7 @@ struct FallbackInstructionSequence {
       // The guard moves to the start of {other}, so it can only rely
       // on what is known there, and on values computed before it.
       base_value = other.base_value;
+      array_length = other.array_length;
       known_offsets = other.known_offsets;
       non_negative_offsets = other.non_negative_offsets;
       start_index = other.start_index;
@@ -1001,6 +1007,7 @@ class WasmBoundsCheckEliminationAnalyzer {
       OpIndex condition, bool inverted) const;
   BaseAndOffset ExtractBaseAndOffset(OpIndex index) const;
   OpIndex CanonicalValue(OpIndex value, int depth = 0) const;
+  bool IsKnownSmi(OpIndex object) const;
   std::optional<uint32_t> TryExtractI32Const(OpIndex expr) const;
 
   const Graph& graph_;
@@ -1144,6 +1151,15 @@ class WasmBoundsCheckEliminationReducer : public Next {
 
   void EmitFallbackSequence(const FallbackInstructionSequence& seq) {
     ScopedModification<bool> set_true(&in_fallback_code_, true);
+
+    // The cloned range must not separate an operation that can throw
+    // from the DidntThrow that follows it: it starts at a trap or at its
+    // condition, and ends right after a trap.
+    DCHECK(__ input_graph().Get(seq.start_index).template Is<TrapIfOp>() ||
+           __ input_graph().Get(seq.start_index).template Is<ComparisonOp>());
+    DCHECK(__ input_graph()
+               .Get(__ input_graph().PreviousIndex(seq.end_index))
+               .template Is<TrapIfOp>());
 
     const Block* current_input_block = __ current_input_block();
     Label<> fallback_code(this);

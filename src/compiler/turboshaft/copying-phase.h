@@ -224,7 +224,11 @@ class GraphVisitor : public OutputGraphAssembler<GraphVisitor<AfterNext>,
   // Visits and emits the instructions from {start} to {end}, followed
   // by an Unreachable because this sequence is not expected to
   // terminate normally. The old to new mapping is cleared afterwards,
-  // so the operations can be emitted again later.
+  // so the operations can be emitted again later. When the current block
+  // uses variables, the values set by the copy are never used, since
+  // nothing follows the Unreachable. The range must be within
+  // {input_block}, and must not separate an operation that can throw
+  // from the DidntThrow that follows it.
   void CloneAndInlineTrappingInstructions(OpIndex start, OpIndex end,
                                           const Block* input_block) {
     // Visiting operations changes the current origin, which should be

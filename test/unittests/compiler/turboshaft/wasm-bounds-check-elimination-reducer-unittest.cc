@@ -1255,6 +1255,36 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, LengthAliasAfterLoopInElse) {
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
 }
 
+TEST_F(WasmBoundsCheckEliminationReducerTest, FallbackSequenceWithAliasLength) {
+  // hi = c ? a.length : 0; if (1 <= hi) for (k = 1; ; k++) {
+  //   if (!(k < hi)) trap; a[k+1]; a[k+2]; if (k == hi) break;
+  // }
+  // In the loop, hi is a.length, so the first check is a bounds check of
+  // a. But its length is not available in the loop, and the length used
+  // by a[k+1] is computed after the first check, so a guard at the first
+  // check cannot use it.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    Label<Word32> merge(&Asm);
+    IF (c) {
+      GOTO(merge, __ ArrayLength(a, compiler::kWithNullCheck));
+    } ELSE {
+      GOTO(merge, __ Word32Constant(0));
+    }
+    BIND(merge, hi);
+    NotEqualLoop(
+        Asm, hi, 1, 1,
+        [&] { return __ Int32LessThanOrEqual(__ Word32Constant(1), hi); },
+        [&](V<Word32> k) {
+          __ TrapIfNot(__ Uint32LessThan(k, hi), TrapId::kTrapArrayOutOfBounds);
+          BoundsCheck(Asm, a, k, 1);
+          BoundsCheck(Asm, a, k, 2);
+        });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+}
+
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"
 
 }  // namespace v8::internal::compiler::turboshaft
