@@ -146,6 +146,62 @@ function store(array, param, offset, value) {
   }
 })();
 
+(function TestDuplicatedComputations() {
+  print(arguments.callee.name);
+  let builder = new WasmModuleBuilder();
+  let array = builder.addArray(kWasmI32);
+  addArrayHelpers(builder, array);
+  let sig = makeSig([wasmRefNullType(array), kWasmI32, kWasmI32], []);
+  // 2 * i, computed anew each time.
+  let twice = [kExprLocalGet, 1, ...wasmI32Const(2), kExprI32Mul];
+  // if (c) a[2 * i]; a[2 * i] = 1; a[2 * i + 1] = 2; ... a[2 * i + 3] = 4;
+  // The four stores after the if use a fallback sequence, whose guard
+  // must use the value of 2 * i computed after the if, and not the one
+  // computed in the if, which has the same structure.
+  let stores = [];
+  for (let k = 0; k < 4; k++) {
+    stores.push(kExprLocalGet, 0, ...twice);
+    if (k > 0) stores.push(...wasmI32Const(k), kExprI32Add);
+    stores.push(...wasmI32Const(k + 1), kGCPrefix, kExprArraySet, array);
+  }
+  builder.addFunction('guardAfterIf', sig)
+    .addBody([
+      kExprLocalGet, 2,
+      kExprIf, kWasmVoid,
+        kExprLocalGet, 0,
+        ...twice,
+        kGCPrefix, kExprArrayGet, array,
+        kExprDrop,
+      kExprEnd,
+      ...stores,
+    ])
+    .exportFunc();
+  let instance = builder.instantiate();
+  const length = 8;
+  for (let c of [0, 1]) {
+    for (let i of [-1, 0, 1, 2, 3, 4, 0x40000000, 0x7fffffff]) {
+      let a = instance.exports.make(length);
+      let expected = new Array(length).fill(0);
+      let traps = c && (2 * i) >>> 0 >= length;
+      for (let k = 0; k < 4 && !traps; k++) {
+        let index = (2 * i + k) >>> 0;
+        if (index >= length) {
+          traps = true;
+        } else {
+          expected[index] = k + 1;
+        }
+      }
+      let run = () => instance.exports.guardAfterIf(a, i, c);
+      if (traps) {
+        assertTraps(kTrapArrayOutOfBounds, run);
+      } else {
+        run();
+      }
+      assertEquals(expected, contents(instance, a, length), `${c} ${i}`);
+    }
+  }
+})();
+
 (function TestNonNegativeIndexAcrossArrays() {
   print(arguments.callee.name);
   let builder = new WasmModuleBuilder();

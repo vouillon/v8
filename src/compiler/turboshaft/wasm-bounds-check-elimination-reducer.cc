@@ -157,7 +157,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessCondition(OpIndex trap_if,
                                                           OpIndex condition,
                                                           bool inverted) {
   if (auto decoded = TryExtractBoundChecksCondition(condition, inverted)) {
-    const auto& [bounds_check, array_length, reduction] = *decoded;
+    const auto& [bounds_check, base_value, array_length, reduction] = *decoded;
     const auto& [key, offset] = bounds_check;
     // Unless the length is known to be at least {reduction},
     // {a.length - reduction} may wrap around, and we learn nothing.
@@ -166,7 +166,8 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessCondition(OpIndex trap_if,
       // When {reduction} is not 0, this is not an actual bounds check, so
       // it is only used for what it shows, even for a trap.
       ProcessBoundsCheck(reduction == 0 ? trap_if : OpIndex::Invalid(),
-                         condition, bounds_check, array_length, reduction);
+                         condition, bounds_check, base_value, array_length,
+                         reduction);
       // With {index < a.length - reduction}, the length is at least
       // {reduction + 1}, and more for a constant index.
       uint64_t index_bound = key.base.valid() ? 0 : offset;
@@ -187,7 +188,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessCondition(OpIndex trap_if,
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
     OpIndex trap_if, OpIndex condition, const BoundsCheck& bounds_check,
-    OpIndex array_length, uint32_t extent) {
+    OpIndex base_value, OpIndex array_length, uint32_t extent) {
   const auto& [key, offset] = bounds_check;
   // Only plain bounds checks can be eliminated.
   DCHECK_IMPLIES(trap_if.valid(), extent == 0);
@@ -243,8 +244,8 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
           << offset << " extent=" << extent << " base=" << key.base
           << " array=" << key.array << " -> [" << checked.lower() << ", "
           << checked.upper() << "]");
-    UpdateKnownBoundsChecks(key, offset, checked, trap_if, condition, known,
-                            non_negative);
+    UpdateKnownBoundsChecks(key, offset, checked, trap_if, condition,
+                            base_value, known, non_negative);
     return;
   }
 
@@ -275,8 +276,8 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
                                : known->lower();
     RecordFallbackSequence(key, prev_offset, trap_if, offset);
   }
-  UpdateKnownBoundsChecks(key, offset, *offsets, trap_if, condition, known,
-                          non_negative);
+  UpdateKnownBoundsChecks(key, offset, *offsets, trap_if, condition, base_value,
+                          known, non_negative);
 }
 
 // Record a fallback sequence covering the previous trap at
@@ -315,10 +316,10 @@ void WasmBoundsCheckEliminationAnalyzer::RecordFallbackSequence(
   OpIndex array_length = array_length_it->second;
 
   FallbackInstructionSequence new_sequence(
-      phase_zone_, key, array_length, *offsets, previous.known_offsets,
-      previous.non_negative_offsets, previous.start_index, fallback_end_index,
-      previous.start_position, current_position_ + 1,
-      {previous.trap_if, trap_if});
+      phase_zone_, key, previous.base_value, array_length, *offsets,
+      previous.known_offsets, previous.non_negative_offsets,
+      previous.start_index, fallback_end_index, previous.start_position,
+      current_position_ + 1, {previous.trap_if, trap_if});
   RegisterFallbackSequence(std::move(new_sequence));
 }
 
@@ -350,7 +351,7 @@ void WasmBoundsCheckEliminationAnalyzer::RegisterFallbackSequence(
 
 void WasmBoundsCheckEliminationAnalyzer::UpdateKnownBoundsChecks(
     const BoundsCheckKey& key, uint32_t offset, const OffsetRange& offsets,
-    OpIndex trap_if, OpIndex condition,
+    OpIndex trap_if, OpIndex condition, OpIndex base_value,
     const std::optional<OffsetRange>& known_before,
     const std::optional<OffsetRange>& non_negative_before) {
   // Records the updated bounds check range.
@@ -365,8 +366,9 @@ void WasmBoundsCheckEliminationAnalyzer::UpdateKnownBoundsChecks(
   OpIndex start_index = starts_at_condition ? condition : trap_if;
   uint32_t start_position = current_position_ - starts_at_condition;
   last_trap_bounds_checks_.insert_or_assign(
-      BoundsCheck(key, offset), TrapInfo{trap_if, start_index, start_position,
-                                         known_before, non_negative_before});
+      BoundsCheck(key, offset),
+      TrapInfo{trap_if, base_value, start_index, start_position, known_before,
+               non_negative_before});
 }
 
 // Returns the offsets known to be within bounds for {key}. If
@@ -450,11 +452,11 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundChecksCondition(
   if (!array_length) return std::nullopt;
   const auto& [length_op, reduction] = *array_length;
 
-  auto [base, offset] = ExtractBaseAndOffset(index);
+  auto [base, base_value, offset] = ExtractBaseAndOffset(index);
   OpIndex array =
       ResolveAliases(graph_.Get(length_op).Cast<ArrayLengthOp>().array());
   return BoundsCheckCondition{BoundsCheck(BoundsCheckKey(base, array), offset),
-                              length_op, reduction};
+                              base_value, length_op, reduction};
 }
 
 // Recognizes {a.length} and {a.length - c} (possibly written
@@ -577,13 +579,13 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractNonNegativeIndex(
     }
   }
 
-  auto [base, offset] = ExtractBaseAndOffset(index);
+  auto [base, base_value, offset] = ExtractBaseAndOffset(index);
   if (!base.valid()) return std::nullopt;
   return std::pair{base, offset};
 }
 
 // Extract base expression and constant offset from an index expression.
-std::pair<OpIndex, uint32_t>
+WasmBoundsCheckEliminationAnalyzer::BaseAndOffset
 WasmBoundsCheckEliminationAnalyzer::ExtractBaseAndOffset(OpIndex index) const {
   // Nested additions of constants, as produced for instance by loop
   // unrolling, are folded into a single offset, so that
@@ -597,7 +599,7 @@ WasmBoundsCheckEliminationAnalyzer::ExtractBaseAndOffset(OpIndex index) const {
     index = ResolveReplacements(index);
     // a[n]
     if (auto constant = TryExtractI32Const(index)) {
-      return {OpIndex::Invalid(), offset + *constant};
+      return {OpIndex::Invalid(), OpIndex::Invalid(), offset + *constant};
     }
     if (depth == kMaxDepth) break;
     // a[base + n] / a[base - n]
@@ -615,7 +617,106 @@ WasmBoundsCheckEliminationAnalyzer::ExtractBaseAndOffset(OpIndex index) const {
     index = op->left();
   }
   // Default: a[base]
-  return {index, offset};
+  return {CanonicalValue(index), index, offset};
+}
+
+// Returns a canonical representative of {value}: pure operations
+// (arithmetic, shifts, conversions) with the same options and inputs
+// with the same canonical values compute the same value, and so have
+// the same canonical value. Code producers often compute the same
+// value several times: for instance, wasm_of_ocaml sign-extends a
+// 31-bit integer both for an OCaml bounds check and for the index of
+// the array access it protects, and an {i31.get_s} of the same
+// reference computes the same integer. Casts and non-null assertions
+// return their input.
+//
+// Values that are computed from the same operations are only equal
+// when these operations were executed the same number of times. Loop
+// phis are the only operations whose values may change without
+// leaving a loop iteration, and facts are never propagated along
+// back edges, so the facts established about a value in an iteration
+// are only used in the same iteration.
+OpIndex WasmBoundsCheckEliminationAnalyzer::CanonicalValue(OpIndex value,
+                                                           int depth) const {
+  // Bound the depth of the recursion. Deeper values are their own
+  // canonical value, which is always correct.
+  static constexpr int kMaxDepth = 16;
+  value = ResolveReplacements(value);
+  if (auto it = canonical_values_.find(value); it != canonical_values_.end()) {
+    return it->second;
+  }
+  if (depth == kMaxDepth) return value;
+  const Operation& op = graph_.Get(value);
+  std::optional<StructuralKey> key;
+  switch (op.opcode) {
+    case Opcode::kWasmTypeCast:
+    case Opcode::kAssertNotNull:
+    case Opcode::kWasmTypeAnnotation: {
+      OpIndex object = ResolveAliases(value);
+      if (object == value) break;
+      OpIndex result = CanonicalValue(object, depth + 1);
+      canonical_values_.emplace(value, result);
+      return result;
+    }
+    case Opcode::kConstant: {
+      const ConstantOp& constant = op.Cast<ConstantOp>();
+      if (constant.kind != ConstantOp::Kind::kWord32 &&
+          constant.kind != ConstantOp::Kind::kWord64) {
+        break;
+      }
+      key = StructuralKey{op.opcode, static_cast<uint64_t>(constant.kind),
+                          constant.integral(), OpIndex::Invalid(),
+                          OpIndex::Invalid()};
+      break;
+    }
+    case Opcode::kWordBinop: {
+      const WordBinopOp& binop = op.Cast<WordBinopOp>();
+      key = StructuralKey{op.opcode,
+                          static_cast<uint64_t>(binop.kind) |
+                              static_cast<uint64_t>(binop.rep.value()) << 8,
+                          0, CanonicalValue(binop.left(), depth + 1),
+                          CanonicalValue(binop.right(), depth + 1)};
+      break;
+    }
+    case Opcode::kShift: {
+      const ShiftOp& shift = op.Cast<ShiftOp>();
+      key = StructuralKey{op.opcode,
+                          static_cast<uint64_t>(shift.kind) |
+                              static_cast<uint64_t>(shift.rep.value()) << 8,
+                          0, CanonicalValue(shift.left(), depth + 1),
+                          CanonicalValue(shift.right(), depth + 1)};
+      break;
+    }
+    case Opcode::kChange: {
+      const ChangeOp& change = op.Cast<ChangeOp>();
+      key = StructuralKey{op.opcode,
+                          static_cast<uint64_t>(change.kind) |
+                              static_cast<uint64_t>(change.assumption) << 8 |
+                              static_cast<uint64_t>(change.from.value()) << 16 |
+                              static_cast<uint64_t>(change.to.value()) << 24,
+                          0, CanonicalValue(change.input(), depth + 1),
+                          OpIndex::Invalid()};
+      break;
+    }
+    case Opcode::kTaggedBitcast: {
+      const TaggedBitcastOp& bitcast = op.Cast<TaggedBitcastOp>();
+      key = StructuralKey{op.opcode,
+                          static_cast<uint64_t>(bitcast.kind) |
+                              static_cast<uint64_t>(bitcast.from.value()) << 8 |
+                              static_cast<uint64_t>(bitcast.to.value()) << 16,
+                          0, CanonicalValue(bitcast.input(), depth + 1),
+                          OpIndex::Invalid()};
+      break;
+    }
+    default:
+      break;
+  }
+  OpIndex result = value;
+  if (key.has_value()) {
+    result = values_by_structure_.emplace(*key, value).first->second;
+  }
+  canonical_values_.emplace(value, result);
+  return result;
 }
 
 std::optional<uint32_t> WasmBoundsCheckEliminationAnalyzer::TryExtractI32Const(

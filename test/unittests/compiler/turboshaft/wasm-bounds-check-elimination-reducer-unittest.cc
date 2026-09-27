@@ -429,6 +429,42 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, OCamlBoundsCheckUnknownLength) {
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
 }
 
+// The sign extension of a 31-bit integer, as done by wasm_of_ocaml.
+template <typename Asm_t>
+static V<Word32> SignExtend31(Asm_t& Asm, V<Word32> value, int shift = 1) {
+  return __ Word32ShiftRightArithmetic(
+      __ Word32ShiftLeft(value, __ Word32Constant(shift)),
+      __ Word32Constant(shift));
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, DuplicatedComputations) {
+  // a[0]; if (a.length - 1 <= sext(i - c)) fail; a[sext(i - c) + 1];
+  // where {sext(i - c)} is computed twice. Both computations have the
+  // same value, so the OCaml bounds check covers the Wasm one.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm,
+           __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1),
+                                    SignExtend31(Asm, __ Word32Sub(i, c))));
+    BoundsCheck(Asm, a, SignExtend31(Asm, __ Word32Sub(i, c)), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, DifferentComputations) {
+  // a[0]; if (a.length - 1 <= sext(i)) fail; a[sext2(i) + 1];
+  // where {sext2} shifts by 2 instead of 1: the values differ.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1),
+                                         SignExtend31(Asm, i)));
+    BoundsCheck(Asm, a, SignExtend31(Asm, i, 2), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
 TEST_F(WasmBoundsCheckEliminationReducerTest, OCamlBoundsChecksInSequence) {
   // a[i+1] after the OCaml bounds check of a.(i) shows that the length is
   // at least 1, so the Wasm bounds checks of a.(j) and a.(k) are

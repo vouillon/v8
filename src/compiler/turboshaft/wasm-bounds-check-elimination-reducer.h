@@ -424,6 +424,12 @@ using MinLengthMap = KeyedSnapshotTable<OpIndex, uint32_t>;
 // - Fallback path: execute with original bounds checks intact
 struct FallbackInstructionSequence {
   BoundsCheckKey key;
+  // The base value used by the guard. {key.base} identifies a value up
+  // to duplicated computations (see {CanonicalValue}), and the
+  // operation it refers to may not be available where the guard is
+  // emitted, while this one is computed before the start of the
+  // sequence.
+  OpIndex base_value;
   OpIndex array_length;
 
   // The smallest range containing the offsets of the covered traps.
@@ -469,13 +475,15 @@ struct FallbackInstructionSequence {
   };
 
   FallbackInstructionSequence(Zone* zone, const BoundsCheckKey& key,
-                              OpIndex array_length, OffsetRange offsets,
+                              OpIndex base_value, OpIndex array_length,
+                              OffsetRange offsets,
                               std::optional<OffsetRange> known_offsets,
                               std::optional<OffsetRange> non_negative_offsets,
                               OpIndex start_index, OpIndex end_index,
                               uint32_t start_position, uint32_t end_position,
                               std::initializer_list<OpIndex> covered)
       : key(key),
+        base_value(base_value),
         array_length(array_length),
         offsets(offsets),
         known_offsets(known_offsets),
@@ -531,7 +539,8 @@ struct FallbackInstructionSequence {
     offsets = *offsets.Hull(other.offsets);
     if (other.start_index < start_index) {
       // The guard moves to the start of {other}, so it can only rely
-      // on what is known there.
+      // on what is known there, and on values computed before it.
+      base_value = other.base_value;
       known_offsets = other.known_offsets;
       non_negative_offsets = other.non_negative_offsets;
       start_index = other.start_index;
@@ -618,6 +627,8 @@ class WasmBoundsCheckEliminationAnalyzer {
         phase_zone_(phase_zone),
         load_elimination_(load_elimination),
         redundant_traps_(phase_zone),
+        canonical_values_(phase_zone),
+        values_by_structure_(phase_zone),
         fallback_sequence_starts_(phase_zone),
         known_bounds_checks_(phase_zone),
         known_non_negative_offsets_(phase_zone),
@@ -684,6 +695,9 @@ class WasmBoundsCheckEliminationAnalyzer {
   // constant (usually 0).
   struct BoundsCheckCondition {
     BoundsCheck bounds_check;
+    // The base as computed by the index of the condition, while
+    // {bounds_check.key.base} is its canonical value.
+    OpIndex base_value;
     OpIndex array_length;
     uint32_t reduction;
   };
@@ -692,12 +706,40 @@ class WasmBoundsCheckEliminationAnalyzer {
   // right before it.
   struct TrapInfo {
     OpIndex trap_if;
+    // The base as computed by the index of the trap.
+    OpIndex base_value;
     // The trap, or its condition when the condition is right before
     // the trap.
     OpIndex start_index;
     uint32_t start_position;
     std::optional<OffsetRange> known_offsets;
     std::optional<OffsetRange> non_negative_offsets;
+  };
+
+  // An index decomposed as {base + offset}. {base} is the canonical
+  // value of {base_value} (see {CanonicalValue}).
+  struct BaseAndOffset {
+    OpIndex base;
+    OpIndex base_value;
+    uint32_t offset;
+  };
+
+  // Identifies a pure operation by its opcode, options and the
+  // canonical values of its inputs.
+  struct StructuralKey {
+    Opcode opcode;
+    uint64_t options;
+    uint64_t constant;
+    OpIndex left;
+    OpIndex right;
+
+    bool operator==(const StructuralKey& other) const = default;
+
+    template <typename H>
+    friend H AbslHashValue(H h, const StructuralKey& key) {
+      return H::combine(std::move(h), key.opcode, key.options, key.constant,
+                        key.left, key.right);
+    }
   };
 
   void ProcessBlock(const Block& block);
@@ -712,14 +754,14 @@ class WasmBoundsCheckEliminationAnalyzer {
 
   void ProcessCondition(OpIndex trap_if, OpIndex condition, bool inverted);
   void ProcessBoundsCheck(OpIndex trap_if, OpIndex condition,
-                          const BoundsCheck& bounds_check, OpIndex array_length,
-                          uint32_t extent);
+                          const BoundsCheck& bounds_check, OpIndex base_value,
+                          OpIndex array_length, uint32_t extent);
 
   void RecordFallbackSequence(const BoundsCheckKey& key, uint32_t prev_offset,
                               OpIndex trap_if, uint32_t offset);
   void UpdateKnownBoundsChecks(const BoundsCheckKey& key, uint32_t offset,
                                const OffsetRange& offsets, OpIndex trap_if,
-                               OpIndex condition,
+                               OpIndex condition, OpIndex base_value,
                                const std::optional<OffsetRange>& known_before,
                                const std::optional<OffsetRange>& non_negative);
 
@@ -740,7 +782,8 @@ class WasmBoundsCheckEliminationAnalyzer {
   bool IsArrayLengthWithoutWrapAround(OpIndex length) const;
   std::optional<std::pair<OpIndex, uint32_t>> TryExtractNonNegativeIndex(
       OpIndex condition, bool inverted) const;
-  std::pair<OpIndex, uint32_t> ExtractBaseAndOffset(OpIndex index) const;
+  BaseAndOffset ExtractBaseAndOffset(OpIndex index) const;
+  OpIndex CanonicalValue(OpIndex value, int depth = 0) const;
   std::optional<uint32_t> TryExtractI32Const(OpIndex expr) const;
 
   const Graph& graph_;
@@ -749,6 +792,11 @@ class WasmBoundsCheckEliminationAnalyzer {
 
   // Set of traps identified as redundant by the analysis.
   ZoneAbslFlatHashSet<OpIndex> redundant_traps_;
+
+  // Memoized canonical values, and the canonical value of each
+  // structure (the first operation found with this structure).
+  mutable ZoneAbslFlatHashMap<OpIndex, OpIndex> canonical_values_;
+  mutable ZoneAbslFlatHashMap<StructuralKey, OpIndex> values_by_structure_;
 
   // Fallback sequences keyed by their start index.
   ZoneAbslFlatHashMap<OpIndex, FallbackInstructionSequence>
@@ -893,8 +941,9 @@ class WasmBoundsCheckEliminationReducer : public Next {
   void EmitBoundsCheck(const FallbackInstructionSequence& seq, uint32_t offset,
                        Label<>& fallback_code) {
     V<Word32> index = __ Word32Constant(offset);
-    if (seq.key.base.valid()) {
-      index = __ Word32Add(__ MapToNewGraph(seq.key.base), index);
+    DCHECK_EQ(seq.key.base.valid(), seq.base_value.valid());
+    if (seq.base_value.valid()) {
+      index = __ Word32Add(__ MapToNewGraph(seq.base_value), index);
     }
     V<Word32> length = __ MapToNewGraph(seq.array_length);
     GOTO_IF_NOT(LIKELY(__ Uint32LessThan(index, length)), fallback_code);
