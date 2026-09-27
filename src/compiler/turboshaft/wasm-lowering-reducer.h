@@ -114,6 +114,31 @@ class WasmLoweringReducer : public Next {
     }
   }
 
+  // A type check whose only use is the branch ending its block (br_on_cast,
+  // br_on_cast_fail, or an `if` on a ref.test) is lowered directly into that
+  // branch, rather than into a Phi of the results of the different checks
+  // that the branch then tests: each comparison then ends up in the same block
+  // as the branch that uses it, which the InstructionSelector can combine.
+  V<Word32> REDUCE_INPUT_GRAPH(WasmTypeCheck)(V<Word32> ig_index,
+                                              const WasmTypeCheckOp& check) {
+    if (IsLoweredIntoBranch(ig_index, check)) return V<Word32>::Invalid();
+    return Next::ReduceInputGraphWasmTypeCheck(ig_index, check);
+  }
+
+  V<None> REDUCE_INPUT_GRAPH(Branch)(V<None> ig_index, const BranchOp& branch) {
+    const WasmTypeCheckOp* check = __ input_graph()
+                                       .Get(branch.condition())
+                                       .template TryCast<WasmTypeCheckOp>();
+    if (check == nullptr || !IsLoweredIntoBranch(branch.condition(), *check)) {
+      return Next::ReduceInputGraphBranch(ig_index, branch);
+    }
+    BranchOnWasmTypeCheckRtt(__ MapToNewGraph(check->object()),
+                             __ MapToNewGraph(check->rtt().value()),
+                             check->config, __ MapToNewGraph(branch.if_true),
+                             __ MapToNewGraph(branch.if_false), branch.hint);
+    return V<None>::Invalid();
+  }
+
   V<Object> REDUCE(WasmTypeCast)(V<Object> object, OptionalV<Map> rtt,
                                  OptionalV<EagerFrameState> frame_state,
                                  WasmTypeCheckConfig config) {
@@ -963,22 +988,43 @@ class WasmLoweringReducer : public Next {
   V<Word32> ReduceWasmTypeCheckRtt(V<Object> object, OptionalV<Map> rtt,
                                    WasmTypeCheckConfig config) {
     DCHECK(rtt.has_value());
+    Label<Word32> end_label(&Asm());
+    EmitWasmTypeCheckRtt(
+        object, rtt.value(), config,
+        [&](ConditionWithHint condition, bool negated, bool result) {
+          if (negated) {
+            GOTO_IF_NOT(condition, end_label, result);
+          } else {
+            GOTO_IF(condition, end_label, result);
+          }
+        },
+        [&](V<Word32> condition) { GOTO(end_label, condition); });
+    BIND(end_label, result);
+    return result;
+  }
+
+  // Emits the checks of a type check against {rtt}. Each check that can
+  // determine the result early is passed to {exit}, with its condition,
+  // whether the check succeeds when the condition is false rather than true
+  // ({negated}), and the result of the type check in that case. The last
+  // comparison, which determines the result otherwise, is passed to {finish}.
+  template <typename Exit, typename Finish>
+  void EmitWasmTypeCheckRtt(V<Object> object, V<Map> rtt,
+                            WasmTypeCheckConfig config, Exit exit,
+                            Finish finish) {
     int rtt_depth = wasm::GetSubtypingDepth(module_, config.to.ref_index());
     bool object_can_be_i31 = wasm::IsSubtypeOf(
         wasm::kWasmI31Ref.AsNonNull(), config.from.AsNonShared(), module_);
     bool is_cast_from_any =
         config.from.is_reference_to(wasm::GenericKind::kAny);
 
-    Label<Word32> end_label(&Asm());
-
     if (config.from.is_nullable()) {
-      const int kResult = config.to.is_nullable() ? 1 : 0;
-      GOTO_IF(UNLIKELY(__ IsNull(object, wasm::kWasmAnyRef)), end_label,
-              kResult);
+      exit(UNLIKELY(__ IsNull(object, wasm::kWasmAnyRef)), false,
+           config.to.is_nullable());
     }
 
     if (object_can_be_i31) {
-      GOTO_IF(__ IsSmi(object), end_label, 0);
+      exit(__ IsSmi(object), false, false);
     }
 
     V<Map> map = __ LoadMapField(object);
@@ -987,27 +1033,25 @@ class WasmLoweringReducer : public Next {
                    config.exactness != kMayBeSubtype);
 
     if (config.exactness == kExactMatchOnly) {
-      GOTO(end_label, __ TaggedEqual(map, rtt.value()));
+      finish(__ TaggedEqual(map, rtt));
     } else if (config.exactness == kExactMatchLastSupertype) {
       // This only used for custom descriptors, and only structs can have them.
       DCHECK_EQ(config.to.ref_type_kind(), wasm::RefTypeKind::kStruct);
       // Check if map instance type identifies a wasm object.
       if (is_cast_from_any) {
-        V<Word32> is_wasm_obj = IsDataRefMap(map);
-        GOTO_IF_NOT(LIKELY(is_wasm_obj), end_label, 0);
+        exit(LIKELY(IsDataRefMap(map)), true, false);
       }
       V<Object> maybe_match = LoadImmediateSuperRTT(map);
-      GOTO(end_label, __ TaggedEqual(maybe_match, rtt.value()));
+      finish(__ TaggedEqual(maybe_match, rtt));
     } else {
       DCHECK_EQ(config.exactness, kMayBeSubtype);
       // First, check if types happen to be equal. This has been shown to give
       // large speedups.
-      GOTO_IF(LIKELY(__ TaggedEqual(map, rtt.value())), end_label, 1);
+      exit(LIKELY(__ TaggedEqual(map, rtt)), false, true);
 
       // Check if map instance type identifies a wasm object.
       if (is_cast_from_any) {
-        V<Word32> is_wasm_obj = IsDataRefMap(map);
-        GOTO_IF_NOT(LIKELY(is_wasm_obj), end_label, 0);
+        exit(LIKELY(IsDataRefMap(map)), true, false);
       }
 
       V<Object> type_info = __ LoadWasmTypeInfo(map);
@@ -1021,8 +1065,8 @@ class WasmLoweringReducer : public Next {
             __ Load(type_info, LoadOp::Kind::TaggedBase().Immutable(),
                     MemoryRepresentation::TaggedSigned(),
                     offsetof(WasmTypeInfo, supertypes_length_)));
-        GOTO_IF_NOT(LIKELY(__ Uint32LessThan(rtt_depth, supertypes_length)),
-                    end_label, 0);
+        exit(LIKELY(__ Uint32LessThan(rtt_depth, supertypes_length)), true,
+             false);
       }
 
       V<Object> maybe_match =
@@ -1030,11 +1074,45 @@ class WasmLoweringReducer : public Next {
                   MemoryRepresentation::TaggedPointer(),
                   WasmTypeInfo::kSupertypesOffset + kTaggedSize * rtt_depth);
 
-      GOTO(end_label, __ TaggedEqual(maybe_match, rtt.value()));
+      finish(__ TaggedEqual(maybe_match, rtt));
     }
+  }
 
-    BIND(end_label, result);
-    return result;
+  bool IsLoweredIntoBranch(OpIndex ig_index, const WasmTypeCheckOp& check) {
+    if (!check.rtt().has_value() || !check.saturated_use_count.Is(1)) {
+      return false;
+    }
+    const BranchOp* branch = __ current_input_block()
+                                 ->LastOperation(__ input_graph())
+                                 .template TryCast<BranchOp>();
+    return branch != nullptr && branch->condition() == ig_index;
+  }
+
+  // Same checks as ReduceWasmTypeCheckRtt, jumping to {if_true} or {if_false}
+  // instead of producing a value.
+  void BranchOnWasmTypeCheckRtt(V<Object> object, V<Map> rtt,
+                                WasmTypeCheckConfig config, Block* if_true,
+                                Block* if_false, BranchHint hint) {
+    Label<> success(&Asm());
+    Label<> failure(&Asm());
+    EmitWasmTypeCheckRtt(
+        object, rtt, config,
+        [&](ConditionWithHint condition, bool negated, bool result) {
+          Label<>& target = result ? success : failure;
+          if (negated) {
+            GOTO_IF_NOT(condition, target);
+          } else {
+            GOTO_IF(condition, target);
+          }
+        },
+        [&](V<Word32> condition) {
+          GOTO_IF(ConditionWithHint(condition, hint), success);
+          GOTO(failure);
+        });
+    BIND(success);
+    __ Goto(if_true);
+    BIND(failure);
+    __ Goto(if_false);
   }
 
   OpIndex LowerGlobalSetOrGet(V<WasmTrustedInstanceData> instance, V<Any> value,
