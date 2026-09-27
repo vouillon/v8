@@ -442,7 +442,7 @@ class V8_EXPORT_PRIVATE WasmLoadEliminationAnalyzer {
 
   void Run();
 
-  OpIndex Replacement(OpIndex index) { return replacements_[index]; }
+  OpIndex Replacement(OpIndex index) const { return replacements_[index]; }
 
  private:
   void ProcessBlock(const Block& block, bool compute_start_snapshot);
@@ -530,7 +530,7 @@ class V8_EXPORT_PRIVATE WasmLoadEliminationReducer : public Next {
 
   // Gives other reducers of the same phase access to the replacements
   // computed by the analysis, once {Analyze} has run.
-  WasmLoadEliminationAnalyzer* GetWasmLoadEliminationAnalyzer() {
+  const WasmLoadEliminationAnalyzer* GetWasmLoadEliminationAnalyzer() const {
     if (!v8_flags.turboshaft_wasm_load_elimination) return nullptr;
     return &analyzer_;
   }

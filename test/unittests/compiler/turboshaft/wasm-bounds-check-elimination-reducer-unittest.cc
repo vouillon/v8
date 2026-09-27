@@ -119,7 +119,7 @@ class WasmBoundsCheckEliminationReducerTest : public ReducerTest {
 
   // The number of comparisons of a guard checking both bounds.
   static constexpr size_t kTwoSidedGuardComparisons =
-      FallbackInstructionSequence::single_comparison_two_sided_guard ? 1 : 2;
+      FallbackInstructionSequence::kSingleComparisonTwoSidedGuard ? 1 : 2;
 
   // The number of 64-bit comparisons, as used by single-comparison
   // guards checking both bounds.
@@ -158,8 +158,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, RedundantBetweenChecks) {
     BoundsCheck(Asm, a, i, 1);
   });
   Run(test);
-  bool fallback =
-      FallbackInstructionSequence::single_comparison_two_sided_guard;
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
@@ -216,8 +215,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForTwoChecks) {
     BoundsCheck(Asm, a, i, 1);
   });
   Run(test);
-  bool fallback =
-      FallbackInstructionSequence::single_comparison_two_sided_guard;
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
@@ -229,8 +227,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForTwoChecksBelow) {
     BoundsCheck(Asm, a, i, 0);
   });
   Run(test);
-  bool fallback =
-      FallbackInstructionSequence::single_comparison_two_sided_guard;
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
@@ -265,7 +262,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForFourChecks) {
   // 4 original comparisons, the guard, 4 in the fallback code.
   ASSERT_EQ(test.CountOp(Opcode::kComparison), 8u + kTwoSidedGuardComparisons);
   ASSERT_EQ(CountWord64Comparisons(test),
-            FallbackInstructionSequence::single_comparison_two_sided_guard);
+            FallbackInstructionSequence::kSingleComparisonTwoSidedGuard);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForThreeChecks) {
@@ -277,8 +274,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForThreeChecks) {
     BoundsCheck(Asm, a, i, 2);
   });
   Run(test);
-  bool fallback =
-      FallbackInstructionSequence::single_comparison_two_sided_guard;
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
   ASSERT_EQ(CountWord64Comparisons(test), fallback ? 1u : 0u);
@@ -332,8 +328,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest,
     BoundsCheck(Asm, b, i, 0);
   });
   Run(test);
-  bool fallback =
-      FallbackInstructionSequence::single_comparison_two_sided_guard;
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
