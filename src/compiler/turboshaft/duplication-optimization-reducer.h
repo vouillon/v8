@@ -62,6 +62,18 @@ namespace v8::internal::compiler::turboshaft {
 // conditions that are used more than once, so that they can be generated right
 // before each branch without worrying about breaking SSA.
 //
+// Similarly, a comparison that is only used by a branch, but that was emitted
+// in a previous block, is materialized in a register, since the
+// InstructionSelector only combines a comparison with a branch in the same
+// block. This typically happens after the BranchEliminationReducer has cloned a
+// merge block ending with a branch on a Phi into each of its predecessors
+// (CloneBlockAndGoto): the comparison stays in the predecessor, and the branch
+// ends up alone in the cloned block. This is what happens for the Wasm type
+// checks of br_on_cast and ref.test, which are lowered to a Phi of the
+// comparison of the map with the rtt. Such comparisons are re-emitted right
+// before the branch when it is their first use; if the original comparison has
+// no other uses, it is then not emitted.
+//
 // 2. Load/Store flexible second operand duplication: on Arm64, it tries to
 // duplicate the "index" input of Loads/Stores when it's a shift by a constant.
 // This allows the Instruction Selector to compute said shift using a flexible
@@ -144,6 +156,10 @@ class DuplicationOptimizationReducer : public Next {
  private:
   bool MaybeDuplicateCond(const Operation& cond, OpIndex input_idx,
                           V<Word32>* new_cond) {
+    if (const ComparisonOp* comp = cond.TryCast<ComparisonOp>()) {
+      *new_cond = MaybeSinkComparison(*comp, input_idx);
+      if (new_cond->valid()) return true;
+    }
     if (cond.saturated_use_count.Is(1)) return false;
 
     switch (cond.opcode) {
@@ -162,6 +178,21 @@ class DuplicationOptimizationReducer : public Next {
         return false;
     }
     return new_cond->valid();
+  }
+
+  V<Word32> MaybeSinkComparison(const ComparisonOp& comp, OpIndex input_idx) {
+    // Only for the first use of the comparison in the output graph (other uses
+    // are handled by MaybeDuplicateComparison), and if the comparison is in a
+    // previous block (otherwise, the InstructionSelector can combine it with
+    // the branch).
+    OpIndex output_idx = __ MapToNewGraph(input_idx);
+    if (!__ Get(output_idx).saturated_use_count.Is(0) ||
+        output_idx.id() >= __ current_block()->begin().id()) {
+      return {};
+    }
+    DisableValueNumbering disable_gvn(this);
+    return __ Comparison(__ MapToNewGraph(comp.left()),
+                         __ MapToNewGraph(comp.right()), comp.kind, comp.rep);
   }
 
   bool MaybeCanDuplicateGenericBinop(OpIndex input_idx, OpIndex left,
