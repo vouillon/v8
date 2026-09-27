@@ -331,6 +331,114 @@ function store(array, param, offset, value) {
   }
 })();
 
+(function TestOCamlBoundsChecks() {
+  print(arguments.callee.name);
+  // wasm_of_ocaml stores a header in the first element of the arrays
+  // it uses for OCaml arrays, and checks an access a.(i) with
+  // {i < a.length - 1} before accessing a[i+1]. This check only shows
+  // that a[i+1] is within bounds if the length is known to be at least 1.
+  let builder = new WasmModuleBuilder();
+  let array = builder.addArray(kWasmI32);
+  addArrayHelpers(builder, array);
+  let sig = makeSig([wasmRefNullType(array), kWasmI32, kWasmI32], []);
+  // if (i < a.length - c) a[i + offset] = value;
+  function guarded(index, reduction, offset, value) {
+    return [
+      kExprLocalGet, index,
+      kExprLocalGet, 0,
+      kGCPrefix, kExprArrayLen,
+      ...wasmI32Const(reduction), kExprI32Sub,
+      kExprI32LtU,
+      kExprIf, kWasmVoid,
+        ...store(array, index, offset, value),
+      kExprEnd,
+    ];
+  }
+  // if (a.length - c <= i) skip; a[i + offset] = value;
+  function skipUnless(index, reduction, offset, value) {
+    return [
+      kExprBlock, kWasmVoid,
+        kExprLocalGet, 0,
+        kGCPrefix, kExprArrayLen,
+        ...wasmI32Const(reduction), kExprI32Sub,
+        kExprLocalGet, index,
+        kExprI32LeU,
+        kExprBrIf, 0,
+        ...store(array, index, offset, value),
+      kExprEnd,
+    ];
+  }
+  let cases = {
+    // Nothing is known about the length: a.length - 1 may wrap around.
+    unknownLength: [[guarded, 1, 1, 0, 1]],
+    unknownLengthSkip: [[skipUnless, 1, 1, 0, 1]],
+    // a[0] shows that the length is at least 1.
+    knownLength: [['store', 0, 1], [guarded, 1, 1, 0, 2]],
+    knownLengthSkip: [['store', 0, 1], [skipUnless, 1, 1, 0, 2]],
+    // The first OCaml access shows that the length is at least 1 for
+    // the second one.
+    sequence: [[skipUnless, 1, 1, 0, 1], [skipUnless, 2, 1, 0, 2]],
+    // a[0] only shows that the length is at least 1, not 2.
+    reductionTooLarge: [['store', 0, 1], [guarded, 1, 2, 1, 2]],
+    reductionOk: [['store', 1, 1], [guarded, 1, 2, 0, 2], [guarded, 1, 2, 2, 3]],
+  };
+  // Parameters: the array, then two indices i and j.
+  for (let [name, steps] of Object.entries(cases)) {
+    let code = [];
+    for (let [kind, ...rest] of steps) {
+      if (kind === 'store') {
+        let [index, value] = rest;
+        code.push(kExprLocalGet, 0, ...wasmI32Const(index),
+                  ...wasmI32Const(value), kGCPrefix, kExprArraySet, array);
+      } else {
+        let [index, reduction, offset, value] = rest;
+        code.push(...kind(index, reduction, offset, value));
+      }
+    }
+    builder.addFunction(name, sig).addBody(code).exportFunc();
+  }
+  let instance = builder.instantiate();
+  for (let [name, steps] of Object.entries(cases)) {
+    for (let length of [0, 1, 2, 3, 5]) {
+      for (let i of [-2, -1, 0, 1, 2, 3, 4, 5]) {
+        for (let j of [-1, 0, 1, 3]) {
+          let a = instance.exports.make(length);
+          let expected = new Array(length).fill(0);
+          let traps = false;
+          let params = [null, i, j];
+          for (let [kind, ...rest] of steps) {
+            let index, value;
+            if (kind === 'store') {
+              [index, value] = rest;
+            } else {
+              let [param, reduction, offset] = rest;
+              value = rest[3];
+              // The condition, with the same modular arithmetic as Wasm.
+              let bound = (length - reduction) >>> 0;
+              if (!((params[param] >>> 0) < bound)) continue;
+              index = params[param] + offset;
+            }
+            index >>>= 0;
+            if (index >= length) {
+              traps = true;
+              break;
+            }
+            expected[index] = value;
+          }
+          let run = () => instance.exports[name](a, i, j);
+          if (traps) {
+            assertTraps(kTrapArrayOutOfBounds, run);
+          } else {
+            run();
+          }
+          assertEquals(expected, contents(instance, a, length),
+                       `${name}(length=${length}, i=${i}, j=${j})`);
+        }
+      }
+    }
+  }
+})();
+
 // Randomly generated functions, compared against a JS model. For stress
 // testing, a different seed can be passed with: d8 ... -- <seed>
 const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
@@ -442,7 +550,7 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
   function randomCondition(bases, anchors, index) {
     let allow_flag = index === undefined;
     index ??= randomIndex(bases, anchors);
-    switch (allow_flag ? random(8) : 1 + random(7)) {
+    switch (allow_flag ? random(10) : 1 + random(9)) {
       case 0:
         return {kind: 'flag'};
       case 1:
@@ -457,6 +565,13 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
         return {kind: 'gtS', bound: randomSignedBound(), index};
       case 6:
         return {kind: 'ltS', bound: randomSignedBound(), index};
+      case 7:
+        // index < a.length - c, as in wasm_of_ocaml's bounds checks.
+        return {kind: 'boundsMinus', array: pick(kArrays), index,
+                reduction: 1 + random(2)};
+      case 8:
+        return {kind: 'outOfBoundsMinus', array: pick(kArrays), index,
+                reduction: 1 + random(2)};
       default:
         return {kind: 'ltU', bound: randomUnsignedBound(), index};
     }
@@ -555,6 +670,14 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
       case 'outOfBounds':
         return [...emitIndex(condition.index), ...length(condition.array),
                 kExprI32GeU];
+      case 'boundsMinus':
+        return [...emitIndex(condition.index), ...length(condition.array),
+                ...wasmI32Const(condition.reduction), kExprI32Sub,
+                kExprI32LtU];
+      case 'outOfBoundsMinus':
+        return [...length(condition.array),
+                ...wasmI32Const(condition.reduction), kExprI32Sub,
+                ...emitIndex(condition.index), kExprI32LeU];
       case 'geS':
         return [...emitIndex(condition.index), ...wasmI32Const(condition.bound),
                 kExprI32GeS];
@@ -647,6 +770,12 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
         return (index >>> 0) < length(condition.array);
       case 'outOfBounds':
         return (index >>> 0) >= length(condition.array);
+      case 'boundsMinus':
+        return (index >>> 0) <
+               ((length(condition.array) - condition.reduction) >>> 0);
+      case 'outOfBoundsMinus':
+        return ((length(condition.array) - condition.reduction) >>> 0) <=
+               (index >>> 0);
       case 'geS':
         return index >= condition.bound;
       case 'gtS':

@@ -73,6 +73,17 @@ namespace v8::internal::compiler::turboshaft {
 // shows that both {i} and {i+1} are within the bounds of {b}, and the
 // last bounds check can be removed.
 //
+// Conditions of the form {base + n < a.length - c}, for a small
+// constant {c}, are also taken into account, once {a.length} is known
+// to be at least {c} (otherwise, {a.length - c} may wrap around). Such
+// a condition shows that the offsets from {n} to {n + c} are within
+// bounds. Any successful bounds check of {a} shows that its length is
+// at least 1. For example, wasm_of_ocaml stores a header in the first
+// element of the arrays it uses for OCaml arrays, so the OCaml bounds
+// check of an access {a.(i)} is {i < a.length - 1}, which shows that
+// the Wasm access {a[i+1]} is within bounds, as long as some previous
+// access to {a} showed that its length is at least 1.
+//
 // When some bounds checks are later followed by stronger checks in
 // the same block, the instructions in between can be duplicated into
 // two paths:
@@ -314,6 +325,37 @@ class OffsetRange {
 //   (assert (not (bvult (bvadd x k) l)))
 //   (check-sat)
 //
+// If the array length l is at least c, then x + n < l - c shows that
+// all the offsets from n to n + c are within bounds (without this
+// assumption on l, it does not: l - c may wrap around):
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (declare-const k (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvuge l c))
+//   (assert (bvult (bvadd x n) (bvsub l c)))
+//   (assert (valid-range n k))
+//   (assert (valid-range k (bvadd n c)))
+//   (assert (not (bvult (bvadd x k) l)))
+//   (check-sat)
+//
+// It also shows that x + n is non-negative, and that l is at least
+// c + 1:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvuge l c))
+//   (assert (bvult (bvadd x n) (bvsub l c)))
+//   (assert (not (and (non-negative (bvadd x n))
+//                     (bvuge l (bvadd c #x00000001)))))
+//   (check-sat)
+//
 // A guard for the range lo..hi only needs to check hi when some x + n
 // with n <= lo is known to be non-negative (in particular, when it is
 // known to be within bounds): this is the previous proof with m = hi.
@@ -373,6 +415,9 @@ using BoundsCheckMap = KeyedSnapshotTable<BoundsCheckKey, OffsetRange>;
 // Maps bases to the range of offsets {n} such that {base + n} is
 // known to be non-negative.
 using NonNegativeOffsetMap = KeyedSnapshotTable<OpIndex, OffsetRange>;
+
+// Maps arrays to a lower bound on their length.
+using MinLengthMap = KeyedSnapshotTable<OpIndex, uint32_t>;
 
 // Represents a sequence of instructions that could be duplicated:
 // - Fast path: execute without bounds checks (checks moved earlier)
@@ -568,12 +613,14 @@ class WasmBoundsCheckEliminationAnalyzer {
         fallback_sequence_starts_(phase_zone),
         known_bounds_checks_(phase_zone),
         known_non_negative_offsets_(phase_zone),
+        known_min_lengths_(phase_zone),
         block_to_snapshot_mapping_(graph.block_count(), phase_zone),
         last_trap_bounds_checks_(phase_zone),
         array_lengths_(phase_zone),
         planned_fallbacks_by_key_(phase_zone),
         predecessor_bounds_check_snapshots_(phase_zone),
-        predecessor_non_negative_snapshots_(phase_zone) {}
+        predecessor_non_negative_snapshots_(phase_zone),
+        predecessor_min_length_snapshots_(phase_zone) {}
 
   void Run() {
     LoopFinder loop_finder(phase_zone_, &graph_, LoopFinder::Config{});
@@ -610,6 +657,15 @@ class WasmBoundsCheckEliminationAnalyzer {
   struct Snapshot {
     BoundsCheckMap::Snapshot bounds_checks;
     NonNegativeOffsetMap::Snapshot non_negative_offsets;
+    MinLengthMap::Snapshot min_lengths;
+  };
+
+  // A condition {index < a.length - reduction}, where {reduction} is a
+  // constant (usually 0).
+  struct BoundsCheckCondition {
+    BoundsCheck bounds_check;
+    OpIndex array_length;
+    uint32_t reduction;
   };
 
   // A trap that may start a fallback sequence, with what is known
@@ -636,8 +692,8 @@ class WasmBoundsCheckEliminationAnalyzer {
 
   void ProcessCondition(OpIndex trap_if, OpIndex condition, bool inverted);
   void ProcessBoundsCheck(OpIndex trap_if, OpIndex condition,
-                          const BoundsCheck& bounds_check,
-                          OpIndex array_length);
+                          const BoundsCheck& bounds_check, OpIndex array_length,
+                          uint32_t extent);
 
   void RecordFallbackSequence(const BoundsCheckKey& key, uint32_t prev_offset,
                               OpIndex trap_if, uint32_t offset);
@@ -654,9 +710,14 @@ class WasmBoundsCheckEliminationAnalyzer {
       const std::optional<OffsetRange>& non_negative) const;
   std::optional<OffsetRange> NonNegativeOffsets(OpIndex base) const;
   void RecordNonNegativeOffset(OpIndex base, uint32_t offset);
+  uint32_t MinLength(OpIndex array) const;
+  void RecordMinLength(OpIndex array, uint64_t length);
 
-  std::optional<std::pair<BoundsCheck, OpIndex>> TryExtractBoundChecksCondition(
+  std::optional<BoundsCheckCondition> TryExtractBoundChecksCondition(
       OpIndex index, bool inverted) const;
+  std::optional<std::pair<OpIndex, uint32_t>> TryExtractArrayLength(
+      OpIndex length) const;
+  bool IsArrayLengthWithoutWrapAround(OpIndex length) const;
   std::optional<std::pair<OpIndex, uint32_t>> TryExtractNonNegativeIndex(
       OpIndex condition, bool inverted) const;
   std::pair<OpIndex, uint32_t> ExtractBaseAndOffset(OpIndex index) const;
@@ -676,6 +737,7 @@ class WasmBoundsCheckEliminationAnalyzer {
   // Summary of all the bounds check information collected so far.
   BoundsCheckMap known_bounds_checks_;
   NonNegativeOffsetMap known_non_negative_offsets_;
+  MinLengthMap known_min_lengths_;
 
   FixedBlockSidetable<std::optional<Snapshot>> block_to_snapshot_mapping_;
 
@@ -699,6 +761,7 @@ class WasmBoundsCheckEliminationAnalyzer {
   ZoneVector<BoundsCheckMap::Snapshot> predecessor_bounds_check_snapshots_;
   ZoneVector<NonNegativeOffsetMap::Snapshot>
       predecessor_non_negative_snapshots_;
+  ZoneVector<MinLengthMap::Snapshot> predecessor_min_length_snapshots_;
 
 #if DEBUG
   void PrintStats();

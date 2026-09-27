@@ -72,6 +72,27 @@ class WasmBoundsCheckEliminationReducerTest : public ReducerTest {
     __ Bind(merge);
   }
 
+  // Emits a branch to an unreachable block when {condition} holds, and
+  // continues otherwise. This is how wasm_of_ocaml raises an exception
+  // for an OCaml bounds check.
+  template <typename Asm_t>
+  static void FailIf(Asm_t& Asm, V<Word32> condition) {
+    Block* failure = __ NewBlock();
+    Block* success = __ NewBlock();
+    __ Branch(condition, failure, success);
+    __ Bind(failure);
+    __ Unreachable();
+    __ Bind(success);
+  }
+
+  // {a.length - reduction}.
+  template <typename Asm_t>
+  static V<Word32> ReducedLength(Asm_t& Asm, V<WasmArrayNullable> array,
+                                 int32_t reduction) {
+    return __ Word32Sub(__ ArrayLength(array, compiler::kWithNullCheck),
+                        __ Word32Constant(reduction));
+  }
+
   static void Run(TestInstance& test) {
     test.Run<WasmBoundsCheckEliminationReducer>();
   }
@@ -331,6 +352,89 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, FallbackSequenceStartingAtTrap) {
   // The first trap, and the other two in the fallback code.
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, OCamlBoundsCheck) {
+  // a[0]; if (a.length - 1 <= i) fail; a[i+1];
+  // The first access shows that the length is at least 1, so the OCaml
+  // bounds check shows that a[i+1] is within bounds.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), i));
+    BoundsCheck(Asm, a, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, OCamlBoundsCheckAsAddition) {
+  // a[0]; if (a.length + (-1) <= i) fail; a[i+1];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Uint32LessThanOrEqual(
+                    __ Word32Add(length, __ Word32Constant(-1)), i));
+    BoundsCheck(Asm, a, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, OCamlBoundsCheckUnknownLength) {
+  // if (a.length - 1 <= i) fail; a[i+1];
+  // The array might be empty, in which case a.length - 1 wraps around
+  // and the OCaml bounds check does not show anything.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), i));
+    BoundsCheck(Asm, a, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, OCamlBoundsChecksInSequence) {
+  // a[i+1] after the OCaml bounds check of a.(i) shows that the length is
+  // at least 1, so the Wasm bounds checks of a.(j) and a.(k) are
+  // redundant.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), i));
+    BoundsCheck(Asm, a, i, 1);
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), c));
+    BoundsCheck(Asm, a, c, 1);
+    V<Word32> k = __ Word32Add(i, c);
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), k));
+    BoundsCheck(Asm, a, k, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, ReducedLengthCoversRange) {
+  // a[1]; if (i < a.length - 2) { a[i]; a[i+1]; a[i+2]; }
+  // a[1] shows that the length is at least 2.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 1);
+    If(Asm, __ Uint32LessThan(i, ReducedLength(Asm, a, 2)), [&]() {
+      BoundsCheck(Asm, a, i, 0);
+      BoundsCheck(Asm, a, i, 1);
+      BoundsCheck(Asm, a, i, 2);
+    });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, ReducedLengthTooLarge) {
+  // a[0]; if (i < a.length - 2) { a[i+2]; }
+  // a[0] only shows that the length is at least 1, so a.length - 2 may
+  // wrap around.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    If(Asm, __ Uint32LessThan(i, ReducedLength(Asm, a, 2)),
+       [&]() { BoundsCheck(Asm, a, i, 2); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
 }
 
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"

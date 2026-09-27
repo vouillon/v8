@@ -61,6 +61,7 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
   // Collect the snapshots of all predecessors.
   predecessor_bounds_check_snapshots_.clear();
   predecessor_non_negative_snapshots_.clear();
+  predecessor_min_length_snapshots_.clear();
   for (const Block* p : block->PredecessorsIterable()) {
     std::optional<Snapshot> pred_snapshots =
         block_to_snapshot_mapping_[p->index()];
@@ -75,6 +76,7 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
         pred_snapshots->bounds_checks);
     predecessor_non_negative_snapshots_.push_back(
         pred_snapshots->non_negative_offsets);
+    predecessor_min_length_snapshots_.push_back(pred_snapshots->min_lengths);
   }
   // Without merge functions, the new snapshots only contain what is
   // known in all predecessors, that is, in the common ancestor of the
@@ -83,6 +85,8 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
       base::VectorOf(predecessor_bounds_check_snapshots_));
   known_non_negative_offsets_.StartNewSnapshot(
       base::VectorOf(predecessor_non_negative_snapshots_));
+  known_min_lengths_.StartNewSnapshot(
+      base::VectorOf(predecessor_min_length_snapshots_));
 
   if (block->IsBranchTarget() && !ShouldSkipOptimizationStep()) {
     // The current block is a branch target, so we see if the branch
@@ -126,7 +130,8 @@ void WasmBoundsCheckEliminationAnalyzer::FinishBlock(const Block* block) {
   array_lengths_.clear();
 
   block_to_snapshot_mapping_[block->index()] =
-      Snapshot{known_bounds_checks_.Seal(), known_non_negative_offsets_.Seal()};
+      Snapshot{known_bounds_checks_.Seal(), known_non_negative_offsets_.Seal(),
+               known_min_lengths_.Seal()};
 }
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBranch(const Block* block) {
@@ -151,10 +156,24 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBranch(const Block* block) {
 void WasmBoundsCheckEliminationAnalyzer::ProcessCondition(OpIndex trap_if,
                                                           OpIndex condition,
                                                           bool inverted) {
-  if (auto decoded_condition =
-          TryExtractBoundChecksCondition(condition, inverted)) {
-    const auto& [bounds_check, array_length] = *decoded_condition;
-    ProcessBoundsCheck(trap_if, condition, bounds_check, array_length);
+  if (auto decoded = TryExtractBoundChecksCondition(condition, inverted)) {
+    const auto& [bounds_check, array_length, reduction] = *decoded;
+    const auto& [key, offset] = bounds_check;
+    // Unless the length is known to be at least {reduction},
+    // {a.length - reduction} may wrap around, and we learn nothing.
+    uint32_t min_length = MinLength(key.array);
+    if (reduction == 0 || min_length >= reduction) {
+      // When {reduction} is not 0, this is not an actual bounds check, so
+      // it is only used for what it shows, even for a trap.
+      ProcessBoundsCheck(reduction == 0 ? trap_if : OpIndex::Invalid(),
+                         condition, bounds_check, array_length, reduction);
+      // With {index < a.length - reduction}, the length is at least
+      // {reduction + 1}, and more for a constant index.
+      uint64_t index_bound = key.base.valid() ? 0 : offset;
+      if (index_bound <= kMaxInt) {
+        RecordMinLength(key.array, index_bound + reduction + 1);
+      }
+    }
   }
   // This is done after processing the bounds check, since what is
   // known before the bounds check is used when emitting fallback
@@ -168,8 +187,10 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessCondition(OpIndex trap_if,
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
     OpIndex trap_if, OpIndex condition, const BoundsCheck& bounds_check,
-    OpIndex array_length) {
+    OpIndex array_length, uint32_t extent) {
   const auto& [key, offset] = bounds_check;
+  // Only plain bounds checks can be eliminated.
+  DCHECK_IMPLIES(trap_if.valid(), extent == 0);
 
   // Record the array length, so that we can use it when emitting new
   // bounds checks. Array length instructions can trap on null, so it
@@ -177,74 +198,83 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
   // a new one.
   array_lengths_.try_emplace(key.array, array_length);
 
-  // For constant indices, check if [0, offset] would be valid.
+  // The condition shows that the offsets from {offset} to {last} are
+  // within bounds (see the proofs in the header).
+  uint32_t last = offset + extent;
+  DCHECK(OffsetRange::IsValidRange(offset, last));
+  OffsetRange direct(offset, last);
+
+  // For constant indices, check if [0, last] would be valid.
   // If not, this offset is out-of-bounds and will always trap.
-  if (!key.base.valid() && !OffsetRange::IsValidRange(0, offset)) {
+  if (!key.base.valid() && !(OffsetRange::IsValidRange(0, offset) &&
+                             OffsetRange::IsValidRange(0, last))) {
     return;
   }
 
   std::optional<OffsetRange> non_negative = NonNegativeOffsets(key.base);
   std::optional<OffsetRange> known = KnownOffsets(key, non_negative);
 
-  if (known.has_value() && known->Contains(offset)) {
-    TRACE("  Redundant bounds check: offset "
-          << offset << " within [" << known->lower() << ", " << known->upper()
-          << "]");
+  if (known.has_value() && known->Contains(offset) && known->Contains(last)) {
+    TRACE("  Redundant bounds check: offsets ["
+          << offset << ", " << last << "] within [" << known->lower() << ", "
+          << known->upper() << "]");
     if (trap_if.valid()) {
       redundant_traps_.insert(trap_if);
     }
     return;
   }
 
-  // Offsets within bounds after this check: {offset}, and every offset
-  // from {n} to {offset} if {key.base + n} is non-negative (see the
-  // proofs in the header).
-  OffsetRange checked(offset);
+  // Offsets within bounds after this check: {direct}, and every offset
+  // from {n} to {last} if {key.base + n} is non-negative, for {n} below
+  // {offset}.
+  OffsetRange checked = direct;
   if (non_negative.has_value()) {
     OffsetRange::RelativePosition position = non_negative->Classify(offset);
-    if (position == OffsetRange::RelativePosition::kInside ||
-        position == OffsetRange::RelativePosition::kAbove) {
-      checked = OffsetRange(non_negative->lower(), offset);
+    if ((position == OffsetRange::RelativePosition::kInside ||
+         position == OffsetRange::RelativePosition::kAbove) &&
+        OffsetRange::IsValidRange(non_negative->lower(), last)) {
+      checked = OffsetRange(non_negative->lower(), last);
     }
   }
 
   if (!known.has_value()) {
     // First bounds check for this base and array.
     TRACE("  New bounds check: offset="
-          << offset << " base=" << key.base << " array=" << key.array << " -> ["
-          << checked.lower() << ", " << checked.upper() << "]");
+          << offset << " extent=" << extent << " base=" << key.base
+          << " array=" << key.array << " -> [" << checked.lower() << ", "
+          << checked.upper() << "]");
     UpdateKnownBoundsChecks(key, offset, checked, trap_if, condition, known,
                             non_negative);
     return;
   }
 
-  OffsetRange::RelativePosition position = known->Classify(offset);
-  if (position == OffsetRange::RelativePosition::kOutOfRange) {
-    // Given the previous bounds check, the current bounds check
-    // will always trap.
-    TRACE("  Out-of-range check: offset "
-          << offset << " outside [" << known->lower() << ", " << known->upper()
-          << "]");
+  // The hull of {known} and {direct} might not be valid, in which case
+  // this condition cannot hold given what we know: a bounds check will
+  // always trap, and a branch will never be taken.
+  std::optional<OffsetRange> offsets = known->Hull(checked);
+  if (!offsets.has_value()) offsets = known->Hull(direct);
+  if (!offsets.has_value()) {
+    TRACE("  Out-of-range check: offsets ["
+          << offset << ", " << last << "] outside [" << known->lower() << ", "
+          << known->upper() << "]");
     return;
   }
-  DCHECK(position == OffsetRange::RelativePosition::kAbove ||
-         position == OffsetRange::RelativePosition::kBelow);
-
-  // The hull of {known} and {offset} is valid since {offset} is above
-  // or below {known}, but the hull with all of {checked} might not be.
-  std::optional<OffsetRange> offsets = known->Hull(checked);
-  if (!offsets.has_value()) offsets = known->Hull(OffsetRange(offset));
-  DCHECK(offsets.has_value());
   TRACE("  Extend range: [" << known->lower() << ", " << known->upper()
                             << "] -> [" << offsets->lower() << ", "
                             << offsets->upper() << "]");
 
-  // The trap that established the bound of {known} on the side of
-  // {offset} can start a fallback sequence.
-  uint32_t prev_offset = position == OffsetRange::RelativePosition::kAbove
-                             ? known->upper()
-                             : known->lower();
-  RecordFallbackSequence(key, prev_offset, trap_if, offset);
+  if (trap_if.valid()) {
+    // The trap that established the bound of {known} on the side of
+    // {offset} can start a fallback sequence. For a trap, {extent} is 0,
+    // and {offset} is not in {known}, so it is above or below it.
+    OffsetRange::RelativePosition position = known->Classify(offset);
+    DCHECK(position == OffsetRange::RelativePosition::kAbove ||
+           position == OffsetRange::RelativePosition::kBelow);
+    uint32_t prev_offset = position == OffsetRange::RelativePosition::kAbove
+                               ? known->upper()
+                               : known->lower();
+    RecordFallbackSequence(key, prev_offset, trap_if, offset);
+  }
   UpdateKnownBoundsChecks(key, offset, *offsets, trap_if, condition, known,
                           non_negative);
 }
@@ -379,13 +409,27 @@ void WasmBoundsCheckEliminationAnalyzer::RecordNonNegativeOffset(
   known_non_negative_offsets_.Set(base, *offsets);
 }
 
+uint32_t WasmBoundsCheckEliminationAnalyzer::MinLength(OpIndex array) const {
+  return known_min_lengths_.Get(array).value_or(0);
+}
+
+void WasmBoundsCheckEliminationAnalyzer::RecordMinLength(OpIndex array,
+                                                         uint64_t length) {
+  if (length <= MinLength(array)) return;
+  // Array lengths are less than 2^31, so a condition implying a larger
+  // length cannot hold, and we are in unreachable code.
+  if (length > kMaxInt) return;
+  TRACE("  Min length for " << array << ": " << length);
+  known_min_lengths_.Set(array, static_cast<uint32_t>(length));
+}
+
 // Attempts to decode a bounds check condition of the form:
-//     n < a.length   or   base + n < a.length
-// If the condition cannot be interpreted as a bounds check, returns
-// std::nullopt. Otherwise, returns a {BoundsCheck} describing the base,
-// array, and offset, along with the index of the array length
-// instruction.
-std::optional<std::pair<BoundsCheck, OpIndex>>
+//     n < a.length - c   or   base + n < a.length - c
+// where {c} is a constant (usually 0). If the condition cannot be
+// interpreted as a bounds check, returns std::nullopt. Otherwise,
+// returns a {BoundsCheck} describing the base, array, and offset,
+// along with the index of the array length instruction, and {c}.
+std::optional<WasmBoundsCheckEliminationAnalyzer::BoundsCheckCondition>
 WasmBoundsCheckEliminationAnalyzer::TryExtractBoundChecksCondition(
     OpIndex condition, bool inverted) const {
   const ComparisonOp* comparison =
@@ -401,19 +445,69 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundChecksCondition(
   OpIndex index = inverted ? comparison->right() : comparison->left();
   OpIndex length = inverted ? comparison->left() : comparison->right();
 
-  const ArrayLengthOp* array_length =
-      graph_.Get(length).TryCast<ArrayLengthOp>();
+  std::optional<std::pair<OpIndex, uint32_t>> array_length =
+      TryExtractArrayLength(length);
   if (!array_length) return std::nullopt;
+  const auto& [length_op, reduction] = *array_length;
 
   auto [base, offset] = ExtractBaseAndOffset(index);
-  OpIndex array = ResolveAliases(array_length->array());
-  return std::pair{BoundsCheck(BoundsCheckKey(base, array), offset), length};
+  OpIndex array =
+      ResolveAliases(graph_.Get(length_op).Cast<ArrayLengthOp>().array());
+  return BoundsCheckCondition{BoundsCheck(BoundsCheckKey(base, array), offset),
+                              length_op, reduction};
+}
+
+// Recognizes {a.length} and {a.length - c} (possibly written
+// {a.length + (-c)}) for a small constant {c}. Returns the array length
+// instruction and {c}.
+std::optional<std::pair<OpIndex, uint32_t>>
+WasmBoundsCheckEliminationAnalyzer::TryExtractArrayLength(
+    OpIndex length) const {
+  if (graph_.Get(length).Is<ArrayLengthOp>()) return std::pair{length, 0u};
+  const WordBinopOp* op = graph_.Get(length).TryCast<WordBinopOp>();
+  if (!op || op->rep != WordRepresentation::Word32() ||
+      !graph_.Get(op->left()).Is<ArrayLengthOp>()) {
+    return std::nullopt;
+  }
+  std::optional<uint32_t> constant = TryExtractI32Const(op->right());
+  if (!constant) return std::nullopt;
+  uint32_t reduction;
+  switch (op->kind) {
+    case WordBinopOp::Kind::kSub:
+      reduction = *constant;
+      break;
+    case WordBinopOp::Kind::kAdd:
+      reduction = 0u - *constant;
+      break;
+    default:
+      return std::nullopt;
+  }
+  // Only small reductions are useful. This also ensures that the range
+  // of offsets shown by the condition is valid.
+  static constexpr uint32_t kMaxReduction = 1 << 16;
+  if (reduction > kMaxReduction) return std::nullopt;
+  return std::pair{op->left(), reduction};
+}
+
+// Whether {length} is {a.length - c}, with {a.length} known to be at
+// least {c}, so that it does not wrap around and is less than 2^31.
+bool WasmBoundsCheckEliminationAnalyzer::IsArrayLengthWithoutWrapAround(
+    OpIndex length) const {
+  std::optional<std::pair<OpIndex, uint32_t>> array_length =
+      TryExtractArrayLength(length);
+  if (!array_length) return false;
+  const auto& [length_op, reduction] = *array_length;
+  return reduction == 0 ||
+         MinLength(ResolveAliases(
+             graph_.Get(length_op).Cast<ArrayLengthOp>().array())) >= reduction;
 }
 
 // Attempts to decode a condition showing that {base + n} is
 // non-negative:
 //     base + n < b    or   base + n <= b   (unsigned)
-// where {b} is an array length or a small enough constant, or
+// where {b} is an array length (possibly minus a constant, if the
+// length is known to be at least that constant), or a small enough
+// constant, or
 //     c < base + n    or   c <= base + n   (signed)
 // where {c} is a large enough constant. Returns {base} and {n}.
 std::optional<std::pair<OpIndex, uint32_t>>
@@ -459,8 +553,9 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractNonNegativeIndex(
     case Kind::kUnsignedLessThanOrEqual: {
       // The index is at most {b}, which must be less than 2^31, or at
       // most {b - 1} for a strict comparison. Array lengths are less
-      // than 2^31.
-      if (!graph_.Get(right).Is<ArrayLengthOp>()) {
+      // than 2^31, and so are reduced array lengths that do not wrap
+      // around.
+      if (!IsArrayLengthWithoutWrapAround(right)) {
         std::optional<uint32_t> bound = TryExtractI32Const(right);
         if (!bound.has_value()) return std::nullopt;
         uint32_t limit = kind == Kind::kUnsignedLessThan ? 1u << 31 : kMaxInt;
