@@ -585,28 +585,37 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractNonNegativeIndex(
 // Extract base expression and constant offset from an index expression.
 std::pair<OpIndex, uint32_t>
 WasmBoundsCheckEliminationAnalyzer::ExtractBaseAndOffset(OpIndex index) const {
-  index = ResolveReplacements(index);
-  // a[n]
-  if (auto offset = TryExtractI32Const(index)) {
-    return {OpIndex::Invalid(), *offset};
-  }
-  // a[base + n] / a[base - n]
-  if (const WordBinopOp* op = graph_.Get(index).TryCast<WordBinopOp>()) {
-    if (auto offset = TryExtractI32Const(op->right()); offset.has_value()) {
-      switch (op->kind) {
-        case WordBinopOp::Kind::kAdd:
-          return {ResolveReplacements(op->left()), *offset};
-        case WordBinopOp::Kind::kSub:
-          // We are using modular arithmetic, so we can always replace
-          // a subtraction by the addition of the opposite
-          return {ResolveReplacements(op->left()), 0u - *offset};
-        default:
-          break;
-      }
+  // Nested additions of constants, as produced for instance by loop
+  // unrolling, are folded into a single offset, so that
+  // {(base + n) + m} and {base + (n + m)} have the same base. We are
+  // using modular arithmetic, so a subtraction can be replaced by the
+  // addition of the opposite. The depth is bounded to keep the cost
+  // linear.
+  static constexpr int kMaxDepth = 8;
+  uint32_t offset = 0;
+  for (int depth = 0;; depth++) {
+    index = ResolveReplacements(index);
+    // a[n]
+    if (auto constant = TryExtractI32Const(index)) {
+      return {OpIndex::Invalid(), offset + *constant};
     }
+    if (depth == kMaxDepth) break;
+    // a[base + n] / a[base - n]
+    const WordBinopOp* op = graph_.Get(index).TryCast<WordBinopOp>();
+    if (op == nullptr) break;
+    std::optional<uint32_t> constant = TryExtractI32Const(op->right());
+    if (!constant.has_value()) break;
+    if (op->kind == WordBinopOp::Kind::kAdd) {
+      offset += *constant;
+    } else if (op->kind == WordBinopOp::Kind::kSub) {
+      offset -= *constant;
+    } else {
+      break;
+    }
+    index = op->left();
   }
   // Default: a[base]
-  return {index, 0};
+  return {index, offset};
 }
 
 std::optional<uint32_t> WasmBoundsCheckEliminationAnalyzer::TryExtractI32Const(

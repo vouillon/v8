@@ -124,6 +124,22 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, RedundantBetweenChecks) {
   ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
 }
 
+TEST_F(WasmBoundsCheckEliminationReducerTest, NestedConstantAdditions) {
+  // a[(i+1)+1]; a[i+2]; a[(i+3)-1]; as produced for instance by loop
+  // unrolling: all three indices are i+2.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> j = __ Word32Add(i, __ Word32Constant(1));
+    BoundsCheck(Asm, a, j, 1);
+    BoundsCheck(Asm, a, i, 2);
+    V<Word32> k = __ Word32Sub(__ Word32Add(i, __ Word32Constant(3)),
+                               __ Word32Constant(1));
+    BoundsCheck(Asm, a, k, 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
+}
+
 TEST_F(WasmBoundsCheckEliminationReducerTest, ConstantIndexOneSidedGuard) {
   // a[0]; a[1]; a[2]; -> guarded by 2 < a.length
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
