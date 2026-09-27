@@ -64,6 +64,7 @@
     {"app_args": "--turbo-instruction-scheduling", "app_name": "d8", "probability": 0.1},
     {"app_args": "--turbo-stress-instruction-scheduling", "app_name": "d8", "probability": 0.1},
     {"app_args": "--turboshaft-verify-load-elimination", "app_name": "d8", "probability": 0.2},
+    {"app_args": "--turboshaft-wasm-bounds-check-elimination --turboshaft-verify-wasm-bounds-check-elimination", "app_name": "d8", "probability": 0.2},
     {"app_args": "--turboshaft-verify-load-store-taggedness", "app_name": "d8", "probability": 0.2},
     {"app_args": "--turboshaft-verify-reductions", "app_name": "d8", "probability": 0.1},
     {"app_args": "--maglev-assert-types", "app_name": "d8", "probability": 0.1},
