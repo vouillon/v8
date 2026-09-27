@@ -64,10 +64,13 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessTrapIf(
 }
 
 void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
+  current_block_ = block;
   // Collect the snapshots of all predecessors.
   predecessor_bounds_check_snapshots_.clear();
   predecessor_non_negative_snapshots_.clear();
   predecessor_min_length_snapshots_.clear();
+  predecessor_length_alias_snapshots_.clear();
+  bool all_predecessors_have_length_aliases = true;
   for (const Block* p : block->PredecessorsIterable()) {
     std::optional<Snapshot> pred_snapshots =
         block_to_snapshot_mapping_[p->index()];
@@ -83,6 +86,12 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
     predecessor_non_negative_snapshots_.push_back(
         pred_snapshots->non_negative_offsets);
     predecessor_min_length_snapshots_.push_back(pred_snapshots->min_lengths);
+    if (pred_snapshots->length_aliases.has_value()) {
+      predecessor_length_alias_snapshots_.push_back(
+          *pred_snapshots->length_aliases);
+    } else {
+      all_predecessors_have_length_aliases = false;
+    }
   }
   // Without merge functions, the new snapshots only contain what is
   // known in all predecessors, that is, in the common ancestor of the
@@ -93,6 +102,20 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
       base::VectorOf(predecessor_non_negative_snapshots_));
   known_min_lengths_.StartNewSnapshot(
       base::VectorOf(predecessor_min_length_snapshots_));
+  // Length aliases are rare, so their table is only used once one has
+  // been recorded. A predecessor without a snapshot of this table then
+  // has no alias (and the current block is not dominated by the loop
+  // header that recorded them).
+  DCHECK(!length_aliases_open_);
+  if (!alias_lengths_.empty()) {
+    if (all_predecessors_have_length_aliases) {
+      known_length_aliases_.StartNewSnapshot(
+          base::VectorOf(predecessor_length_alias_snapshots_));
+    } else {
+      known_length_aliases_.StartNewSnapshot();
+    }
+    length_aliases_open_ = true;
+  }
 
   if (block->IsLoop() && !ShouldSkipOptimizationStep()) {
     ProcessLoopHeader(block);
@@ -139,9 +162,14 @@ void WasmBoundsCheckEliminationAnalyzer::FinishBlock(const Block* block) {
   last_trap_bounds_checks_.clear();
   array_lengths_.clear();
 
+  std::optional<LengthAliasMap::Snapshot> length_aliases;
+  if (length_aliases_open_) {
+    length_aliases = known_length_aliases_.Seal();
+    length_aliases_open_ = false;
+  }
   block_to_snapshot_mapping_[block->index()] =
       Snapshot{known_bounds_checks_.Seal(), known_non_negative_offsets_.Seal(),
-               known_min_lengths_.Seal()};
+               known_min_lengths_.Seal(), length_aliases};
 }
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBranch(const Block* block) {
@@ -287,8 +315,12 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
   // Record the array length, so that we can use it when emitting new
   // bounds checks. Array length instructions can trap on null, so it
   // is simpler to keep using the very first one rather than inserting
-  // a new one.
-  array_lengths_.try_emplace(key.array, array_length);
+  // a new one. A length known from {known_length_aliases_} may not be
+  // available in the current block, and is then not recorded.
+  if (!alias_lengths_.contains(array_length) ||
+      Dominates(&graph_.Get(graph_.BlockOf(array_length)), current_block_)) {
+    array_lengths_.try_emplace(key.array, array_length);
+  }
 
   // The condition shows that the offsets from {offset} to {last} are
   // within bounds (see the proofs in the header).
@@ -403,7 +435,8 @@ void WasmBoundsCheckEliminationAnalyzer::RecordFallbackSequence(
                                    << fallback_end_index << ")");
 
   auto array_length_it = array_lengths_.find(key.array);
-  DCHECK_NE(array_length_it, array_lengths_.end());
+  // The guard needs an array length available in this block.
+  if (array_length_it == array_lengths_.end()) return;
   OpIndex array_length = array_length_it->second;
 
   FallbackInstructionSequence new_sequence(
@@ -711,6 +744,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessLoopHeader(
 
     bool non_negative = false;
     OpIndex upper = OpIndex::Invalid();  // {i <= upper} in the loop.
+    int64_t upper_lower_bound = 0;       // {upper_lower_bound <= upper}.
     // For the comparisons {i + k != x}: the offsets {k} for each {x}.
     std::map<OpIndex, std::set<uint32_t>> not_equal_offsets;
     std::map<OpIndex, OpIndex> not_equal_values;
@@ -829,6 +863,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessLoopHeader(
         int64_t bound = *lower;
         while (excluded.contains(bound)) bound++;
         entered = static_cast<int32_t>(*init) <= bound;
+        upper_lower_bound = bound;
       }
       if (entered) {
         non_negative = true;
@@ -843,6 +878,46 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessLoopHeader(
     // are within bounds.
     BaseAndOffset bound = ExtractBaseAndOffset(upper);
     if (!bound.base.valid()) continue;
+    if (const PhiOp* merge = graph_.Get(bound.base).TryCast<PhiOp>();
+        merge && !graph_.Get(graph_.BlockOf(bound.base)).IsLoop()) {
+      // {upper = phi(...) + offset}, loop-invariant: the loop is only
+      // entered with a value of {upper} at least {upper_lower_bound},
+      // which rules out the constant inputs {k} with
+      // {k + offset < upper_lower_bound}. If a single input remains,
+      // {upper} is that input plus {offset} in the loop. For instance,
+      // the length of an array that may be empty (a constant 0 on the
+      // other path) minus 1, for a loop that is only entered if it is
+      // non-negative.
+      OpIndex remaining = OpIndex::Invalid();
+      bool single = true;
+      for (OpIndex input : merge->inputs()) {
+        if (auto k = TryExtractI32Const(input)) {
+          int64_t candidate = static_cast<int32_t>(*k + bound.offset);
+          if (candidate < upper_lower_bound) continue;
+        }
+        if (remaining.valid()) single = false;
+        remaining = input;
+      }
+      if (!single || !remaining.valid()) continue;
+      BaseAndOffset input = ExtractBaseAndOffset(remaining);
+      bound = BaseAndOffset{input.base, input.base_value,
+                            input.offset + bound.offset};
+      if (!bound.base.valid()) continue;
+      // In the loop, {upper} is then {a.length - r}.
+      if (graph_.Get(bound.base).Is<ArrayLengthOp>()) {
+        uint32_t reduction = 0u - bound.offset;
+        if (reduction <= (1u << 16)) {
+          if (!length_aliases_open_) {
+            // The first alias: no block had any before.
+            known_length_aliases_.StartNewSnapshot();
+            length_aliases_open_ = true;
+          }
+          known_length_aliases_.Set(CanonicalValue(upper),
+                                    std::pair{bound.base, reduction});
+          alias_lengths_.insert(bound.base);
+        }
+      }
+    }
     const ArrayLengthOp* length =
         graph_.Get(bound.base).TryCast<ArrayLengthOp>();
     if (!length) continue;
@@ -870,6 +945,11 @@ std::optional<std::pair<OpIndex, uint32_t>>
 WasmBoundsCheckEliminationAnalyzer::TryExtractArrayLength(
     OpIndex length) const {
   if (graph_.Get(length).Is<ArrayLengthOp>()) return std::pair{length, 0u};
+  if (length_aliases_open_) {
+    if (auto alias = known_length_aliases_.Get(CanonicalValue(length))) {
+      return *alias;
+    }
+  }
   const WordBinopOp* op = graph_.Get(length).TryCast<WordBinopOp>();
   if (!op || op->rep != WordRepresentation::Word32() ||
       !graph_.Get(op->left()).Is<ArrayLengthOp>()) {

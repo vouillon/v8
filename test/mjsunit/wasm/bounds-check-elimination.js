@@ -698,6 +698,110 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
   }
 })();
 
+(function TestLoopsWithPhiBound() {
+  print(arguments.callee.name);
+  // for (i = 0; i <= hi; i++) body, where hi is the length of an array
+  // minus 1, or {other} - 1 when the array has another type (as for the
+  // length of an OCaml float array, where {other} is 0 for an empty
+  // array), and the loop is only entered if hi >= 0.
+  let builder = new WasmModuleBuilder();
+  let floats = builder.addArray(kWasmF64);
+  let ints = builder.addArray(kWasmI32);
+  builder.addFunction('makeFloats', makeSig([kWasmI32], [kWasmEqRef]))
+    .addBody([
+      ...wasmF64Const(1.5), kExprLocalGet, 0,
+      kGCPrefix, kExprArrayNew, floats,
+    ])
+    .exportFunc();
+  builder.addFunction('makeInts', makeSig([kWasmI32], [kWasmEqRef]))
+    .addBody([
+      ...wasmI32Const(7), kExprLocalGet, 0,
+      kGCPrefix, kExprArrayNew, ints,
+    ])
+    .exportFunc();
+  const kA = 0, kHi = 1, kI = 2, kAcc = 3;
+  let asFloats = [kExprLocalGet, kA, kGCPrefix, kExprRefCast, floats];
+  let cases = [];
+  for (let other of [0, 1, 3]) {
+    for (let accesses of [[0], [0, 1], [1], [-1]]) {
+      cases.push({other, accesses});
+    }
+  }
+  let sig = makeSig([kWasmEqRef], [kWasmF64]);
+  for (let [n, c] of cases.entries()) {
+    let body = [];
+    for (let d of c.accesses) {
+      body.push(kExprLocalGet, kAcc, ...asFloats, kExprLocalGet, kI,
+                ...wasmI32Const(d), kExprI32Add,
+                kGCPrefix, kExprArrayGet, floats, kExprF64Add,
+                kExprLocalSet, kAcc);
+    }
+    builder.addFunction(`loop${n}`, sig)
+      .addLocals(kWasmI32, 2).addLocals(kWasmF64, 1)
+      .addBody([
+        // hi = (a is a float array ? a.length : other) - 1
+        kExprLocalGet, kA, kGCPrefix, kExprRefTest, floats,
+        kExprIf, kWasmI32,
+          ...asFloats, kGCPrefix, kExprArrayLen,
+        kExprElse,
+          ...wasmI32Const(c.other),
+        kExprEnd,
+        ...wasmI32Const(1), kExprI32Sub, kExprLocalSet, kHi,
+        kExprLocalGet, kHi, ...wasmI32Const(0), kExprI32GeS,
+        kExprIf, kWasmVoid,
+          kExprLoop, kWasmVoid,
+            ...body,
+            kExprLocalGet, kI, kExprLocalGet, kHi, kExprI32Ne,
+            kExprIf, kWasmVoid,
+              kExprLocalGet, kI, ...wasmI32Const(1), kExprI32Add,
+              kExprLocalSet, kI,
+              kExprBr, 1,
+            kExprEnd,
+          kExprEnd,
+        kExprEnd,
+        kExprLocalGet, kAcc,
+      ])
+      .exportFunc();
+  }
+  let instance = builder.instantiate();
+  for (let [n, c] of cases.entries()) {
+    for (let isFloats of [true, false]) {
+      for (let length of [0, 1, 2, 3, 8]) {
+        let a = isFloats ? instance.exports.makeFloats(length)
+                         : instance.exports.makeInts(length);
+        // The model.
+        let expected = 0;
+        let hi = (isFloats ? length : c.other) - 1;
+        let traps = false;
+        let cast = false;
+        for (let i = 0; i <= hi && !traps && !cast; i++) {
+          for (let d of c.accesses) {
+            if (!isFloats) {
+              cast = true;
+              break;
+            }
+            if (((i + d) >>> 0) >= length) {
+              traps = true;
+              break;
+            }
+            expected += 1.5;
+          }
+        }
+        let run = () => instance.exports[`loop${n}`](a);
+        let name = `other ${c.other} accesses ${c.accesses} ` +
+                   `floats ${isFloats} length ${length}`;
+        if (cast) {
+          assertTraps(kTrapIllegalCast, run, name);
+        } else if (traps) {
+          assertTraps(kTrapArrayOutOfBounds, run, name);
+        } else {
+          assertEquals(expected, run(), name);
+        }
+      }
+    }
+  }
+})();
+
 (function TestRandomAccessSequences() {
   print(arguments.callee.name);
 

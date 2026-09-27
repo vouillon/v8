@@ -107,7 +107,13 @@ namespace v8::internal::compiler::turboshaft {
 // {c > 1} and the back edge is taken when {i + k != x} for all {k} from
 // 0 to {c - 1}, which works the same way. In the unrolled copies, a
 // test {x + k != a.length - r} then shows that {x + k + r} is within
-// bounds when {x + k + r - 1} is.
+// bounds when {x + k + r - 1} is. When {x} is a phi plus a constant, the
+// constant inputs of the phi for which the loop is not entered are
+// ruled out: if a single input remains, {x} is this input plus the
+// constant in the loop. For instance, with {x = phi(a.length, 0) - 1}
+// (the length of an array that may be empty, minus 1), the loop is not
+// entered when {x} is -1, so {x} is {a.length - 1} in the loop, which
+// is recorded in {known_length_aliases_}.
 //
 // When some bounds checks are later followed by stronger checks in
 // the same block, the instructions in between can be duplicated into
@@ -580,6 +586,12 @@ using NonNegativeOffsetMap = KeyedSnapshotTable<OpIndex, OffsetRange>;
 // Maps arrays to a lower bound on their length.
 using MinLengthMap = KeyedSnapshotTable<OpIndex, uint32_t>;
 
+// Maps values to an array length {l} and a constant {c} such that the
+// value is {l - c}, when this is only known in part of the graph (see
+// {ProcessLoopHeader}).
+using LengthAliasMap =
+    KeyedSnapshotTable<OpIndex, std::pair<OpIndex, uint32_t>>;
+
 // Represents a sequence of instructions that could be duplicated:
 // - Fast path: execute without bounds checks (checks moved earlier)
 // - Fallback path: execute with original bounds checks intact
@@ -817,13 +829,16 @@ class WasmBoundsCheckEliminationAnalyzer {
         known_bounds_checks_(phase_zone),
         known_non_negative_offsets_(phase_zone),
         known_min_lengths_(phase_zone),
+        known_length_aliases_(phase_zone),
+        alias_lengths_(phase_zone),
         block_to_snapshot_mapping_(graph.block_count(), phase_zone),
         last_trap_bounds_checks_(phase_zone),
         array_lengths_(phase_zone),
         planned_fallbacks_by_key_(phase_zone),
         predecessor_bounds_check_snapshots_(phase_zone),
         predecessor_non_negative_snapshots_(phase_zone),
-        predecessor_min_length_snapshots_(phase_zone) {}
+        predecessor_min_length_snapshots_(phase_zone),
+        predecessor_length_alias_snapshots_(phase_zone) {}
 
   void Run() {
     LoopFinder loop_finder(phase_zone_, &graph_, LoopFinder::Config{});
@@ -873,6 +888,8 @@ class WasmBoundsCheckEliminationAnalyzer {
     BoundsCheckMap::Snapshot bounds_checks;
     NonNegativeOffsetMap::Snapshot non_negative_offsets;
     MinLengthMap::Snapshot min_lengths;
+    // Only once some length alias has been recorded.
+    std::optional<LengthAliasMap::Snapshot> length_aliases;
   };
 
   // A condition {index < a.length - reduction}, where {reduction} is a
@@ -1006,6 +1023,12 @@ class WasmBoundsCheckEliminationAnalyzer {
   BoundsCheckMap known_bounds_checks_;
   NonNegativeOffsetMap known_non_negative_offsets_;
   MinLengthMap known_min_lengths_;
+  LengthAliasMap known_length_aliases_;
+  // The array lengths used by {known_length_aliases_}.
+  ZoneAbslFlatHashSet<OpIndex> alias_lengths_;
+  // Whether {known_length_aliases_} has an open snapshot for the current
+  // block.
+  bool length_aliases_open_ = false;
 
   FixedBlockSidetable<std::optional<Snapshot>> block_to_snapshot_mapping_;
 
@@ -1013,6 +1036,9 @@ class WasmBoundsCheckEliminationAnalyzer {
 
   // Position of the current operation in the block.
   uint32_t current_position_ = 0;
+
+  // The block being processed.
+  const Block* current_block_ = nullptr;
 
   // Previous bounds check traps that can start a fallback sequence.
   ZoneAbslBTreeMap<BoundsCheck, TrapInfo> last_trap_bounds_checks_;
@@ -1030,6 +1056,7 @@ class WasmBoundsCheckEliminationAnalyzer {
   ZoneVector<NonNegativeOffsetMap::Snapshot>
       predecessor_non_negative_snapshots_;
   ZoneVector<MinLengthMap::Snapshot> predecessor_min_length_snapshots_;
+  ZoneVector<LengthAliasMap::Snapshot> predecessor_length_alias_snapshots_;
 
 #if DEBUG
   void PrintStats();
