@@ -453,6 +453,14 @@ struct FallbackInstructionSequence {
   // of the code size.
   static constexpr uint32_t instruction_budget_per_trap = 20;
 
+  // Heuristic: only generate fallback code if it eliminates at least
+  // this number of bounds checks, once the checks of the guard are
+  // taken into account. Sequences that eliminate a single check save
+  // little at run time, while the duplicated code makes compilation
+  // noticeably slower (mostly in later phases, such as late load
+  // elimination).
+  static constexpr int min_eliminated_checks = 2;
+
   // Which bounds of {offsets} the guard needs to check.
   struct Guard {
     bool check_lower;
@@ -593,7 +601,7 @@ struct FallbackInstructionSequence {
   static bool IsProfitable(uint32_t instruction_count, size_t trap_count,
                            Guard guard) {
     int eliminated = static_cast<int>(trap_count) - guard.check_count();
-    return eliminated >= 1 &&
+    return eliminated >= min_eliminated_checks &&
            instruction_count <=
                instruction_budget_per_trap * static_cast<uint32_t>(eliminated);
   }

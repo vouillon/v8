@@ -106,11 +106,12 @@ function store(array, param, offset, value) {
     below: [1, 0],
     above: [0, 1],
     middle: [0, 2, 1],
-    chainBelow: [5, 3, 1],
-    chainAbove: [1, 3, 5],
+    chainBelow: [7, 5, 3, 1],
+    chainAbove: [1, 3, 5, 7],
+    consecutive: [0, 1, 2, 3, 4],
     zigzag: [2, 3, 1, 4, 0],
-    wrapAround: [-1, 0, 1],
-    large: [0x7ffffffe, 0x7fffffff, -0x80000000],
+    wrapAround: [-2, -1, 0, 1],
+    large: [0x7ffffffd, 0x7ffffffe, 0x7fffffff, -0x80000000],
   };
   for (let [name, offsets] of Object.entries(sequences)) {
     builder.addFunction(name, sig)
