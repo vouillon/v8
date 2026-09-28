@@ -1,4 +1,4 @@
-// Copyright 2025 the V8 project authors. All rights reserved.
+// Copyright 2026 the V8 project authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -439,6 +439,9 @@ void WasmBoundsCheckEliminationAnalyzer::UpdateKnownBoundsChecks(
   // since we don't want to keep it on the main sequence of execution.
   OpIndex condition = graph_.Get(trap_if).Cast<TrapIfOp>().condition();
   bool starts_at_condition = graph_.PreviousIndex(trap_if) == condition;
+  // The operation before the first one of a block is the terminator of
+  // another block, which is not a condition.
+  DCHECK_IMPLIES(starts_at_condition, current_position_ > 0);
   OpIndex start_index = starts_at_condition ? condition : trap_if;
   uint32_t start_position = current_position_ - starts_at_condition;
   last_trap_bounds_checks_.insert_or_assign(
@@ -1015,19 +1018,29 @@ WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
       return {OpIndex::Invalid(), OpIndex::Invalid(), offset + *constant};
     }
     if (depth == kMaxDepth) break;
-    // a[base + n] / a[base - n]
+    // a[base + n] / a[n + base] / a[base - n]
     const WordBinopOp* op = graph_.Get(index).TryCast<WordBinopOp>();
-    if (op == nullptr) break;
-    std::optional<uint32_t> constant = TryExtractI32Const(op->right());
-    if (!constant.has_value()) break;
-    if (op->kind == WordBinopOp::Kind::kAdd) {
-      offset += *constant;
-    } else if (op->kind == WordBinopOp::Kind::kSub) {
-      offset -= *constant;
+    if (op == nullptr || op->rep != WordRepresentation::Word32()) break;
+    if (std::optional<uint32_t> constant = TryExtractI32Const(op->right())) {
+      if (op->kind == WordBinopOp::Kind::kAdd) {
+        offset += *constant;
+      } else if (op->kind == WordBinopOp::Kind::kSub) {
+        offset -= *constant;
+      } else {
+        break;
+      }
+      index = op->left();
+    } else if (std::optional<uint32_t> left_constant =
+                   TryExtractI32Const(op->left());
+               left_constant.has_value() &&
+               op->kind == WordBinopOp::Kind::kAdd) {
+      // Constants are not always on the right yet: this phase runs before
+      // machine optimizations, except in functions with unrolled loops.
+      offset += *left_constant;
+      index = op->right();
     } else {
       break;
     }
-    index = op->left();
   }
   // Default: a[base]
   return {OpIndex::Invalid(), index, offset};
@@ -1089,11 +1102,16 @@ OpIndex WasmBoundsCheckEliminationAnalyzer::CanonicalValue(OpIndex value,
     }
     case Opcode::kWordBinop: {
       const WordBinopOp& binop = op.Cast<WordBinopOp>();
+      OpIndex left = CanonicalValue(binop.left(), depth + 1);
+      OpIndex right = CanonicalValue(binop.right(), depth + 1);
+      // {a + b} and {b + a} compute the same value.
+      if (WordBinopOp::IsCommutative(binop.kind) && right < left) {
+        std::swap(left, right);
+      }
       key = StructuralKey{op.opcode,
                           static_cast<uint64_t>(binop.kind) |
                               static_cast<uint64_t>(binop.rep.value()) << 8,
-                          0, CanonicalValue(binop.left(), depth + 1),
-                          CanonicalValue(binop.right(), depth + 1)};
+                          0, left, right};
       break;
     }
     case Opcode::kShift: {

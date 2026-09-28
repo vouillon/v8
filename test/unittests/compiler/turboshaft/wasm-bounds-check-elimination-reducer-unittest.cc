@@ -693,6 +693,33 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, DuplicatedComputations) {
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
 }
 
+TEST_F(WasmBoundsCheckEliminationReducerTest, CommutedComputations) {
+  // a[0]; if (a.length - 1 <= i * c) fail; a[c * i + 1];
+  // Both products have the same value.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1),
+                                         __ Word32Mul(i, c)));
+    BoundsCheck(Asm, a, __ Word32Mul(c, i), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, ConstantOnTheLeft) {
+  // a[i + 1]; a[1 + i];
+  // Constants are not always on the right when this phase runs.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 1);
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    __ TrapIfNot(
+        __ Uint32LessThan(__ Word32Add(__ Word32Constant(1), i), length),
+        TrapId::kTrapArrayOutOfBounds);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
 TEST_F(WasmBoundsCheckEliminationReducerTest, DifferentComputations) {
   // a[0]; if (a.length - 1 <= sext(i)) fail; a[sext2(i) + 1];
   // where {sext2} shifts by 2 instead of 1: the values differ.
