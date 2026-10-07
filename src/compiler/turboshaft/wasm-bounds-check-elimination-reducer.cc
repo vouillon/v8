@@ -670,7 +670,9 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessLoopHeader(
     if (!bound.has_value() && !HasSmallBound(*induction, conditions)) {
       continue;
     }
-    TRACE("  Loop induction: " << index << " is non-negative");
+    TRACE("  Loop induction: "
+          << index << " is non-negative ("
+          << (bound.has_value() ? "not-equal bound" : "small bound") << ")");
     RecordNonNegativeOffset(induction->value, 0);
     if (bound.has_value()) RecordLoopBound(*induction, *bound);
   }
@@ -895,6 +897,8 @@ WasmBoundsCheckEliminationAnalyzer::TryResolveMergeBound(
     known_length_aliases_.StartNewSnapshot();
     length_aliases_open_ = true;
   }
+  TRACE("  Length alias: " << bound.x << " is " << length.length << " - "
+                           << length.reduction << " in the loop");
   known_length_aliases_.Set(CanonicalValue(bound.x), length);
   alias_lengths_.insert(length.length);
   return length;
