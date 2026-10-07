@@ -87,7 +87,12 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
   }
   // Without merge functions, the new snapshots only contain what is
   // known in all predecessors, that is, in the common ancestor of the
-  // predecessor snapshots.
+  // predecessor snapshots. By induction, the ancestors of the snapshot
+  // of a block are snapshots of blocks that dominate it, so this common
+  // ancestor is the snapshot of a block that dominates all the (forward)
+  // predecessors, and thus the current block: facts known at the start
+  // of a block were recorded in its dominators, as {CanonicalValue}
+  // requires.
   known_bounds_checks_.StartNewSnapshot(
       base::VectorOf(predecessor_bounds_check_snapshots_));
   known_non_negative_offsets_.StartNewSnapshot(
@@ -645,6 +650,25 @@ bool WasmBoundsCheckEliminationAnalyzer::Dominates(const Block* dominator,
 // loop is only entered if {c0 <= x}: {i} is then at most {x} in the
 // whole loop ([induction-not-equal]), which is a bounds check fact when
 // {x} is an array length minus a constant (see {RecordLoopBound}).
+//
+// These facts are recorded at the header, so they must hold whenever the
+// header is executed, which is shown by induction on the iterations.
+// When the loop is entered, {i} is {c0}, which is non-negative, and at
+// most {x} for a not-equal bound (see {EntryLowerBound}). When the back
+// edge is taken, the conditions collected below held when they were
+// tested: they are the branch conditions of the dominators of the back
+// edge within the loop (branch targets have a single predecessor). The
+// value of {i} they tested is the current one, since the header, where
+// {i} is defined, is not executed again before the back edge. This
+// value satisfied the facts (induction hypothesis), and the lemmas show
+// that {i + c}, the value of {i} at the next iteration, does too. For a
+// small bound, the lemmas hold for any value of {x}, so {x} can change
+// in the loop. For a not-equal bound, {x} must be the same as when
+// entering the loop, so it must be computed before the loop (see
+// {FindNotEqualBound}). The facts then remain true in the blocks
+// dominated by the header, including after the loop, as long as {i} is
+// not computed again, that is, until the header is executed again (see
+// {CanonicalValue}).
 void WasmBoundsCheckEliminationAnalyzer::ProcessLoopHeader(
     const Block* header) {
   if (header->PredecessorCount() != 2) return;
@@ -777,6 +801,10 @@ WasmBoundsCheckEliminationAnalyzer::FindNotEqualBound(
   uint32_t all_offsets = (1u << induction.step) - 1;
   for (const Candidate& candidate : candidates) {
     if (candidate.offsets != all_offsets) continue;
+    // {x} must be computed before the loop, so that it is the same in
+    // the whole loop. In practice, {EntryLowerBound} only finds a lower
+    // bound for a value computed before the loop, but this is not
+    // obvious, so we check it.
     if (!TryExtractI32Const(candidate.x_value).has_value() &&
         !Dominates(&graph_.Get(graph_.BlockOf(candidate.x_value)), forward)) {
       continue;
@@ -866,6 +894,25 @@ void WasmBoundsCheckEliminationAnalyzer::RecordLoopBound(
 // that is only entered if it is non-negative. If {x} is then an array
 // length minus a constant, this is recorded as a length alias, which
 // holds in the blocks dominated by the loop header.
+//
+// The alias holds in a block {b} dominated by the header, although the
+// length {l} in the remaining input does not dominate {b}. Consider an
+// execution reaching {b}. The merge block {m} dominates {forward} (it
+// dominates {x}, which does), which dominates {b} (the header's other
+// predecessor is the back edge). The last execution of {m} before {b}
+// is thus followed by an execution of {forward}, and {m} is not
+// executed again in between (any path from {m} to the header goes
+// through {forward}). When {forward} was last executed, the conditions
+// dominating it held, so {x} was at least {x_lower_bound}, and that
+// execution of {m} took the edge of the remaining input, which then
+// had the value of {l} plus a constant. Neither {l} nor its array is
+// computed again before {b}. Otherwise, as {m} is not a loop header, it
+// does not dominate the block {d} where they are computed ({d} dominates
+// the predecessor of {m} for the remaining input). There would then be
+// a path to {d} that avoids {m}, followed by a path from {d} to {b}
+// that avoids {m}, while {m} dominates {b}. So in {b}, {x} is {l} minus
+// a constant, for the current values of {l} and of its array, which is
+// what facts about the array refer to.
 std::optional<ReducedLength>
 WasmBoundsCheckEliminationAnalyzer::TryResolveMergeBound(
     const LoopBound& bound) {

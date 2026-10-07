@@ -1038,7 +1038,10 @@ class WasmBoundsCheckEliminationAnalyzer {
   };
 
   // A trap that may start a fallback sequence, with what is known
-  // right before it.
+  // right before it. This is also what is known at the start of the
+  // sequence, where the guard is emitted: the sequence starts at the
+  // trap, or at its condition, a comparison, which does not record any
+  // fact.
   struct TrapInfo {
     OpIndex trap_if;
     // The base as computed by the index of the trap.
