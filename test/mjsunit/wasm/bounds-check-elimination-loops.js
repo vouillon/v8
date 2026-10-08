@@ -11,7 +11,9 @@
 // that reason about loops: induction on loop phis, bounds {i <= x}
 // shown by {i != x} exits (possibly unrolled), lower bounds of {x} when
 // entering the loop, and bounds that are a merge phi of an array length
-// and constants. Each function first runs with Liftoff, which gives the
+// and constants, and decreasing loops {i = phi(i0, i - step)}, as
+// {for (i = a.length - 1; i >= 0; i--)} or OCaml loops
+// {for i = i0 downto lo}. Each function first runs with Liftoff, which gives the
 // expected results, and then with optimized code: the results, the
 // position of traps and the contents of the arrays must be the same.
 //
@@ -444,6 +446,120 @@ function randomFunction() {
   return statements;
 }
 
+// Ways for a decreasing loop to differ from a loop that the analysis
+// should recognize. Each one is applied with probability 1/5: some of
+// them only lead to a wrong result when combined with particular inputs
+// (for instance, an array shorter than the constant subtracted from its
+// length).
+const kDecreasingMutations = ['init', 'step', 'lo', 'op', 'guard', 'netest'];
+
+// A function with a loop over {i = phi(i0, i - step)}, followed by
+// statements using {i} after the loop. The loop is of one of these kinds:
+// - ge: the back edge is taken when the decremented {i} is at least {lo}
+//   (as for {for (i = i0; i >= lo; i--)});
+// - gt: {i > lo} is tested at the top of each iteration, before {i} is
+//   decremented, so that {lo} must be at least {step - 1};
+// - ne: {i - k == lo} exits the loop, for each {k} below the step (as an
+//   OCaml loop {for i = i0 downto lo}, unrolled {step} times).
+// The start {i0} is an array length minus a constant, or a small constant,
+// and the loop is only entered if {i0 >= lo}, for a small {lo >= 0}.
+function randomDecreasingFunction() {
+  let mutations = new Set(kDecreasingMutations.filter(() => chance(5)));
+  let kind = pick(['ge', 'gt', 'ne', 'ne']);
+  let unroll = kind == 'ne' ? pick([1, 1, 1, 2, 2, 3]) : 1;
+  let step = kind == 'ne' ? unroll : kind == 'ge' ? pick([1, 1, 1, 2, 3])
+                                                  : pick([1, 1, 2]);
+  let lo = kind == 'gt' ? step - 1 + random(2) : pick([0, 0, 0, 1]);
+  if (mutations.has('step')) {
+    step = kind == 'ne' ? pick([unroll + 1, unroll - 1, -1])
+                        : kind == 'gt' ? lo + 2 : pick([-1, 0x40000001]);
+  }
+  if (mutations.has('lo')) lo = kind == 'gt' ? step - 2 : -1;
+  let i0 = mutations.has('init')
+      ? constant(pick([-1, 0x7fffffff, -0x80000000, 0x40000000]))
+      : chance(4) ? constant(pick([0, 1, 3, 8]))
+                  : lengthMinus(chance(4) ? 'b' : 'a', pick([0, 1, 1, 2, 3]));
+
+  // The loop. Its iterations are capped, at its top or before the
+  // decrement of {i}.
+  let cap = pick([2, 5, 12, 40]);
+  let body = [];
+  let capCheck = [brIf('out', eqz(local('count'))),
+                  set('count', index(local('count'), -1))];
+  let capAtTop = !chance(4);
+  if (capAtTop) body.push(...capCheck);
+  if (kind == 'gt') {
+    let op = mutations.has('op') ? pick(['ge_s', 'gt_u', 'ne']) : 'gt_s';
+    body.push(brIf('out', negatedRelation(op, local('i'), constant(lo))));
+  }
+  let skippedTest = mutations.has('netest') ? random(unroll + 1) : -1;
+  for (let k = 0; k < unroll; k++) {
+    let statements = randomStatements('i', {out: 'out'}, 0);
+    if (k > 0) {
+      // Accesses at {i - k}, as in an unrolled copy of the loop body.
+      statements = statements.map(s => shiftStatement(s, -k));
+    }
+    if (kind != 'ne') {
+      body.push(...statements);
+      continue;
+    }
+    let tested = k == skippedTest ? k + 1 : k;
+    let test = brIf('out', relation('eq', index(local('i'), -tested),
+                                    constant(lo)));
+    if (chance(4)) {
+      body.push(test, ...statements);
+    } else {
+      body.push(...statements, test);
+    }
+  }
+  if (!capAtTop) body.push(...capCheck);
+  body.push(set('i', index(local('i'), -step)));
+  if (kind == 'ge') {
+    // {lo <= i}, or {lo - 1 < i}, or when mutated, a comparison that
+    // lets {i} go below {lo}.
+    let [op, bound] = mutations.has('op')
+        ? pick([['le_u', lo], ['lt_s', lo - 2], ['ne', lo - 1]])
+        : pick([['le_s', lo], ['lt_s', lo - 1]]);
+    body.push(brIf('loop', relation(op, constant(bound), local('i'))));
+  } else {
+    body.push({k: 'br', label: 'loop'});
+  }
+  let loop = [
+    set('i', local('x')),
+    set('count', constant(cap)),
+    {k: 'block', label: 'out',
+     body: [{k: 'loop', label: 'loop', body}]},
+    ...randomStatements('i', {}, 0),
+  ];
+
+  // The entry guard: the loop is only entered if {x >= g}.
+  let statements = [set('x', i0)];
+  let g = lo;
+  let guard = true;
+  let unsigned = false;
+  if (mutations.has('guard')) {
+    switch (random(3)) {
+      case 0: guard = false; break;
+      case 1: unsigned = true; break;
+      case 2: g = lo - 1; break;
+    }
+  }
+  if (!guard) return [...statements, ...loop];
+  if (unsigned) {
+    statements.push({k: 'if', c: relation('lt_u', local('x'), constant(g)),
+                     then: [{k: 'return'}], else: []});
+  } else if (chance(3)) {
+    statements.push({k: 'if', c: relation('le_s', constant(g), local('x')),
+                     then: loop, else: []});
+    return statements;
+  } else {
+    statements.push({k: 'if', c: relation('lt_s', local('x'), constant(g)),
+                     then: [{k: 'return'}], else: []});
+  }
+  statements.push(...loop);
+  return statements;
+}
+
 // Replaces {i + d} by {i + d + k} in the accesses and conditions of {s}.
 function shiftStatement(s, k) {
   function shift(e) {
@@ -660,7 +776,8 @@ let sig = makeSig([wasmRefNullType(array), wasmRefNullType(array),
                    kWasmI32, kWasmI32], [kWasmI32]);
 let functions = [];
 for (let f = 0; f < kFunctionCount; f++) {
-  let statements = randomFunction();
+  let statements =
+      chance(4) ? randomDecreasingFunction() : randomFunction();
   functions.push(statements);
   builder.addFunction(`f${f}`, sig)
     .addLocals(kWasmI32, 6)
