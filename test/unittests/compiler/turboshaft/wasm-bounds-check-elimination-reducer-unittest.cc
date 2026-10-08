@@ -1441,6 +1441,135 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, NoCoalescingBeyondBudget) {
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 5u);
 }
 
+TEST_F(WasmBoundsCheckEliminationReducerTest, NonStrictReducedLength) {
+  // b[i]; if (i <=s a.length - 2) a[i+1];
+  // i <= a.length - 2 is i < a.length - 1, which covers i and i + 1.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, b, i, 0);
+    If(Asm, __ Int32LessThanOrEqual(i, ReducedLength(Asm, a, 2)),
+       [&] { BoundsCheck(Asm, a, i, 1); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       NonStrictUnsignedReducedLengthUnknownLength) {
+  // if (i <=u a.length - 1) a[i];
+  // The array might be empty, in which case a.length - 1 wraps around.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    If(Asm, __ Uint32LessThanOrEqual(i, ReducedLength(Asm, a, 1)),
+       [&] { BoundsCheck(Asm, a, i, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       NonStrictUnsignedReducedLengthKnownLength) {
+  // a[0]; if (i <=u a.length - 1) a[i];
+  // The first access shows that the array is not empty.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    If(Asm, __ Uint32LessThanOrEqual(i, ReducedLength(Asm, a, 1)),
+       [&] { BoundsCheck(Asm, a, i, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, ConstantAtMostLength) {
+  // if (2 <=s a.length) { a[1]; a[0]; }
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm, __ Int32LessThanOrEqual(__ Word32Constant(2), a_length), [&] {
+      BoundsCheck(Asm, a, {}, 1);
+      BoundsCheck(Asm, a, {}, 0);
+    });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, ConstantAtMostLengthTooLarge) {
+  // if (2 <=s a.length) a[2];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm, __ Int32LessThanOrEqual(__ Word32Constant(2), a_length),
+       [&] { BoundsCheck(Asm, a, {}, 2); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LengthNotZero) {
+  // if (a.length != 0) a[0];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm,
+       __ Word32Equal(__ Word32Equal(a_length, __ Word32Constant(0)),
+                      __ Word32Constant(0)),
+       [&] { BoundsCheck(Asm, a, {}, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, BranchOnLength) {
+  // if (a.length) a[0];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm, a_length, [&] { BoundsCheck(Asm, a, {}, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LengthNotEqualToMinLength) {
+  // a[0]; if (a.length != 1) a[1];
+  // The length is at least 1, and not 1.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm,
+       __ Word32Equal(__ Word32Equal(a_length, __ Word32Constant(1)),
+                      __ Word32Constant(0)),
+       [&] { BoundsCheck(Asm, a, {}, 1); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LengthNotEqualAboveMinLength) {
+  // a[0]; if (a.length != 2) a[1];
+  // The length may be 1.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    V<Word32> a_length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm,
+       __ Word32Equal(__ Word32Equal(a_length, __ Word32Constant(2)),
+                      __ Word32Constant(0)),
+       [&] { BoundsCheck(Asm, a, {}, 1); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, MinLengthCoversConstantIndices) {
+  // b[i]; if (i <s a.length - 2) { a[2]; a[0]; a[1]; }
+  // The length of a is at least 3.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, b, i, 0);
+    If(Asm, __ Int32LessThan(i, ReducedLength(Asm, a, 2)), [&] {
+      BoundsCheck(Asm, a, {}, 2);
+      BoundsCheck(Asm, a, {}, 0);
+      BoundsCheck(Asm, a, {}, 1);
+    });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"
 
 }  // namespace v8::internal::compiler::turboshaft

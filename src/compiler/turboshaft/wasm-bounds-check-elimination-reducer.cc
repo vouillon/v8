@@ -202,7 +202,16 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
                                                            OpIndex condition,
                                                            bool holds) {
   std::optional<Relation> relation = Normalize(condition, holds);
-  if (!relation.has_value()) return;
+  if (!relation.has_value()) {
+    // A value that holds is not 0, for instance an array length tested
+    // directly, or with {eqz}.
+    if (holds) {
+      if (auto length = TryExtractArrayLength(condition)) {
+        ProcessNotEqualToConstant(*length, 0);
+      }
+    }
+    return;
+  }
   if (relation->not_equal) {
     ProcessNotEqual(*relation);
     return;
@@ -221,11 +230,14 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
                   : reduction == 0 || MinLength(key.array) >= reduction) {
       if (is_signed) TRACE("  Signed bounds check");
       // Only an unsigned comparison with the length itself is an actual
-      // bounds check, which can be eliminated. Other conditions are only
-      // used for what they show, even for a trap.
-      ProcessBoundsCheck(
-          !is_signed && reduction == 0 ? trap_if : OpIndex::Invalid(),
-          bounds_check, base_value, array_length, reduction);
+      // bounds check, which can be eliminated. Other conditions,
+      // including non-strict comparisons rewritten as strict ones (see
+      // {TryExtractBoundsCheckCondition}), are only used for what they
+      // show, even for a trap.
+      bool is_bounds_check =
+          relation->is_strict() && !is_signed && reduction == 0;
+      ProcessBoundsCheck(is_bounds_check ? trap_if : OpIndex::Invalid(),
+                         bounds_check, base_value, array_length, reduction);
       // With {index < a.length - reduction}, the length is at least
       // {reduction + 1}, and more for a constant index
       // ([reduced-length-min-length], [constant-index-min-length]).
@@ -254,6 +266,10 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqual(
     std::optional<ReducedLength> array_length = TryExtractArrayLength(length);
     if (!array_length) continue;
     auto [base, base_value, offset] = ExtractBaseAndOffset(index);
+    if (!base.valid()) {
+      ProcessNotEqualToConstant(*array_length, offset);
+      return;
+    }
     BoundsCheckKey key(base, ArrayOfLength(array_length->length));
     uint32_t last = offset + array_length->reduction - 1;
     std::optional<OffsetRange> known =
@@ -267,6 +283,19 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqual(
                        base_value, array_length->length, 0);
     return;
   }
+}
+
+// {a.length - r != n} for a constant {n}: if {a.length} is known to be
+// at least {n + r}, it is at least {n + r + 1} ([not-equal-min-length]).
+// This is [not-equal-length] for a constant index, whose known offsets
+// are those below the min length (see {KnownOffsets}).
+void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqualToConstant(
+    const ReducedLength& length, uint32_t n) {
+  OpIndex array = ArrayOfLength(length.length);
+  uint64_t excluded = uint64_t{n} + length.reduction;
+  if (excluded != MinLength(array)) return;
+  TRACE("  Not equal to the min length");
+  RecordMinLength(array, excluded + 1);
 }
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
@@ -472,11 +501,21 @@ WasmBoundsCheckEliminationAnalyzer::ExtendDownToNonNegative(
 
 // Returns the offsets known to be within bounds for {key}, including
 // the ones shown by non-negative offsets below them, even if we learnt
-// that these offsets are non-negative after the bounds checks.
+// that these offsets are non-negative after the bounds checks, and, for
+// a constant index, the ones below the min length of the array
+// ([min-length-constant-index]).
 std::optional<OffsetRange> WasmBoundsCheckEliminationAnalyzer::KnownOffsets(
     const BoundsCheckKey& key,
     const std::optional<OffsetRange>& non_negative) const {
   std::optional<OffsetRange> known = known_bounds_checks_.Get(key);
+  if (!key.base.valid()) {
+    // Both ranges are within bounds, so their hull is valid ([covered]).
+    if (uint32_t min_length = MinLength(key.array); min_length > 0) {
+      OffsetRange below_min_length(0, min_length - 1);
+      known = known.has_value() ? known->Hull(below_min_length).value_or(*known)
+                                : below_min_length;
+    }
+  }
   if (!known.has_value()) return known;
   return ExtendDownToNonNegative(*known, non_negative).value_or(*known);
 }
@@ -531,20 +570,36 @@ void WasmBoundsCheckEliminationAnalyzer::RecordMinLength(OpIndex array,
 
 // Attempts to decode a bounds check condition of the form:
 //     n < a.length - r   or   base + n < a.length - r
-// (signed or unsigned), where {r} is a constant (usually 0).
+// (signed or unsigned), where {r} is a constant (usually 0). A
+// non-strict comparison {x <= a.length - r} is rewritten as
+// {x < a.length - (r - 1)} when {r >= 1}, provided that {a.length - r}
+// does not wrap around (which is always the case for a signed
+// comparison), and {n <= a.length - r} as {n - 1 < a.length - r} for a
+// constant {n >= 1} ([non-strict-length], [non-strict-constant]).
 std::optional<WasmBoundsCheckEliminationAnalyzer::BoundsCheckCondition>
 WasmBoundsCheckEliminationAnalyzer::TryExtractBoundsCheckCondition(
     const Relation& relation) const {
-  if (relation.kind != ComparisonOp::Kind::kUnsignedLessThan &&
-      relation.kind != ComparisonOp::Kind::kSignedLessThan) {
-    return std::nullopt;
-  }
+  if (relation.kind == ComparisonOp::Kind::kEqual) return std::nullopt;
   std::optional<ReducedLength> length = TryExtractArrayLength(relation.right);
   if (!length) return std::nullopt;
+  OpIndex array = ArrayOfLength(length->length);
   auto [base, base_value, offset] = ExtractBaseAndOffset(relation.left);
-  return BoundsCheckCondition{
-      BoundsCheck(BoundsCheckKey(base, ArrayOfLength(length->length)), offset),
-      base_value, length->length, length->reduction, relation.is_signed()};
+  uint32_t reduction = length->reduction;
+  if (!relation.is_strict()) {
+    if (reduction >= 1 &&
+        (relation.is_signed() || MinLength(array) >= reduction)) {
+      reduction--;
+    } else if (!base.valid() &&
+               (relation.is_signed() ? static_cast<int32_t>(offset) >= 1
+                                     : offset >= 1)) {
+      offset--;
+    } else {
+      return std::nullopt;
+    }
+  }
+  return BoundsCheckCondition{BoundsCheck(BoundsCheckKey(base, array), offset),
+                              base_value, length->length, reduction,
+                              relation.is_signed()};
 }
 
 template <typename F>

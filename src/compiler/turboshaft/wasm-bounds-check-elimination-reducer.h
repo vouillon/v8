@@ -71,7 +71,17 @@ namespace v8::internal::compiler::turboshaft {
 // element of the arrays it uses for OCaml arrays, so the OCaml bounds
 // check of an access {a.(i)} is {i < a.length - 1}, which shows that
 // the Wasm access {a[i+1]} is within bounds, as long as some previous
-// access to {a} showed that its length is at least 1.
+// access to {a} showed that its length is at least 1. A non-strict
+// condition {base + n <= a.length - r} is the same as
+// {base + n < a.length - (r - 1)} when {r >= 1}.
+//
+// The analysis also tracks a lower bound on the length of each array.
+// It shows that the constant indices below it are within bounds, and
+// that {a.length - r} does not wrap around when it is at least {r}. It
+// comes from bounds checks, from conditions {n <= a.length - r} for a
+// constant {n}, and from tests {a.length - r != n} when the length is
+// known to be at least {n + r} (for instance, {a.length != 0} shows that
+// the length is at least 1).
 //
 // Signed conditions {base + n <s a.length - r}, as produced by languages
 // with signed integers (Java, Kotlin, Dart...), are taken into account
@@ -610,6 +620,62 @@ class OffsetRange {
 //   (assert (not (= (bvadd (bvadd x m) #x00000001) l)))
 //   (assert (not (bvult (bvadd (bvadd x m) #x00000001) l)))
 //   (check-sat)
+//
+// [non-strict-length] A non-strict condition {x <= l - r} implies
+// {x < l - (r - 1)} for {r >= 1}, when the comparison is signed ({s}),
+// or when {l} is at least {r}:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const r (_ BitVec 32))
+//   (declare-const s Bool)
+//   (assert (bvsge l #x00000000))
+//   (assert (bvuge r #x00000001))
+//   (assert (bvule r #x00010000))
+//   (assert (or (and s (bvsle x (bvsub l r)))
+//               (and (not s) (bvuge l r) (bvule x (bvsub l r)))))
+//   (assert (not (ite s (bvslt x (bvsub l (bvsub r #x00000001)))
+//                       (bvult x (bvsub l (bvsub r #x00000001))))))
+//   (check-sat)
+//
+// [non-strict-constant] For a constant {n >= 1}, {n <= y} implies
+// {n - 1 < y}, signed ({s}) or unsigned:
+//
+//   (declare-const n (_ BitVec 32))
+//   (declare-const y (_ BitVec 32))
+//   (declare-const s Bool)
+//   (assert (or (and s (bvsge n #x00000001) (bvsle n y))
+//               (and (not s) (bvuge n #x00000001) (bvule n y))))
+//   (assert (not (ite s (bvslt (bvsub n #x00000001) y)
+//                       (bvult (bvsub n #x00000001) y))))
+//   (check-sat)
+//
+// [not-equal-min-length] A test {l - r != n}, when {l} is known to be at
+// least {n + r}, shows that {l} is at least {n + r + 1}:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const r (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvule r #x00010000))
+//   (assert (bvule n #x7fffffff))
+//   (assert (bvule (bvadd n r) #x7fffffff))
+//   (assert (bvuge l (bvadd n r)))
+//   (assert (not (= (bvsub l r) n)))
+//   (assert (not (bvuge l (bvadd (bvadd n r) #x00000001))))
+//   (check-sat)
+//
+// [min-length-constant-index] A constant index below a lower bound of
+// the length is within bounds:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const m (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvuge l m))
+//   (assert (bvult n m))
+//   (assert (not (bvult n l)))
+//   (check-sat)
 
 // Maps keys of type {K} to values of type {V}. Supports snapshotting
 // for control flow merge points.
@@ -1108,6 +1174,7 @@ class WasmBoundsCheckEliminationAnalyzer {
   void ProcessCondition(OpIndex trap_if, OpIndex condition, bool holds);
   void ProcessComparison(OpIndex trap_if, OpIndex condition, bool holds);
   void ProcessNotEqual(const Relation& relation);
+  void ProcessNotEqualToConstant(const ReducedLength& length, uint32_t n);
   void ProcessBoundsCheck(OpIndex trap_if, const BoundsCheck& bounds_check,
                           OpIndex base_value, OpIndex array_length,
                           uint32_t reduction);
