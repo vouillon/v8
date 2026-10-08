@@ -50,9 +50,9 @@ function chance(n) {
 // Locals: parameters a, b (arrays), p, q, then i (loop variable), x (its
 // bound), j (inner loop variable), count and jcount (iterations left in
 // the loops, which count down so that they are not induction variables
-// themselves), acc (result).
+// themselves), acc (result), and c (an array allocated by the function).
 const kLocals = {a: 0, b: 1, p: 2, q: 3, i: 4, x: 5, j: 6, count: 7,
-                 jcount: 8, acc: 9};
+                 jcount: 8, acc: 9, c: 10};
 
 // Expressions (all i32).
 const constant = (v) => ({k: 'const', v: v | 0});
@@ -180,10 +180,13 @@ function burst(arr, base, center) {
 // Statements using the variable {iv}. {labels.out} is the label to exit
 // the current loop, if any. With {guarded_only}, accesses are guarded by
 // conditions, so that they do not always trap for a large {iv}.
+// The array mostly accessed by {randomStatements}, when set.
+let preferredArray = null;
+
 function randomStatements(iv, labels, depth, guarded_only = false) {
   let statements = [];
   let count = 1 + random(3);
-  let arr = chance(4) ? 'b' : 'a';
+  let arr = preferredArray ?? (chance(4) ? 'b' : 'a');
   for (let n = 0; n < count; n++) {
     switch (guarded_only ? pick([4, 5, 9]) : random(12)) {
       case 0: case 1: case 2:
@@ -560,6 +563,76 @@ function randomDecreasingFunction() {
   return statements;
 }
 
+// Ways for a loop over an allocated array to differ from a loop whose
+// accesses are within bounds. Each one is applied with probability 1/5.
+const kAllocationMutations = ['bound', 'other', 'op', 'init', 'size'];
+
+// A function that allocates an array {c} of length {n}, followed by a loop
+// {for (i = 0; i < bound; i++)} accessing mostly {c}, where {bound} is
+// {n} (computed again in some cases), {c.length}, or the length of the
+// array that {n} is the length of, as in fill and copy loops:
+// - fill: {n} is an array length minus a constant, a small parameter, or
+//   a constant;
+// - copy: {n} is {a.length} (or {b.length}), and the loop also reads the
+//   source array;
+// - fixed: {c} is allocated with {array.new_fixed}, with a constant
+//   length.
+// Statements using {c} follow the loop.
+function randomAllocationFunction() {
+  let mutations = new Set(kAllocationMutations.filter(() => chance(5)));
+  let kind = pick(['fill', 'fill', 'copy', 'fixed']);
+  let source = chance(4) ? 'b' : 'a';
+  let n, bounds;
+  switch (kind) {
+    case 'fill':
+      switch (random(4)) {
+        case 0: n = lengthMinus(source, pick([0, 1, 2])); break;
+        case 1: n = binop('and', local('p'), constant(15)); break;
+        case 2: n = local('p'); break;  // May trap: too large or negative.
+        default: n = constant(pick([0, 1, 3, 8])); break;
+      }
+      bounds = [local('x'), local('x'), len('c')];
+      break;
+    case 'copy':
+      n = len(source);
+      bounds = [len(source), len(source), local('x'), len('c')];
+      break;
+    case 'fixed':
+      n = constant(pick([0, 1, 2, 3, 5]));
+      bounds = [n, n, len('c')];
+      break;
+  }
+  let bound = pick(bounds);
+  if (mutations.has('bound')) bound = index(bound, 1);
+  if (mutations.has('other')) bound = len(source == 'a' ? 'b' : 'a');
+  let size = mutations.has('size') ? index(local('x'), -1) : local('x');
+  let op = mutations.has('op') ? pick(['le_s', 'le_u']) : pick(['lt_s', 'lt_u']);
+  let init = mutations.has('init') ? -1 : 0;
+
+  let saved = preferredArray;
+  preferredArray = chance(4) ? source : 'c';
+  let body = [brIf('out', eqz(local('count'))),
+              set('count', index(local('count'), -1)),
+              brIf('out', negatedRelation(op, local('i'), bound)),
+              ...randomStatements('i', {out: 'out'}, 0)];
+  if (kind == 'copy') {
+    body.push(access(source, local('i')));
+  }
+  body.push(set('i', index(local('i'), 1)), {k: 'br', label: 'loop'});
+  let after = randomStatements('i', {}, 0);
+  preferredArray = saved;
+  return [
+    set('x', n),
+    kind == 'fixed' && !mutations.has('size')
+        ? {k: 'newfixed', count: n.v}
+        : {k: 'new', len: size},
+    set('i', constant(init)),
+    set('count', constant(pick([2, 5, 12, 40]))),
+    {k: 'block', label: 'out', body: [{k: 'loop', label: 'loop', body}]},
+    ...after,
+  ];
+}
+
 // Replaces {i + d} by {i + d + k} in the accesses and conditions of {s}.
 function shiftStatement(s, k) {
   function shift(e) {
@@ -590,7 +663,8 @@ function shiftStatement(s, k) {
 }
 
 // Code generation.
-const kBinops = {add: kExprI32Add, sub: kExprI32Sub, xor: kExprI32Xor};
+const kBinops = {add: kExprI32Add, sub: kExprI32Sub, xor: kExprI32Xor,
+                 and: kExprI32And};
 const kComparisons = {
   lt_s: kExprI32LtS, lt_u: kExprI32LtU, le_s: kExprI32LeS, le_u: kExprI32LeU,
   gt_s: kExprI32GtS, gt_u: kExprI32GtU, ge_s: kExprI32GeS, ge_u: kExprI32GeU,
@@ -663,6 +737,15 @@ function emitStatements(statements, array, labels) {
       case 'return':
         code.push(kExprLocalGet, kLocals.acc, kExprReturn);
         break;
+      case 'new':
+        code.push(...emitExpression(s.len, array), kGCPrefix,
+                  kExprArrayNewDefault, array, kExprLocalSet, kLocals.c);
+        break;
+      case 'newfixed':
+        for (let n = 0; n < s.count; n++) code.push(...wasmI32Const(n));
+        code.push(kGCPrefix, kExprArrayNewFixed, array, s.count,
+                  kExprLocalSet, kLocals.c);
+        break;
       case 'block':
       case 'loop':
         code.push(s.k == 'block' ? kExprBlock : kExprLoop, kWasmVoid,
@@ -678,7 +761,7 @@ function emitStatements(statements, array, labels) {
 
 // Pseudo-code, for debugging.
 const kOperators = {
-  add: '+', sub: '-', xor: '^', lt_s: '<s', lt_u: '<u', le_s: '<=s',
+  add: '+', sub: '-', xor: '^', and: '&', lt_s: '<s', lt_u: '<u', le_s: '<=s',
   le_u: '<=u', gt_s: '>s', gt_u: '>u', ge_s: '>=s', ge_u: '>=u', eq: '==',
   ne: '!=',
 };
@@ -730,6 +813,12 @@ function printStatements(statements, indent = '  ') {
       case 'return':
         lines.push(`${indent}return acc;`);
         break;
+      case 'new':
+        lines.push(`${indent}c = new T[${printExpression(s.len)}];`);
+        break;
+      case 'newfixed':
+        lines.push(`${indent}c = new_fixed T[${s.count}];`);
+        break;
       case 'block':
       case 'loop':
         lines.push(`${indent}${s.k} ${s.label} {`,
@@ -776,11 +865,13 @@ let sig = makeSig([wasmRefNullType(array), wasmRefNullType(array),
                    kWasmI32, kWasmI32], [kWasmI32]);
 let functions = [];
 for (let f = 0; f < kFunctionCount; f++) {
-  let statements =
-      chance(4) ? randomDecreasingFunction() : randomFunction();
+  let statements = chance(4) ? randomDecreasingFunction()
+                 : chance(3) ? randomAllocationFunction()
+                 : randomFunction();
   functions.push(statements);
   builder.addFunction(`f${f}`, sig)
     .addLocals(kWasmI32, 6)
+    .addLocals(wasmRefNullType(array), 1)
     .addBody([...emitStatements(statements, array, []),
               kExprLocalGet, kLocals.acc])
     .exportFunc();
