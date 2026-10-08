@@ -33,9 +33,13 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBlock(const Block& block) {
   BeginBlock(&block);
   current_position_ = 0;
   for (OpIndex op_idx : graph_.OperationIndices(block)) {
-    if (const TrapIfOp* trap_if = graph_.Get(op_idx).TryCast<TrapIfOp>();
+    const Operation& op = graph_.Get(op_idx);
+    if (const TrapIfOp* trap_if = op.TryCast<TrapIfOp>();
         trap_if && !ShouldSkipOptimizationStep()) {
       ProcessTrapIf(op_idx, *trap_if);
+    } else if (const WasmAllocateArrayOp* allocation =
+                   op.TryCast<WasmAllocateArrayOp>()) {
+      RecordKnownLength(allocation->length());
     }
     current_position_++;
   }
@@ -231,7 +235,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
     // unless the length is known to be at least {r}, {a.length - r} may
     // wrap around, and we learn nothing.
     if (is_signed ? IsKnownNonNegative(key, offset)
-                  : reduction == 0 || MinLength(key.array) >= reduction) {
+                  : reduction == 0 || MinLength(key.length) >= reduction) {
       if (is_signed) TRACE("  Signed bounds check");
       // Only an unsigned comparison with the length itself is an actual
       // bounds check, which can be eliminated. Other conditions,
@@ -247,7 +251,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
       // ([reduced-length-min-length], [constant-index-min-length]).
       uint64_t index_bound = key.base.valid() ? 0 : offset;
       if (index_bound <= kMaxInt) {
-        RecordMinLength(key.array, index_bound + reduction + 1);
+        RecordMinLength(key.length, index_bound + reduction + 1);
       }
     }
   }
@@ -274,7 +278,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqual(
       ProcessNotEqualToConstant(*array_length, offset);
       return;
     }
-    BoundsCheckKey key(base, ArrayOfLength(array_length->length));
+    BoundsCheckKey key(base, LengthKey(array_length->length));
     uint32_t last = offset + array_length->reduction - 1;
     std::optional<OffsetRange> known =
         KnownOffsets(key, NonNegativeOffsets(base));
@@ -295,11 +299,11 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqual(
 // are those below the min length (see {KnownOffsets}).
 void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqualToConstant(
     const ReducedLength& length, uint32_t n) {
-  OpIndex array = ArrayOfLength(length.length);
+  OpIndex length_key = LengthKey(length.length);
   uint64_t excluded = uint64_t{n} + length.reduction;
-  if (excluded != MinLength(array)) return;
+  if (excluded != MinLength(length_key)) return;
   TRACE("  Not equal to the min length");
-  RecordMinLength(array, excluded + 1);
+  RecordMinLength(length_key, excluded + 1);
 }
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
@@ -316,7 +320,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
   // available in the current block, and is then not recorded.
   if (!alias_lengths_.contains(array_length) ||
       Dominates(&graph_.Get(graph_.BlockOf(array_length)), current_block_)) {
-    array_lengths_.try_emplace(key.array, array_length);
+    array_lengths_.try_emplace(key.length, array_length);
   }
 
   // The condition shows that the offsets from {offset} to {last} are
@@ -362,7 +366,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
           << known->upper() << "]");
     return;
   }
-  TRACE("  Known offsets for base " << key.base << " and array " << key.array
+  TRACE("  Known offsets for base " << key.base << " and length " << key.length
                                     << ": [" << offsets->lower() << ", "
                                     << offsets->upper() << "]");
 
@@ -407,7 +411,7 @@ void WasmBoundsCheckEliminationAnalyzer::RecordFallbackSequence(
   // {known_length_aliases_}, which is not recorded if not available in
   // this block, and a later condition may then have recorded another
   // length.
-  auto array_length_it = array_lengths_.find(key.array);
+  auto array_length_it = array_lengths_.find(key.length);
   if (array_length_it == array_lengths_.end()) return;
   OpIndex array_length = array_length_it->second;
   if (graph_.BlockIndexOf(array_length) == current_block_->index() &&
@@ -514,7 +518,7 @@ std::optional<OffsetRange> WasmBoundsCheckEliminationAnalyzer::KnownOffsets(
   std::optional<OffsetRange> known = known_bounds_checks_.Get(key);
   if (!key.base.valid()) {
     // Both ranges are within bounds, so their hull is valid ([covered]).
-    if (uint32_t min_length = MinLength(key.array); min_length > 0) {
+    if (uint32_t min_length = MinLength(key.length); min_length > 0) {
       OffsetRange below_min_length(0, min_length - 1);
       known = known.has_value() ? known->Hull(below_min_length).value_or(*known)
                                 : below_min_length;
@@ -558,18 +562,42 @@ void WasmBoundsCheckEliminationAnalyzer::RecordNonNegativeOffset(
   known_non_negative_offsets_.Set(base, *offsets);
 }
 
-uint32_t WasmBoundsCheckEliminationAnalyzer::MinLength(OpIndex array) const {
-  return known_min_lengths_.Get(array).value_or(0);
+uint32_t WasmBoundsCheckEliminationAnalyzer::MinLength(OpIndex length) const {
+  // A constant length is its own min length ([constant-length]).
+  if (std::optional<uint32_t> constant = TryExtractI32Const(length);
+      constant.has_value() && *constant < kMaxArrayLength) {
+    return *constant;
+  }
+  return known_min_lengths_.Get(length).value_or(0);
 }
 
-void WasmBoundsCheckEliminationAnalyzer::RecordMinLength(OpIndex array,
-                                                         uint64_t length) {
-  if (length <= MinLength(array)) return;
+void WasmBoundsCheckEliminationAnalyzer::RecordMinLength(OpIndex length,
+                                                         uint64_t min_length) {
+  std::optional<uint32_t> known = known_min_lengths_.Get(length);
+  if (known.has_value() && min_length <= *known) return;
   // Array lengths are less than 2^31, so a condition implying a larger
   // length cannot hold, and we are in unreachable code.
-  if (length > kMaxInt) return;
-  TRACE("  Min length for " << array << ": " << length);
-  known_min_lengths_.Set(array, static_cast<uint32_t>(length));
+  if (min_length > kMaxInt) return;
+  TRACE("  Min length for " << length << ": " << min_length);
+  known_min_lengths_.Set(length, static_cast<uint32_t>(min_length));
+}
+
+// Whether {value} is known to be the length of an array, and so less than
+// 2^30: an ArrayLength operation, or a value with the same canonical
+// value as a length recorded by {RecordKnownLength}.
+bool WasmBoundsCheckEliminationAnalyzer::IsKnownLength(OpIndex value) const {
+  return graph_.Get(value).Is<ArrayLengthOp>() ||
+         known_min_lengths_.Get(CanonicalValue(value)).has_value();
+}
+
+// Records that {value} is the length of an array, as the length of an
+// array allocated successfully ([allocation-length], see "Limits" in the
+// header).
+void WasmBoundsCheckEliminationAnalyzer::RecordKnownLength(OpIndex value) {
+  OpIndex key = CanonicalValue(value);
+  if (known_min_lengths_.Get(key).has_value()) return;
+  TRACE("  Known length: " << value);
+  known_min_lengths_.Set(key, 0);
 }
 
 // Attempts to decode a bounds check condition of the form:
@@ -586,12 +614,12 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundsCheckCondition(
   if (relation.kind == ComparisonOp::Kind::kEqual) return std::nullopt;
   std::optional<ReducedLength> length = TryExtractArrayLength(relation.right);
   if (!length) return std::nullopt;
-  OpIndex array = ArrayOfLength(length->length);
+  OpIndex length_key = LengthKey(length->length);
   auto [base, base_value, offset] = ExtractBaseAndOffset(relation.left);
   uint32_t reduction = length->reduction;
   if (!relation.is_strict()) {
     if (reduction >= 1 &&
-        (relation.is_signed() || MinLength(array) >= reduction)) {
+        (relation.is_signed() || MinLength(length_key) >= reduction)) {
       reduction--;
     } else if (!base.valid() &&
                (relation.is_signed() ? static_cast<int32_t>(offset) >= 1
@@ -601,9 +629,9 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundsCheckCondition(
       return std::nullopt;
     }
   }
-  return BoundsCheckCondition{BoundsCheck(BoundsCheckKey(base, array), offset),
-                              base_value, length->length, reduction,
-                              relation.is_signed()};
+  return BoundsCheckCondition{
+      BoundsCheck(BoundsCheckKey(base, length_key), offset), base_value,
+      length->length, reduction, relation.is_signed()};
 }
 
 template <typename F>
@@ -836,16 +864,16 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessDecreasingInduction(
   RecordNonNegativeOffset(value, 0);
   std::optional<ReducedLength> length = TryExtractArrayLength(init);
   if (!length.has_value() || length->reduction == 0) return;
-  OpIndex array = ArrayOfLength(length->length);
+  OpIndex length_key = LengthKey(length->length);
   uint32_t last = length->reduction - 1;
   TRACE("  Loop induction: offsets [0, " << last << "] of " << value
-                                         << " within bounds of " << array);
-  BoundsCheckKey key(value, array);
+                                         << " below length " << length_key);
+  BoundsCheckKey key(value, length_key);
   // The loop phi is defined in the loop header, so nothing is known yet
   // about it.
   DCHECK(!known_bounds_checks_.Get(key).has_value());
   known_bounds_checks_.Set(key, OffsetRange(0, last));
-  RecordMinLength(array, uint64_t{last} + 1);
+  RecordMinLength(length_key, uint64_t{last} + 1);
 }
 
 // For a decreasing loop phi {i = phi(i0, i - c)}, with {0 <= i}, whether
@@ -1069,8 +1097,7 @@ WasmBoundsCheckEliminationAnalyzer::EntryLowerBoundOfStart(
     if (bound >= 0 && (!lower.has_value() || bound > *lower)) lower = bound;
   };
   if (std::optional<ReducedLength> length = TryExtractArrayLength(init)) {
-    raise(int64_t{MinLength(ArrayOfLength(length->length))} -
-          length->reduction);
+    raise(int64_t{MinLength(LengthKey(length->length))} - length->reduction);
   }
   // {x + o} or {x - (-o)}, for the value {x} on which conditions may have
   // been tested (not decomposed further).
@@ -1106,16 +1133,16 @@ void WasmBoundsCheckEliminationAnalyzer::RecordLoopBound(
   std::optional<ReducedLength> length = TryExtractArrayLength(bound.x);
   if (!length.has_value()) length = TryResolveMergeBound(bound);
   if (!length.has_value() || length->reduction == 0) return;
-  OpIndex array = ArrayOfLength(length->length);
+  OpIndex length_key = LengthKey(length->length);
   uint32_t last = length->reduction - 1;
   TRACE("  Loop induction: offsets [0, " << last << "] of " << induction.value
-                                         << " within bounds of " << array);
-  BoundsCheckKey key(induction.value, array);
+                                         << " below length " << length_key);
+  BoundsCheckKey key(induction.value, length_key);
   // The loop phi is defined in the loop header, so nothing is known yet
   // about it.
   DCHECK(!known_bounds_checks_.Get(key).has_value());
   known_bounds_checks_.Set(key, OffsetRange(0, last));
-  RecordMinLength(array, uint64_t{last} + 1);
+  RecordMinLength(length_key, uint64_t{last} + 1);
 }
 
 // With {x = phi(...) + offset}, where the phi is a merge (not a loop
@@ -1185,13 +1212,22 @@ WasmBoundsCheckEliminationAnalyzer::TryResolveMergeBound(
 }
 
 // Recognizes {a.length - r} for a small constant {r} (possibly written
-// {a.length + (-r)}, or with nested additions of constants), and values
-// known from {known_length_aliases_} to be equal to such an expression.
+// {a.length + (-r)}, or with nested additions of constants), where
+// {a.length} is an ArrayLength operation, or a value known to be an
+// array length (see {IsKnownLength}), and values known from
+// {known_length_aliases_} to be equal to such an expression.
 std::optional<ReducedLength>
 WasmBoundsCheckEliminationAnalyzer::TryExtractArrayLength(
     OpIndex length) const {
   BaseAndOffset b = DecomposeIndex(length);
-  if (b.base_value.valid() && graph_.Get(b.base_value).Is<ArrayLengthOp>()) {
+  // A constant {c < 2^30} is the same as the length of an array of
+  // length {c} for the analysis, which only assumes that array lengths
+  // are less than 2^30 ([constant-length]).
+  if (!b.base_value.valid()) {
+    if (b.offset >= kMaxArrayLength) return std::nullopt;
+    return ReducedLength{length, 0};
+  }
+  if (IsKnownLength(b.base_value)) {
     uint32_t reduction = 0u - b.offset;
     // Only small reductions are useful (see "Limits" in the header).
     if (reduction > kMaxReduction) return std::nullopt;
@@ -1203,9 +1239,12 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractArrayLength(
   return std::nullopt;
 }
 
-OpIndex WasmBoundsCheckEliminationAnalyzer::ArrayOfLength(
-    OpIndex length) const {
-  return ResolveAliases(graph_.Get(length).Cast<ArrayLengthOp>().array());
+// The key of an array length: its canonical value, which is the same for
+// all the ArrayLength operations of an array, and for the length given
+// to {array.new} when load elimination replaced the length of the new
+// array by it.
+OpIndex WasmBoundsCheckEliminationAnalyzer::LengthKey(OpIndex length) const {
+  return CanonicalValue(length);
 }
 
 // Whether {length} is {a.length - r}, with {a.length} known to be at
@@ -1215,7 +1254,7 @@ bool WasmBoundsCheckEliminationAnalyzer::IsArrayLengthWithoutWrapAround(
   std::optional<ReducedLength> array_length = TryExtractArrayLength(length);
   return array_length.has_value() &&
          (array_length->reduction == 0 ||
-          MinLength(ArrayOfLength(array_length->length)) >=
+          MinLength(LengthKey(array_length->length)) >=
               array_length->reduction);
 }
 
@@ -1418,6 +1457,14 @@ OpIndex WasmBoundsCheckEliminationAnalyzer::CanonicalValue(OpIndex value,
                           OpIndex::Invalid()};
       break;
     }
+    case Opcode::kArrayLength:
+      // The length of an array never changes, so the ArrayLength
+      // operations of the same array compute the same value.
+      key = StructuralKey{
+          op.opcode, 0, 0,
+          CanonicalValue(op.Cast<ArrayLengthOp>().array(), depth + 1),
+          OpIndex::Invalid()};
+      break;
     case Opcode::kTaggedBitcast: {
       const TaggedBitcastOp& bitcast = op.Cast<TaggedBitcastOp>();
       // The bitcast of a reference to a heap object is its address, which

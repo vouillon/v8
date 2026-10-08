@@ -75,6 +75,18 @@ namespace v8::internal::compiler::turboshaft {
 // condition {base + n <= a.length - r} is the same as
 // {base + n < a.length - (r - 1)} when {r >= 1}.
 //
+// Facts are about values: a bounds check {base + n < l} depends on the
+// value {l}, not on the array whose length it is. Bounds checks are
+// thus grouped by the canonical value of the length (see
+// {CanonicalValue}), which is the same for all the ArrayLength
+// operations of an array, and for arrays that load elimination knows to
+// have the same length, as an array allocated with the length of
+// another one: in {b = new T[a.length]; for (i = 0; i < a.length; i++)
+// b[i] = a[i];}, the condition covers the accesses to both arrays. A
+// condition {i < n} is also recognized as a bounds check after an
+// allocation of length {n}, as in {b = new T[n]; for (i = 0; i < n; i++)
+// b[i] = ...}.
+//
 // The analysis also tracks a lower bound on the length of each array.
 // It shows that the constant indices below it are within bounds, and
 // that {a.length - r} does not wrap around when it is at least {r}. It
@@ -188,24 +200,39 @@ namespace v8::internal::compiler::turboshaft {
 // {n + r} shown by such a condition valid, and it ensures that
 // {a.length - r} is negative (as a signed integer) rather than a large
 // positive value when {a.length < r}.
+//
+// A value {n} is also known to be an array length after an allocation
+// {WasmAllocateArray} of length {n} (as for {array.new} or
+// {array.new_fixed}), which traps when {n} exceeds the maximum length of
+// the array type (the check is emitted when the operation is lowered)
+// ([allocation-length]): {n} is then at most {WasmArray::MaxLength}, and
+// so less than 2^30, which is all that the analysis assumes about array
+// lengths. For the same reason, a constant {c < 2^30} is used as an
+// array length, whose min length is {c} ([constant-length]): after load
+// elimination, the bounds checks of an array allocated with a constant
+// length compare the index with this constant.
 
-// Key for grouping bounds checks by base and array
+// Key for grouping bounds checks by base and array length. The length
+// is the canonical value of an array length (see {LengthKey}): a bounds
+// check {base + n < l} only depends on the value {l}, which may be the
+// length of several arrays.
 struct BoundsCheckKey {
   OpIndex base;  // Invalid means that we do not have a base.
-  OpIndex array;
+  OpIndex length;
 
   bool operator==(const BoundsCheckKey& other) const = default;
   bool operator<(const BoundsCheckKey& other) const {
-    return std::tie(base, array) < std::tie(other.base, other.array);
+    return std::tie(base, length) < std::tie(other.base, other.length);
   }
 
   template <typename H>
   friend H AbslHashValue(H h, const BoundsCheckKey& key) {
-    return H::combine(std::move(h), key.base, key.array);
+    return H::combine(std::move(h), key.base, key.length);
   }
 };
 
-// Identifies a specific bounds check by its key (base + array) and offset.
+// Identifies a specific bounds check by its key (base + length) and
+// offset.
 struct BoundsCheck {
   BoundsCheckKey key;
   uint32_t offset;
@@ -784,7 +811,8 @@ class KeyedSnapshotTable : public SnapshotTable<std::optional<V>> {
 };
 
 // An array length minus a constant, {length - reduction}, where
-// {length} is an ArrayLength operation.
+// {length} is an ArrayLength operation, or a value known to be the
+// length of an array (see {IsKnownLength}).
 struct ReducedLength {
   OpIndex length;
   uint32_t reduction;
@@ -792,14 +820,16 @@ struct ReducedLength {
   bool operator==(const ReducedLength& other) const = default;
 };
 
-// Maps (base, array) pairs to their known safe offset ranges.
+// Maps (base, length) pairs to their known safe offset ranges.
 using BoundsCheckMap = KeyedSnapshotTable<BoundsCheckKey, OffsetRange>;
 
 // Maps bases to the range of offsets {n} such that {base + n} is
 // known to be non-negative.
 using NonNegativeOffsetMap = KeyedSnapshotTable<OpIndex, OffsetRange>;
 
-// Maps arrays to a lower bound on their length.
+// Maps array lengths (by canonical value) to a lower bound. A length
+// has an entry, possibly 0, when it is known to be an array length,
+// for instance the length of an allocated array (see {IsKnownLength}).
 using MinLengthMap = KeyedSnapshotTable<OpIndex, uint32_t>;
 
 // Maps values to an array length minus a constant that they are equal
@@ -1318,13 +1348,15 @@ class WasmBoundsCheckEliminationAnalyzer {
   std::optional<OffsetRange> NonNegativeOffsets(OpIndex base) const;
   bool IsKnownNonNegative(const BoundsCheckKey& key, uint32_t offset) const;
   void RecordNonNegativeOffset(OpIndex base, uint32_t offset);
-  uint32_t MinLength(OpIndex array) const;
-  void RecordMinLength(OpIndex array, uint64_t length);
+  uint32_t MinLength(OpIndex length) const;
+  void RecordMinLength(OpIndex length, uint64_t min_length);
+  bool IsKnownLength(OpIndex value) const;
+  void RecordKnownLength(OpIndex value);
 
   std::optional<BoundsCheckCondition> TryExtractBoundsCheckCondition(
       const Relation& relation) const;
   std::optional<ReducedLength> TryExtractArrayLength(OpIndex length) const;
-  OpIndex ArrayOfLength(OpIndex length) const;
+  OpIndex LengthKey(OpIndex length) const;
   bool IsArrayLengthWithoutWrapAround(OpIndex length) const;
   std::optional<BaseAndOffset> TryExtractNonNegativeIndex(
       const Relation& relation) const;
@@ -1376,8 +1408,9 @@ class WasmBoundsCheckEliminationAnalyzer {
   // Previous bounds check traps that can start a fallback sequence.
   ZoneAbslBTreeMap<BoundsCheck, TrapInfo> last_trap_bounds_checks_;
 
-  // For each array, the first array length used in a bounds check
-  // condition within this block, or in a dominating block.
+  // For each array length (by canonical value), the first operation
+  // computing it used in a bounds check condition within this block, or
+  // in a dominating block.
   ZoneAbslBTreeMap<OpIndex, OpIndex> array_lengths_;
 
   // The fallback sequences planned in this block. Sequences for
