@@ -5,6 +5,7 @@
 #include "src/compiler/turboshaft/wasm-bounds-check-elimination-reducer.h"
 
 #include "src/base/small-vector.h"
+#include "src/compiler/turboshaft/opmasks.h"
 #include "src/wasm/wasm-objects.h"
 
 namespace v8::internal::compiler::turboshaft {
@@ -33,6 +34,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBlock(const Block& block) {
   BeginBlock(&block);
   current_position_ = 0;
   for (OpIndex op_idx : graph_.OperationIndices(block)) {
+    current_operation_ = op_idx;
     const Operation& op = graph_.Get(op_idx);
     if (const TrapIfOp* trap_if = op.TryCast<TrapIfOp>();
         trap_if && !ShouldSkipOptimizationStep()) {
@@ -61,6 +63,8 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessTrapIf(
 
 void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
   current_block_ = block;
+  // Loop headers are processed here, before the operations of the block.
+  current_operation_ = block->begin();
   // Collect the snapshots of all predecessors.
   predecessor_bounds_check_snapshots_.clear();
   predecessor_non_negative_snapshots_.clear();
@@ -1341,6 +1345,37 @@ WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
       return {OpIndex::Invalid(), OpIndex::Invalid(), offset + *constant};
     }
     if (depth == kMaxDepth) break;
+    // a[trunc(base64 + n)]: languages with 64-bit integers compute the
+    // index of {a[i + 1]} as {trunc(i + 1)}, which is {trunc(i) + 1}
+    // ([truncated-addition]). The base is then an operation computing
+    // {trunc(i)}, which must already exist (as for the index of a
+    // previous access {a[i]}).
+    if (const ChangeOp* truncation =
+            graph_.Get(index).TryCast<Opmask::kTruncateWord64ToWord32>()) {
+      const WordBinopOp* op =
+          graph_.Get(ResolveReplacements(truncation->input()))
+              .TryCast<WordBinopOp>();
+      if (op == nullptr || op->rep != WordRepresentation::Word64()) break;
+      OpIndex base = OpIndex::Invalid();
+      if (std::optional<uint32_t> constant = TryExtractI64ConstLow(op->right());
+          constant.has_value() && (op->kind == WordBinopOp::Kind::kAdd ||
+                                   op->kind == WordBinopOp::Kind::kSub)) {
+        base = ExistingTruncation(*truncation, op->left());
+        if (base.valid()) {
+          offset +=
+              op->kind == WordBinopOp::Kind::kAdd ? *constant : -*constant;
+        }
+      } else if (std::optional<uint32_t> left_constant =
+                     TryExtractI64ConstLow(op->left());
+                 left_constant.has_value() &&
+                 op->kind == WordBinopOp::Kind::kAdd) {
+        base = ExistingTruncation(*truncation, op->right());
+        if (base.valid()) offset += *left_constant;
+      }
+      if (!base.valid()) break;
+      index = base;
+      continue;
+    }
     // a[base + n] / a[n + base] / a[base - n]
     const WordBinopOp* op = graph_.Get(index).TryCast<WordBinopOp>();
     if (op == nullptr || op->rep != WordRepresentation::Word32()) break;
@@ -1448,12 +1483,8 @@ OpIndex WasmBoundsCheckEliminationAnalyzer::CanonicalValue(OpIndex value,
     }
     case Opcode::kChange: {
       const ChangeOp& change = op.Cast<ChangeOp>();
-      key = StructuralKey{op.opcode,
-                          static_cast<uint64_t>(change.kind) |
-                              static_cast<uint64_t>(change.assumption) << 8 |
-                              static_cast<uint64_t>(change.from.value()) << 16 |
-                              static_cast<uint64_t>(change.to.value()) << 24,
-                          0, CanonicalValue(change.input(), depth + 1),
+      key = StructuralKey{op.opcode, ChangeOptions(change), 0,
+                          CanonicalValue(change.input(), depth + 1),
                           OpIndex::Invalid()};
       break;
     }
@@ -1522,6 +1553,50 @@ bool WasmBoundsCheckEliminationAnalyzer::IsKnownSmi(OpIndex object) const {
       return true;
     }
   }
+}
+
+// The options of a Change, in the structural key of its canonical value.
+uint64_t WasmBoundsCheckEliminationAnalyzer::ChangeOptions(
+    const ChangeOp& change) {
+  return static_cast<uint64_t>(change.kind) |
+         static_cast<uint64_t>(change.assumption) << 8 |
+         static_cast<uint64_t>(change.from.value()) << 16 |
+         static_cast<uint64_t>(change.to.value()) << 24;
+}
+
+// An operation computing the same truncation as {change} (to 32 bits) of
+// {x} instead of its input, if one has been seen already (see
+// {CanonicalValue}) and is computed before the current operation (in
+// the current block, or in a block that dominates it), so that it can be
+// used wherever an index used by the current operation is, including by
+// the guard of a fallback sequence starting there. Values seen already
+// may come later in the block: the conditions of a loop are processed
+// at its header.
+OpIndex WasmBoundsCheckEliminationAnalyzer::ExistingTruncation(
+    const ChangeOp& change, OpIndex x) const {
+  auto it = values_by_structure_.find(
+      StructuralKey{Opcode::kChange, ChangeOptions(change), 0,
+                    CanonicalValue(x), OpIndex::Invalid()});
+  if (it == values_by_structure_.end() || current_block_ == nullptr) {
+    return OpIndex::Invalid();
+  }
+  OpIndex truncation = it->second;
+  const Block* block = &graph_.Get(graph_.BlockOf(truncation));
+  if (block == current_block_ ? !(truncation < current_operation_)
+                              : !Dominates(block, current_block_)) {
+    return OpIndex::Invalid();
+  }
+  return truncation;
+}
+
+// The low 32 bits of a 64-bit constant.
+std::optional<uint32_t>
+WasmBoundsCheckEliminationAnalyzer::TryExtractI64ConstLow(OpIndex expr) const {
+  if (const ConstantOp* constant = graph_.Get(expr).TryCast<ConstantOp>();
+      constant && constant->kind == ConstantOp::Kind::kWord64) {
+    return static_cast<uint32_t>(constant->integral());
+  }
+  return std::nullopt;
 }
 
 std::optional<uint32_t> WasmBoundsCheckEliminationAnalyzer::TryExtractI32Const(

@@ -779,6 +779,17 @@ class OffsetRange {
 //   (assert (not (and (non-negative (bvadd x o))
 //                     (bvsge (bvadd x o) (bvadd lo o)))))
 //   (check-sat)
+//
+// [truncated-addition] The truncation to 32 bits of a 64-bit addition
+// (or subtraction) is the addition of the truncations:
+//
+//   (declare-const x (_ BitVec 64))
+//   (declare-const c (_ BitVec 64))
+//   (assert (not (and (= ((_ extract 31 0) (bvadd x c))
+//                        (bvadd ((_ extract 31 0) x) ((_ extract 31 0) c)))
+//                     (= ((_ extract 31 0) (bvsub x c))
+//                        (bvsub ((_ extract 31 0) x) ((_ extract 31 0) c))))))
+//   (check-sat)
 
 // Maps keys of type {K} to values of type {V}. Supports snapshotting
 // for control flow merge points.
@@ -1365,6 +1376,9 @@ class WasmBoundsCheckEliminationAnalyzer {
   OpIndex CanonicalValue(OpIndex value, int depth = 0) const;
   bool IsKnownSmi(OpIndex object) const;
   std::optional<uint32_t> TryExtractI32Const(OpIndex expr) const;
+  std::optional<uint32_t> TryExtractI64ConstLow(OpIndex expr) const;
+  static uint64_t ChangeOptions(const ChangeOp& change);
+  OpIndex ExistingTruncation(const ChangeOp& change, OpIndex x) const;
 
   const Graph& graph_;
   Zone* phase_zone_;
@@ -1404,6 +1418,9 @@ class WasmBoundsCheckEliminationAnalyzer {
 
   // The block being processed.
   const Block* current_block_ = nullptr;
+  // The operation being processed, or the first one of the block when
+  // processing its start (see {ExistingTruncation}).
+  OpIndex current_operation_ = OpIndex::Invalid();
 
   // Previous bounds check traps that can start a fallback sequence.
   ZoneAbslBTreeMap<BoundsCheck, TrapInfo> last_trap_bounds_checks_;

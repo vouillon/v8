@@ -1887,6 +1887,85 @@ TEST_F(WasmBoundsCheckEliminationReducerTest,
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
 }
 
+// {trunc(x + offset)}, for a 64-bit {x}, as computed by languages with
+// 64-bit integers for the index of {a[x + offset]}.
+template <typename Asm_t>
+static V<Word32> TruncatedIndex(Asm_t& Asm, V<Word64> x, int64_t offset) {
+  return __ TruncateWord64ToWord32(
+      offset == 0 ? x : __ Word64Add(x, __ Word64Constant(offset)));
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedAdditions) {
+  // a[trunc(x)]; a[trunc(x + 2)]; a[trunc(x + 1)];
+  // As for a[i]; a[i+2]; a[i+1]: the last check is redundant.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 0), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 2), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+  });
+  Run(test);
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedAdditionsNoBase) {
+  // a[trunc(x + 2)]; a[trunc(x + 1)];
+  // No operation computes trunc(x), so the indices are not decomposed,
+  // and the second check stays.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 2), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedAdditionsAfterBranch) {
+  // if (c) a[trunc(x)]; a[trunc(x + 2)]; a[trunc(x + 1)];
+  // The only operation computing trunc(x) does not dominate the other
+  // accesses.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    If(Asm, c, [&] { BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 0), 0); });
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 2), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       TruncatedAdditionsBeforeBaseInBlock) {
+  // for (k = 0; ; k++) {
+  //   x = zext(k); a[trunc(x + 1)]; a[trunc(x + 3)];
+  //   if (trunc(x) >=s a.length) break; ...
+  // }
+  // The loop header processes the exit test, and so sees trunc(x), before
+  // the accesses that precede it in the same block: trunc(x) cannot be
+  // the base of these accesses, nor of the guard of their fallback
+  // sequence.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    Loop(
+        Asm, 0, 1,
+        [&](V<Word32> k) {
+          V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+          return __ Int32LessThanOrEqual(
+              length, TruncatedIndex(Asm, __ ChangeUint32ToUint64(k), 0));
+        },
+        [&](V<Word32> k) {},
+        [&](V<Word32> k) {
+          V<Word64> x = __ ChangeUint32ToUint64(k);
+          BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+          BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 3), 0);
+        });
+  });
+  Run(test);
+  ASSERT_GE(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"
 
 }  // namespace v8::internal::compiler::turboshaft
