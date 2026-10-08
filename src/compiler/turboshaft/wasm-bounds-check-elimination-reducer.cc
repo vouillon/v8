@@ -24,6 +24,10 @@ namespace v8::internal::compiler::turboshaft {
 static constexpr uint32_t kMaxArrayLength = 1u << 30;
 static_assert(v8::internal::WasmArray::MaxLength(1) < kMaxArrayLength);
 static constexpr uint32_t kMaxReduction = 1u << 16;
+// The largest step of a loop recognized as unrolled, with an exit test
+// on each value of the loop variable (see {FindNotEqualBound} and
+// {HasDecreasingLowerBound}).
+static constexpr uint32_t kMaxUnrolledStep = 16;
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBlock(const Block& block) {
   BeginBlock(&block);
@@ -729,21 +733,29 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessLoopHeader(
   if (header->PredecessorCount() != 2) return;
   const Block* back_edge = header->LastPredecessor();
   const Block* forward = back_edge->NeighboringPredecessor();
-  // The conditions that hold whenever the back edge is taken.
+  // The conditions that hold whenever the back edge is taken, and the
+  // values that are not 0 then (conditions that hold, but are not
+  // comparisons, as {i} for an exit test {i == 0}).
   base::SmallVector<Relation, 8> conditions;
+  base::SmallVector<OpIndex, 4> non_zero;
   ForEachDominatingCondition(
       back_edge, header, [&](OpIndex condition, bool holds) {
         if (auto relation = Normalize(condition, holds)) {
           conditions.push_back(*relation);
+        } else if (holds) {
+          non_zero.push_back(condition);
         }
       });
-  if (conditions.empty()) return;
+  if (conditions.empty() && non_zero.empty()) return;
   for (OpIndex index : graph_.OperationIndices(*header)) {
     const PhiOp* phi = graph_.Get(index).TryCast<PhiOp>();
     if (!phi) continue;
     std::optional<InductionVariable> induction =
         TryMatchInductionVariable(index, *phi);
-    if (!induction.has_value()) continue;
+    if (!induction.has_value()) {
+      ProcessDecreasingInduction(index, *phi, conditions, non_zero, forward);
+      continue;
+    }
     std::optional<LoopBound> bound =
         FindNotEqualBound(*induction, conditions, forward);
     if (!bound.has_value() && !HasSmallBound(*induction, conditions)) {
@@ -775,6 +787,128 @@ WasmBoundsCheckEliminationAnalyzer::TryMatchInductionVariable(
     return std::nullopt;
   }
   return InductionVariable{value, *init, step.offset};
+}
+
+// Decreasing loop induction. A loop phi {i = phi(i0, i - c)}, where
+// {0 < c <= 2^30} is a constant, is non-negative in the whole loop if
+// {i0} is non-negative when entering the loop, and the back edge is only
+// taken if {i - c} is non-negative (see {HasDecreasingLowerBound}). As
+// {i} then decreases without wrapping around, it is at most {i0} in the
+// whole loop ([induction-decreasing]). When {i0} is an array length
+// minus a constant {r >= 1}, as in {for (i = a.length - 1; i >= 0; i--)},
+// the offsets 0 to {r - 1} of {i} are thus within bounds
+// ([induction-not-equal-bounds]).
+//
+// As for increasing loops (see {ProcessLoopHeader}), these facts hold
+// whenever the header is executed, by induction on the iterations. When
+// the loop is entered, {i} is {i0}, which is non-negative (see
+// {EntryLowerBoundOfStart}), and at least {y} for a not-equal bound,
+// since {y <= i0} then. When the back edge is taken, the conditions
+// collected at the header, including the values known to be different
+// from 0, held for the current value of {i}, which satisfied the facts,
+// and the lemmas show that {i - c} does too. The bound {i0} is the same
+// in the whole loop: it is the input of the phi for the forward edge, so
+// it is computed before the loop, and so is the array length it is
+// derived from, or it is known to be equal to an array length minus a
+// constant in the whole loop (see {TryResolveMergeBound}). The bound {y}
+// is a constant.
+template <typename Conditions, typename Values>
+void WasmBoundsCheckEliminationAnalyzer::ProcessDecreasingInduction(
+    OpIndex index, const PhiOp& phi, const Conditions& conditions,
+    const Values& non_zero, const Block* forward) {
+  if (phi.rep != RegisterRepresentation::Word32() || phi.input_count != 2) {
+    return;
+  }
+  OpIndex value = CanonicalValue(index);
+  BaseAndOffset step = ExtractBaseAndOffset(phi.input(1));
+  uint32_t decrement = 0u - step.offset;
+  if (step.base != value || decrement == 0 || decrement > kMaxArrayLength) {
+    return;
+  }
+  OpIndex init = phi.input(0);
+  std::optional<int64_t> init_lower = EntryLowerBoundOfStart(init, forward);
+  if (!init_lower.has_value() || *init_lower < 0) return;
+  if (!HasDecreasingLowerBound(value, decrement, conditions, non_zero,
+                               *init_lower)) {
+    return;
+  }
+  TRACE("  Loop induction: " << index << " is non-negative (decreasing)");
+  RecordNonNegativeOffset(value, 0);
+  std::optional<ReducedLength> length = TryExtractArrayLength(init);
+  if (!length.has_value() || length->reduction == 0) return;
+  OpIndex array = ArrayOfLength(length->length);
+  uint32_t last = length->reduction - 1;
+  TRACE("  Loop induction: offsets [0, " << last << "] of " << value
+                                         << " within bounds of " << array);
+  BoundsCheckKey key(value, array);
+  // The loop phi is defined in the loop header, so nothing is known yet
+  // about it.
+  DCHECK(!known_bounds_checks_.Get(key).has_value());
+  known_bounds_checks_.Set(key, OffsetRange(0, last));
+  RecordMinLength(array, uint64_t{last} + 1);
+}
+
+// For a decreasing loop phi {i = phi(i0, i - c)}, with {0 <= i}, whether
+// the back edge is only taken if {i - c} is non-negative:
+// - when {lo <= i + d} (or {lo < i + d}), signed, with a constant {lo}
+//   and {-2^30 <= d <= 0} such that {lo - d >= c} (or {lo + 1 - d >= c}),
+//   as for an exit test {i >= 0} after decrementing {i}, or {i > 0}
+//   before ([induction-decreasing]);
+// - when {i + k != y} for all {k} below the step (for a small step), for
+//   a constant {y} with {0 <= y <= i0} when entering the loop (where
+//   {i0} is at least {init_lower}), as for OCaml loops
+//   {for i = i0 downto y}: {i} then remains at least {y}
+//   ([induction-decreasing-not-equal]). The values in {non_zero} are
+//   also known to be different from 0 when the back edge is taken.
+template <typename Conditions, typename Values>
+bool WasmBoundsCheckEliminationAnalyzer::HasDecreasingLowerBound(
+    OpIndex value, uint32_t decrement, const Conditions& conditions,
+    const Values& non_zero, int64_t init_lower) const {
+  // The values {v} such that the back edge is only taken if {i != v}.
+  base::SmallVector<int64_t, kMaxUnrolledStep> excluded;
+  // {i + n != k} is {i != k - n}, for an {i} below 2^31.
+  auto exclude = [&](uint32_t n, uint32_t k) {
+    uint32_t v = k - n;
+    if (v <= kMaxInt) excluded.push_back(v);
+  };
+  for (OpIndex v : non_zero) {
+    BaseAndOffset i = ExtractBaseAndOffset(v);
+    if (i.base == value) exclude(i.offset, 0);
+  }
+  for (const Relation& relation : conditions) {
+    if (relation.not_equal) {
+      for (auto [index, other] : {std::pair{relation.left, relation.right},
+                                  std::pair{relation.right, relation.left}}) {
+        BaseAndOffset i = ExtractBaseAndOffset(index);
+        if (i.base != value) continue;
+        if (auto k = TryExtractI32Const(other)) exclude(i.offset, *k);
+        break;
+      }
+      continue;
+    }
+    if (relation.kind == ComparisonOp::Kind::kEqual || !relation.is_signed()) {
+      continue;
+    }
+    std::optional<uint32_t> lo = TryExtractI32Const(relation.left);
+    if (!lo.has_value()) continue;
+    BaseAndOffset i = ExtractBaseAndOffset(relation.right);
+    if (i.base != value) continue;
+    int64_t d = static_cast<int32_t>(i.offset);
+    if (d > 0 || d < -int64_t{kMaxArrayLength}) continue;
+    int64_t lower = static_cast<int32_t>(*lo) + (relation.is_strict() ? 1 : 0);
+    if (lower - d >= decrement) return true;
+  }
+  if (decrement > kMaxUnrolledStep) return false;
+  for (int64_t y : excluded) {
+    if (y > init_lower) continue;
+    bool all_excluded = true;
+    for (uint32_t k = 1; k < decrement && all_excluded; k++) {
+      all_excluded =
+          std::find(excluded.begin(), excluded.end(), y + k) != excluded.end();
+    }
+    if (all_excluded) return true;
+  }
+  return false;
 }
 
 // Whether the back edge is only taken if {i < x} or {i <= x}, for a
@@ -824,7 +958,6 @@ std::optional<WasmBoundsCheckEliminationAnalyzer::LoopBound>
 WasmBoundsCheckEliminationAnalyzer::FindNotEqualBound(
     const InductionVariable& induction, const Conditions& conditions,
     const Block* forward) const {
-  static constexpr uint32_t kMaxUnrolledStep = 16;
   if (induction.step > kMaxUnrolledStep) return std::nullopt;
   // For each candidate {x} (by canonical value): an operation computing
   // it, and the offsets {k} with {i + k != x}, as a bit mask.
@@ -918,6 +1051,51 @@ std::optional<int64_t> WasmBoundsCheckEliminationAnalyzer::EntryLowerBound(
     bound++;
   }
   return bound;
+}
+
+// A lower bound of {init} when entering the loop from {forward}, from
+// the conditions on {init}, and, when {init} is {x + o} with
+// {-2^30 <= o < 0}, as for the start {x - 1} of a loop whose first
+// iteration was peeled, from the conditions on {x} or, when {x} is an
+// array length, from its min length: if {x} is at least {lo} with
+// {lo + o >= 0}, then {x + o} does not wrap around, and is at least
+// {lo + o} ([entry-lower-bound-offset]).
+std::optional<int64_t>
+WasmBoundsCheckEliminationAnalyzer::EntryLowerBoundOfStart(
+    OpIndex init, const Block* forward) const {
+  std::optional<int64_t> lower =
+      EntryLowerBound(CanonicalValue(init), init, forward);
+  auto raise = [&](int64_t bound) {
+    if (bound >= 0 && (!lower.has_value() || bound > *lower)) lower = bound;
+  };
+  if (std::optional<ReducedLength> length = TryExtractArrayLength(init)) {
+    raise(int64_t{MinLength(ArrayOfLength(length->length))} -
+          length->reduction);
+  }
+  // {x + o} or {x - (-o)}, for the value {x} on which conditions may have
+  // been tested (not decomposed further).
+  const WordBinopOp* binop =
+      graph_.Get(ResolveReplacements(init)).TryCast<WordBinopOp>();
+  if (binop == nullptr || binop->rep != WordRepresentation::Word32()) {
+    return lower;
+  }
+  std::optional<uint32_t> constant = TryExtractI32Const(binop->right());
+  if (!constant.has_value()) return lower;
+  int64_t o;
+  if (binop->kind == WordBinopOp::Kind::kAdd) {
+    o = static_cast<int32_t>(*constant);
+  } else if (binop->kind == WordBinopOp::Kind::kSub) {
+    o = -int64_t{static_cast<int32_t>(*constant)};
+  } else {
+    return lower;
+  }
+  if (o >= 0 || o < -int64_t{kMaxArrayLength}) return lower;
+  OpIndex x = binop->left();
+  if (std::optional<int64_t> x_lower =
+          EntryLowerBound(CanonicalValue(x), x, forward)) {
+    raise(*x_lower + o);
+  }
+  return lower;
 }
 
 // With {0 <= i <= x} in the loop, if {x} is {a.length - r} with

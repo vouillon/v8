@@ -116,6 +116,19 @@ namespace v8::internal::compiler::turboshaft {
 // entered when {x} is -1, so {x} is {a.length - 1} in the loop, which
 // is recorded in {known_length_aliases_}.
 //
+// Decreasing loop phis {i = phi(i0, i - c)} are non-negative in the
+// whole loop when {i0} is non-negative when entering the loop (which may
+// be shown by conditions on {x} when {i0} is {x - k}, as for a loop whose
+// first iteration was peeled), and the
+// back edge is only taken when {i - c} is non-negative: when {lo <= i + d}
+// for constants with {lo - d >= c}, as for an exit test {i >= 0} after
+// decrementing {i}, or {i > 0} before, or when {i + k != y} for all {k}
+// below {c}, for a constant {y} with {0 <= y <= i0} when entering the
+// loop, as for an OCaml loop {for i = i0 downto y}. As {i} then
+// decreases without wrapping around, it is at most {i0}, and when {i0}
+// is {a.length - r} with {r >= 1}, the offsets 0 to {r - 1} of {i} are
+// within bounds, as in {for (i = a.length - 1; i >= 0; i--)}.
+//
 // When some bounds checks are later followed by stronger checks in
 // the same block, the instructions in between can be duplicated into
 // two paths:
@@ -676,6 +689,69 @@ class OffsetRange {
 //   (assert (bvult n m))
 //   (assert (not (bvult n l)))
 //   (check-sat)
+//
+// [induction-decreasing] Induction for decreasing loop phis
+// {i = phi(i0, i - c)}: if {0 <= i <= i0} and the back edge is only
+// taken when {lo <= i + d} (or {lo < i + d}), signed, with
+// {-2^30 <= d <= 0} and {lo - d >= c} (or {lo + 1 - d >= c}) as
+// integers, then {0 <= i - c <= i0}:
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const i0 (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (declare-const d (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (assert (non-negative i))
+//   (assert (bvsle i i0))
+//   (assert (bvugt c #x00000000))
+//   (assert (bvule c #x40000000))
+//   (assert (bvsge d #xc0000000))
+//   (assert (bvsle d #x00000000))
+//   (assert (or (and (bvsle lo (bvadd i d))
+//                    (bvsge (bvsub ((_ sign_extend 32) lo)
+//                                  ((_ sign_extend 32) d))
+//                           ((_ zero_extend 32) c)))
+//               (and (bvslt lo (bvadd i d))
+//                    (bvsge (bvsub (bvadd ((_ sign_extend 32) lo)
+//                                         #x0000000000000001)
+//                                  ((_ sign_extend 32) d))
+//                           ((_ zero_extend 32) c)))))
+//   (assert (not (and (non-negative (bvsub i c)) (bvsle (bvsub i c) i0))))
+//   (check-sat)
+//
+// [induction-decreasing-not-equal] For decreasing {i != y} loops,
+// {0 <= y <= i <= i0} is preserved by a decrement {c} when the back edge
+// is only taken if {i != y + k} for all {k} below {c}, that is, if
+// {i - y} is not below {c}:
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const i0 (_ BitVec 32))
+//   (declare-const y (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (assert (non-negative y))
+//   (assert (bvsle y i))
+//   (assert (bvsle i i0))
+//   (assert (bvugt c #x00000000))
+//   (assert (bvule c #x40000000))
+//   (assert (not (bvult (bvsub i y) c)))
+//   (assert (not (and (bvsle y (bvsub i c)) (bvsle (bvsub i c) i0))))
+//   (check-sat)
+//
+// [entry-lower-bound-offset] If {x >= lo} (signed) and
+// {-2^30 <= o < 0} with {lo + o >= 0} as integers, then {x + o} does
+// not wrap around, and is at least {lo + o}:
+//
+//   (declare-const x (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (declare-const o (_ BitVec 32))
+//   (assert (bvsge x lo))
+//   (assert (bvslt o #x00000000))
+//   (assert (bvsge o #xc0000000))
+//   (assert (bvsge (bvadd ((_ sign_extend 32) lo) ((_ sign_extend 32) o))
+//                  #x0000000000000000))
+//   (assert (not (and (non-negative (bvadd x o))
+//                     (bvsge (bvadd x o) (bvadd lo o)))))
+//   (check-sat)
 
 // Maps keys of type {K} to values of type {V}. Supports snapshotting
 // for control flow merge points.
@@ -1187,12 +1263,23 @@ class WasmBoundsCheckEliminationAnalyzer {
                      const Conditions& conditions) const;
   bool IsSmallBound(OpIndex x, uint32_t step, bool is_signed,
                     bool inclusive) const;
+  template <typename Conditions, typename Values>
+  void ProcessDecreasingInduction(OpIndex index, const PhiOp& phi,
+                                  const Conditions& conditions,
+                                  const Values& non_zero, const Block* forward);
+  template <typename Conditions, typename Values>
+  bool HasDecreasingLowerBound(OpIndex value, uint32_t decrement,
+                               const Conditions& conditions,
+                               const Values& non_zero,
+                               int64_t init_lower) const;
   template <typename Conditions>
   std::optional<LoopBound> FindNotEqualBound(const InductionVariable& induction,
                                              const Conditions& conditions,
                                              const Block* forward) const;
   std::optional<int64_t> EntryLowerBound(OpIndex x, OpIndex x_value,
                                          const Block* forward) const;
+  std::optional<int64_t> EntryLowerBoundOfStart(OpIndex init,
+                                                const Block* forward) const;
   void RecordLoopBound(const InductionVariable& induction,
                        const LoopBound& bound);
   std::optional<ReducedLength> TryResolveMergeBound(const LoopBound& bound);
