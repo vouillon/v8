@@ -805,6 +805,70 @@ function truncatedStatements(arr) {
   return result;
 }
 
+// A 64-bit value {X}, and a 32-bit value {e} equal to its truncation,
+// which accesses use: {w} or an extension of a 32-bit value, possibly
+// plus a constant.
+function randomWide() {
+  let d = smallOffset();
+  if (chance(3)) {
+    return chance(2) ? {X: w64(), e: wrap(w64())}
+                     : {X: binop64('add', w64(), const64(d)),
+                        e: index(wrap(w64()), d)};
+  }
+  let v = pick([local('p'), local('q'),
+                binop('and', local('p'), constant(15))]);
+  let x = extend(v, chance(2));
+  switch (random(3)) {
+    case 0: return {X: x, e: v};
+    case 1: return {X: binop64('add', x, const64(d)), e: index(v, d)};
+    default: return {X: binop64('sub', x, const64(-d)), e: index(v, d)};
+  }
+}
+
+// A 64-bit comparison {X < zext(a.length - r)} (or {<=}), unsigned, as
+// languages with 64-bit integers compare indices with lengths: it shows
+// that {X} is less than 2^32, and so is the same as the comparison of
+// its truncation {e} ([narrowed-comparison]). Accesses at {e + k} follow
+// when it holds, in a branch, or after returning when it does not hold
+// (as wasm_of_ocaml does with {X >= zext(a.length - 1)}). Near misses:
+// signed comparisons, and sign-extended lengths.
+function narrowedStatements(arr) {
+  let {X, e} = randomWide();
+  if (chance(4)) {
+    // {X < zext(c)} with a constant {c} below 2^31 shows that {trunc(X)}
+    // is non-negative, so that a signed check {trunc(X) < a.length} is
+    // a bounds check. A sign-extended constant {c >= 2^31} is a near miss:
+    // {X} can then be 2^32 or more.
+    let c = pick([0x7fffffff, 0x80000000, 0x80000001, 8]);
+    let d = smallOffset();
+    return [{k: 'if',
+             c: {k: 'cmp64', op: pick(['lt_u', 'le_u']), l: X,
+                 r: extend(constant(c), chance(2))},
+             then: [{k: 'if', c: relation('lt_s', index(e, d), len(arr)),
+                     then: [access(arr, index(e, d))], else: []}],
+             else: []}];
+  }
+  let r = pick([0, 0, 1, 2]);
+  let bound = extend(lengthMinus(arr, r), chance(6));
+  let op = chance(6) ? pick(['lt_s', 'le_s']) : pick(['lt_u', 'le_u']);
+  let accesses = [];
+  for (let k = 1 + random(3); k > 0; k--) {
+    accesses.push(access(arr, index(e, random(r + 1))));
+  }
+  switch (random(3)) {
+    case 0:
+      return [{k: 'if', c: {k: 'cmp64', op, l: X, r: bound},
+               then: accesses, else: []}];
+    case 1:
+      return [{k: 'if', c: {k: 'cmp64', op: kSwapped[op], l: bound, r: X},
+               then: accesses, else: []}];
+    default:
+      return [{k: 'if', c: {k: 'cmp64', op: kNegated[op], l: X, r: bound},
+               then: [{k: 'return'}], else: []},
+              ...accesses];
+  }
+}
+
 // A function that computes a few base expressions several times (see
 // {randomBaseExpression}), and accesses arrays at small offsets of them,
 // in guarded accesses, merges and loops, possibly with stores in between.
@@ -826,6 +890,11 @@ function randomCanonicalFunction() {
     for (let n = 0; n < count; n++) {
       if (chance(8)) {
         result.push(...truncatedStatements(arr));
+        continue;
+      }
+      // As in wasm_of_ocaml's bounds checks, which are 64-bit.
+      if (chance(5)) {
+        result.push(...narrowedStatements(arr));
         continue;
       }
       if (chance(6)) {
@@ -996,6 +1065,9 @@ function emitExpression(e, array) {
       return [kExprLocalGet, kLocals.u, kGCPrefix, kExprStructGet, struct, 0];
     case 'wrap':
       return [...emitExpression64(e.e, array), kExprI32ConvertI64];
+    case 'cmp64':
+      return [...emitExpression64(e.l, array), ...emitExpression64(e.r, array),
+              kComparisons64[e.op]];
     case 'high':
       // The high half of {e} extended to 64 bits.
       return [...emitExpression(e.e, array),
@@ -1006,6 +1078,10 @@ function emitExpression(e, array) {
 }
 
 const kBinops64 = {add: kExprI64Add, sub: kExprI64Sub, mul: kExprI64Mul};
+const kComparisons64 = {
+  lt_s: kExprI64LtS, lt_u: kExprI64LtU, le_s: kExprI64LeS, le_u: kExprI64LeU,
+  gt_s: kExprI64GtS, gt_u: kExprI64GtU, ge_s: kExprI64GeS, ge_u: kExprI64GeU,
+};
 
 function emitExpression64(e, array) {
   switch (e.k) {
@@ -1127,6 +1203,9 @@ function printExpression(e) {
     case 'aget': return `${e.arr}[${printExpression(e.idx)}]`;
     case 'sget': return 'u.f';
     case 'wrap': return `trunc(${printExpression64(e.e)})`;
+    case 'cmp64':
+      return `(${printExpression64(e.l)} ${kOperators[e.op]} ` +
+             `${printExpression64(e.r)})`;
     case 'high':
       return `high${e.signed ? '_s' : '_u'}(${printExpression(e.e)})`;
   }
