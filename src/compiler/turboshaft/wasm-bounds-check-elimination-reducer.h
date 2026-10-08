@@ -882,9 +882,15 @@ using MinLengthMap = KeyedSnapshotTable<OpIndex, uint32_t>;
 // to, when this is only known in part of the graph (see
 // {ProcessLoopHeader}). The ArrayLength operation may be an input of a
 // merge phi, and then does not dominate the uses of the alias. Facts
-// about the array learnt from it are still sound, since they are about
-// values, but it can only be used by the guard of a fallback sequence
-// where it is available (see {ProcessBoundsCheck}).
+// learnt from it (bounds checks and min lengths of the length) are
+// still sound: they hold when they are recorded (see
+// {TryResolveMergeBound}), and they remain true in the blocks dominated
+// by the point where they are recorded, although their leaves (see
+// {CanonicalValue}) do not dominate it. These leaves are not defined in
+// blocks dominated by the merge block of the alias, which dominates
+// that point, so they are not computed again before such blocks are
+// reached. The ArrayLength operation can only be used by the guard of a
+// fallback sequence where it is available (see {ProcessBoundsCheck}).
 using LengthAliasMap = KeyedSnapshotTable<OpIndex, ReducedLength>;
 
 // A sequence of instructions of a block, for which the reducer emits:

@@ -102,9 +102,10 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
   // predecessor snapshots. By induction, the ancestors of the snapshot
   // of a block are snapshots of blocks that dominate it, so this common
   // ancestor is the snapshot of a block that dominates all the (forward)
-  // predecessors, and thus the current block: facts known at the start
-  // of a block were recorded in its dominators, as {CanonicalValue}
-  // requires.
+  // predecessors, and thus the current block (for a loop header, as it
+  // dominates its back edge, any path to it enters it first from its
+  // forward predecessor): facts known at the start of a block were
+  // recorded in its dominators, as {CanonicalValue} requires.
   known_bounds_checks_.StartNewSnapshot(
       base::VectorOf(predecessor_bounds_check_snapshots_));
   known_non_negative_offsets_.StartNewSnapshot(
@@ -770,15 +771,26 @@ bool WasmBoundsCheckEliminationAnalyzer::Dominates(const Block* dominator,
 //
 // These facts are recorded at the header, so they must hold whenever the
 // header is executed, which is shown by induction on the iterations.
+// The invariant may be stronger than the facts recorded: for a
+// not-equal bound, it is {0 <= i <= x}, while only {0 <= i} is recorded
+// when {x} is not an array length minus a constant, and {0 <= i} alone
+// is not preserved ({i != x} does not prevent {i + 1} from
+// overflowing). The induction covers all the facts recorded at the
+// header together, in the order in which they are recorded: later phis
+// of the header may use facts recorded for earlier ones (length aliases
+// and min lengths, see {ProcessDecreasingInduction}).
 // When the loop is entered, {i} is {c0}, which is non-negative, and at
 // most {x} for a not-equal bound (see {EntryLowerBound}). When the back
-// edge is taken, the conditions collected below held when they were
-// tested: they are the branch conditions of the dominators of the back
-// edge within the loop (branch targets have a single predecessor). The
-// value of {i} they tested is the current one, since the header, where
-// {i} is defined, is not executed again before the back edge. This
-// value satisfied the facts (induction hypothesis), and the lemmas show
-// that {i + c}, the value of {i} at the next iteration, does too. For a
+// edge is taken, the conditions collected below hold: they are the
+// branch conditions of the dominators of the back edge within the loop
+// (branch targets have a single predecessor), read from the graph, not
+// from the tables of facts. They held when they were tested, and still
+// hold at the back edge, as their operands are not computed again in
+// between: they are computed in dominators of the branch, and the
+// header, where {i} is defined, is not executed again before the back
+// edge (see {CanonicalValue}). The current value of {i} satisfied the
+// invariant (induction hypothesis), and the lemmas show that {i + c},
+// the value of {i} at the next iteration, does too. For a
 // small bound, the lemmas hold for any value of {x}, so {x} can change
 // in the loop. For a not-equal bound, {x} must be the same as when
 // entering the loop, so it must be computed before the loop (see
@@ -858,8 +870,13 @@ WasmBoundsCheckEliminationAnalyzer::TryMatchInductionVariable(
 // ([induction-not-equal-bounds]).
 //
 // As for increasing loops (see {ProcessLoopHeader}), these facts hold
-// whenever the header is executed, by induction on the iterations. When
-// the loop is entered, {i} is {i0}, which is non-negative (see
+// whenever the header is executed, by induction on the iterations, with
+// the invariant {0 <= i <= i0}, and also {y <= i} for a not-equal bound.
+// {i0} may be an array length minus a constant only known from a length
+// alias, or have a lower bound only known from a min length, recorded
+// at the header for an earlier phi (see {RecordLoopBound}): these facts
+// are part of the same induction, recorded before. When the loop is
+// entered, {i} is {i0}, which is non-negative (see
 // {EntryLowerBoundOfStart}), and at least {y} for a not-equal bound,
 // since {y <= i0} then. When the back edge is taken, the conditions
 // collected at the header, including the values known to be different
@@ -1122,7 +1139,10 @@ std::optional<int64_t> WasmBoundsCheckEliminationAnalyzer::EntryLowerBound(
 // iteration was peeled, from the conditions on {x} or, when {x} is an
 // array length, from its min length: if {x} is at least {lo} with
 // {lo + o >= 0}, then {x + o} does not wrap around, and is at least
-// {lo + o} ([entry-lower-bound-offset]).
+// {lo + o} ([entry-lower-bound-offset]). The min length is the one known
+// at the header, which may come from facts recorded there for an earlier
+// phi (see {RecordLoopBound}): these hold whenever the header is
+// executed, in particular when the loop is entered.
 std::optional<int64_t>
 WasmBoundsCheckEliminationAnalyzer::EntryLowerBoundOfStart(
     OpIndex init, const Block* forward) const {
@@ -1200,14 +1220,18 @@ void WasmBoundsCheckEliminationAnalyzer::RecordLoopBound(
 // through {forward}). When {forward} was last executed, the conditions
 // dominating it held, so {x} was at least {x_lower_bound}, and that
 // execution of {m} took the edge of the remaining input, which then
-// had the value of {l} plus a constant. Neither {l} nor its array is
+// had the value of {l} plus a constant. None of the leaves of the
+// canonical value of {l} (see {CanonicalValue}: its array, possibly
+// behind casts, or the replacement of {l} by load elimination) is
 // computed again before {b}. Otherwise, as {m} is not a loop header, it
-// does not dominate the block {d} where they are computed ({d} dominates
-// the predecessor of {m} for the remaining input). There would then be
-// a path to {d} that avoids {m}, followed by a path from {d} to {b}
-// that avoids {m}, while {m} dominates {b}. So in {b}, {x} is {l} minus
-// a constant, for the current values of {l} and of its array, which is
-// what facts about the array refer to.
+// does not dominate the block {d} where such a leaf is computed ({d}
+// dominates the predecessor of {m} for the remaining input, which {m}
+// does not dominate), including when {d} would be {m} itself. There
+// would then be a path to {d} that avoids {m}, followed by a path from
+// {d} to {b} that avoids {m}, while {m} dominates {b}. So in {b}, {x} is
+// {l} minus a constant, for the value of {l} computed from the current
+// values of these leaves, which is what facts about the length refer to
+// (they are keyed by its canonical value).
 std::optional<ReducedLength>
 WasmBoundsCheckEliminationAnalyzer::TryResolveMergeBound(
     const LoopBound& bound) {
@@ -1486,14 +1510,29 @@ WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
 // and is what the output graph computes.
 //
 // Facts about canonical values are sound because a fact recorded at a
-// point {p} is only used at points {q} dominated by {p}. The operations
-// whose canonical value is not structural (phis, loads, parameters...)
-// used at {p} are defined in dominators of {p}, and so are not executed
-// again between the last execution of {p} and {q} (otherwise, there
-// would be a path to {q} avoiding {p}). A value used at {q} with the
-// same canonical value is computed from these same operations, and so
-// is equal to the value used at {p}. In particular, phis are never
-// looked through.
+// point {p} is only used at points {q} dominated by {p} (see
+// {BeginBlock}), and none of its leaves (the operations whose canonical
+// value is not structural: phis, loads, parameters...) is defined at a
+// point strictly dominated by {p}. Such a leaf is then not executed
+// again between the last execution of {p} and {q}: as {p} does not
+// dominate it, there is a path to it that avoids {p}, which, followed
+// by the execution from the leaf to {q}, would reach {q} without going
+// through {p}. Usually, the leaves of a fact are defined in dominators
+// of {p}, but those of a fact learnt from a length alias are not (see
+// {LengthAliasMap}). By induction on canonical values, a value used at
+// {q} (and so computed in a dominator of {q}) is equal to its canonical
+// value, computed from the current values of its leaves, and so two
+// values used at {q} with the same canonical value are equal. This
+// holds with the representatives of structural keys, and with the
+// depth limit below, whose cut-off values are leaves, computed in
+// dominators of the values that use them. The canonical value of a
+// truncation {trunc(X)} to 32 bits may instead be the canonical value
+// of its 64-bit input {X} (see {TruncationKey}): the truncation is then
+// equal to the truncation of its canonical value, which is enough, as
+// the options of structural keys include the representations of their
+// inputs, so that no other 32-bit value, and no operation not using a
+// truncation of {X}, has the same canonical value as one using it. In
+// particular, phis are never looked through.
 OpIndex WasmBoundsCheckEliminationAnalyzer::CanonicalValue(OpIndex value,
                                                            int depth) const {
   // Bound the depth of the recursion. Deeper values are their own
