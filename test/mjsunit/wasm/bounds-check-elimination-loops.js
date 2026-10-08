@@ -51,9 +51,9 @@ function chance(n) {
 // bound), j (inner loop variable), count and jcount (iterations left in
 // the loops, which count down so that they are not induction variables
 // themselves), acc (result), c (an array allocated by the function), and
-// s, t, u (structs: u is s or t).
+// s, t, u (structs: u is s or t), and w (a 64-bit integer).
 const kLocals = {a: 0, b: 1, p: 2, q: 3, i: 4, x: 5, j: 6, count: 7,
-                 jcount: 8, acc: 9, c: 10, s: 11, t: 12, u: 13};
+                 jcount: 8, acc: 9, c: 10, s: 11, t: 12, u: 13, w: 14};
 
 // Expressions (all i32).
 const constant = (v) => ({k: 'const', v: v | 0});
@@ -728,6 +728,83 @@ function recompute(e, near_miss) {
   }
 }
 
+// 64-bit expressions: {e} extended to 64 bits, the local {w}, binary
+// operations, and constants (BigInts).
+const extend = (e, signed) => ({k: 'extend', e, signed});
+const w64 = () => ({k: 'w64'});
+const binop64 = (op, l, r) => ({k: 'binop64', op, l, r});
+const const64 = (v) => ({k: 'const64', v: BigInt.asIntN(64, BigInt(v))});
+const wrap = (e) => ({k: 'wrap', e});
+
+// {trunc(w + d)}, written in various ways, where the constant may have
+// high bits, which the truncation discards ([truncated-addition]).
+function truncatedIndex(d) {
+  let c = BigInt(d) + (chance(6) ? BigInt(pick([1, -1, 3])) << 32n : 0n);
+  switch (random(4)) {
+    case 0: return wrap(binop64('add', const64(c), w64()));
+    case 1: return wrap(binop64('sub', w64(), const64(-c)));
+    default:
+      return d == 0 && chance(2) ? wrap(w64())
+                                 : wrap(binop64('add', w64(), const64(c)));
+  }
+}
+
+// Statements accessing {arr} at truncations of 64-bit additions to {w}:
+// {trunc(w + d)} is {trunc(w) + d}, when an operation computing
+// {trunc(w)} exists before. Near misses ({trunc(d - w)}, {trunc(w * 2)})
+// are not such additions.
+function truncatedStatements(arr) {
+  let result = [access(arr, wrap(w64()))];
+  for (let n = 1 + random(4); n > 0; n--) {
+    switch (random(5)) {
+      case 0: case 1: {
+        let d = smallOffset();
+        let r = pick([0, 0, 1, 2]);
+        let then = [];
+        for (let k = 1 + random(3); k > 0; k--) {
+          then.push(access(arr, truncatedIndex(d + random(r + 2))));
+        }
+        result.push({k: 'if', c: relation(pick(['lt_u', 'lt_s']),
+                                          truncatedIndex(d),
+                                          lengthMinus(arr, r)),
+                     then, else: []});
+        break;
+      }
+      case 2:
+        result.push(access(arr, truncatedIndex(smallOffset())));
+        break;
+      case 3:
+        result.push(access(arr, wrap(chance(2)
+            ? binop64('sub', const64(smallOffset()), w64())
+            : binop64('mul', w64(), const64(2)))));
+        break;
+      default:
+        // A loop in a single block, whose exit condition computes
+        // {trunc(w)} after accesses at {trunc(w + d)}: the analysis
+        // sees the condition at the loop header (because of the
+        // induction variable {i}), before the accesses, but the
+        // operation computing {trunc(w)} comes after them, so it cannot
+        // be used as their base (in particular by the guard of a
+        // fallback sequence covering them).
+        let accesses = [];
+        for (let k = 2 + random(3), d = 1; k > 0; k--, d += random(2)) {
+          accesses.push(access(arr, truncatedIndex(d)));
+        }
+        result.push(
+            set('i', constant(0)),
+            {k: 'loop', label: 'tloop', body: [
+              ...accesses,
+              set('j', relation('lt_s', wrap(w64()), len(arr))),
+              {k: 'set64', e: binop64('add', w64(), const64(1))},
+              set('i', index(local('i'), 1)),
+              brIf('tloop', local('j')),
+            ]});
+        break;
+    }
+  }
+  return result;
+}
+
 // A function that computes a few base expressions several times (see
 // {randomBaseExpression}), and accesses arrays at small offsets of them,
 // in guarded accesses, merges and loops, possibly with stores in between.
@@ -747,6 +824,10 @@ function randomCanonicalFunction() {
     let result = [];
     let count = 2 + random(4);
     for (let n = 0; n < count; n++) {
+      if (chance(8)) {
+        result.push(...truncatedStatements(arr));
+        continue;
+      }
       if (chance(6)) {
         // A condition combining a bounds check with another condition:
         // when {(e + d >= a.length) | c} does not hold, {e + d} is within
@@ -840,6 +921,9 @@ function randomCanonicalFunction() {
     {k: 'snew', n: 's', value: binop('and', local('p'), constant(7))},
     {k: 'snew', n: 't', value: constant(random(8))},
     {k: 'salias', c: local('q')},
+    {k: 'set64', e: extend(pick([local('p'), local('q'),
+                                 binop('and', local('p'), constant(15))]),
+                           chance(2))},
     ...statements(0, false),
   ];
 }
@@ -910,6 +994,8 @@ function emitExpression(e, array) {
               kGCPrefix, kExprArrayGet, array];
     case 'sget':
       return [kExprLocalGet, kLocals.u, kGCPrefix, kExprStructGet, struct, 0];
+    case 'wrap':
+      return [...emitExpression64(e.e, array), kExprI32ConvertI64];
     case 'high':
       // The high half of {e} extended to 64 bits.
       return [...emitExpression(e.e, array),
@@ -917,6 +1003,24 @@ function emitExpression(e, array) {
               ...wasmI64Const(32), kExprI64ShrU, kExprI32ConvertI64];
   }
   throw new Error(`unknown expression ${e.k}`);
+}
+
+const kBinops64 = {add: kExprI64Add, sub: kExprI64Sub, mul: kExprI64Mul};
+
+function emitExpression64(e, array) {
+  switch (e.k) {
+    case 'extend':
+      return [...emitExpression(e.e, array),
+              e.signed ? kExprI64SConvertI32 : kExprI64UConvertI32];
+    case 'w64':
+      return [kExprLocalGet, kLocals.w];
+    case 'binop64':
+      return [...emitExpression64(e.l, array), ...emitExpression64(e.r, array),
+              kBinops64[e.op]];
+    case 'const64':
+      return wasmI64Const(e.v);
+  }
+  throw new Error(`unknown 64-bit expression ${e.k}`);
 }
 
 function emitStatements(statements, array, labels) {
@@ -967,6 +1071,9 @@ function emitStatements(statements, array, labels) {
         for (let n = 0; n < s.count; n++) code.push(...wasmI32Const(n));
         code.push(kGCPrefix, kExprArrayNewFixed, array, s.count,
                   kExprLocalSet, kLocals.c);
+        break;
+      case 'set64':
+        code.push(...emitExpression64(s.e, array), kExprLocalSet, kLocals.w);
         break;
       case 'snew':
         code.push(...emitExpression(s.value, array), kGCPrefix, kExprStructNew,
@@ -1019,8 +1126,21 @@ function printExpression(e) {
              `${printExpression(e.e)})`;
     case 'aget': return `${e.arr}[${printExpression(e.idx)}]`;
     case 'sget': return 'u.f';
+    case 'wrap': return `trunc(${printExpression64(e.e)})`;
     case 'high':
       return `high${e.signed ? '_s' : '_u'}(${printExpression(e.e)})`;
+  }
+}
+
+function printExpression64(e) {
+  switch (e.k) {
+    case 'extend':
+      return `extend${e.signed ? '_s' : '_u'}(${printExpression(e.e)})`;
+    case 'w64': return 'w';
+    case 'binop64':
+      return `(${printExpression64(e.l)} ${kOperators[e.op]} ` +
+             `${printExpression64(e.r)})`;
+    case 'const64': return `${e.v}L`;
   }
 }
 
@@ -1060,6 +1180,9 @@ function printStatements(statements, indent = '  ') {
         break;
       case 'newfixed':
         lines.push(`${indent}c = new_fixed T[${s.count}];`);
+        break;
+      case 'set64':
+        lines.push(`${indent}w = ${printExpression64(s.e)};`);
         break;
       case 'snew':
         lines.push(`${indent}${s.n} = new S(${printExpression(s.value)});`);
@@ -1127,6 +1250,7 @@ for (let f = 0; f < kFunctionCount; f++) {
     .addLocals(kWasmI32, 6)
     .addLocals(wasmRefNullType(array), 1)
     .addLocals(wasmRefNullType(struct), 3)
+    .addLocals(kWasmI64, 1)
     .addBody([...emitStatements(statements, array, []),
               kExprLocalGet, kLocals.acc])
     .exportFunc();
