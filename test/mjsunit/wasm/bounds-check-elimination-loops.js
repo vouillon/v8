@@ -50,9 +50,10 @@ function chance(n) {
 // Locals: parameters a, b (arrays), p, q, then i (loop variable), x (its
 // bound), j (inner loop variable), count and jcount (iterations left in
 // the loops, which count down so that they are not induction variables
-// themselves), acc (result), and c (an array allocated by the function).
+// themselves), acc (result), c (an array allocated by the function), and
+// s, t, u (structs: u is s or t).
 const kLocals = {a: 0, b: 1, p: 2, q: 3, i: 4, x: 5, j: 6, count: 7,
-                 jcount: 8, acc: 9, c: 10};
+                 jcount: 8, acc: 9, c: 10, s: 11, t: 12, u: 13};
 
 // Expressions (all i32).
 const constant = (v) => ({k: 'const', v: v | 0});
@@ -262,6 +263,40 @@ function randomStatements(iv, labels, depth, guarded_only = false) {
   return statements;
 }
 
+// A function from {randomLoopFunction}. When the bound {x} is a merge
+// phi, the loop may be in a branch, after which {x} is used: the length
+// alias for {x} only holds in the loop and the blocks it dominates, not
+// after the merge, where {x} may come from the constant input of the phi.
+function randomFunction() {
+  let state = {};
+  let statements = randomLoopFunction(state);
+  if (!state.phi || chance(2)) return statements;
+  let [setX, ...loop] = statements;
+  return [
+    setX,
+    // Accesses showing a minimal length of {a}, which conditions on {x}
+    // (seen as {a.length - r}) need.
+    ...burst('a', constant(0), 1),
+    // The loop is in either branch: the analysis visits one before the
+    // other.
+    chance(2)
+        ? {k: 'if', c: pick([local('q'), cmp('lt_s', local('p'), constant(3))]),
+           then: burst('a', local('p'), 0), else: loop}
+        : {k: 'if', c: pick([local('q'), cmp('lt_s', local('p'), constant(3))]),
+           then: loop, else: burst('a', local('p'), 0)},
+    // With {x} from the constant input, {x} is negative, so {k <u x}
+    // holds: it shows that {k} is within bounds only if {x} is the array
+    // length minus a constant.
+    ...(() => {
+      let k = random(6);
+      return [{k: 'if', c: relation(pick(['lt_u', 'le_u', 'lt_s']),
+                                    constant(k), local('x')),
+               then: [access('a', constant(k))], else: []}];
+    })(),
+    ...randomStatements('i', {}, 0),
+  ];
+}
+
 // Ways for a function to differ from a loop that the analysis should
 // recognize. Each one is applied with probability 1/10.
 const kMutations = ['init', 'step', 'bound', 'op', 'inline', 'guard',
@@ -283,7 +318,8 @@ const kMutations = ['init', 'step', 'bound', 'op', 'inline', 'guard',
 // which {i + step} cannot overflow, or with an array length minus a
 // constant, compared in any way: {i} then overflows within a few
 // iterations when the bound does not prevent it.
-function randomFunction() {
+// {state.phi} is set when the bound is a merge phi.
+function randomLoopFunction(state) {
   let mutations = new Set(kMutations.filter(() => chance(10)));
   let kind = pick(['while', 'while', 'ne', 'ne', 'ne', 'dowhile']);
   let high = kind == 'while' && chance(6);
@@ -340,6 +376,7 @@ function randomFunction() {
           ? phiBound(pick([3, 0x7fffffff, 1]), pick([0, -1, 1]))
           : phiBound(0, pick([1, 1, 2]));
       ops = ['lt_s'];
+      state.phi = true;
       break;
   }
   let op = mutations.has('op')
@@ -633,6 +670,180 @@ function randomAllocationFunction() {
   ];
 }
 
+// A base expression for {randomCanonicalFunction}, over the parameters
+// {p} and {q}, or over {iv} (a loop variable) in loops.
+function randomBaseExpression(iv) {
+  let operand = () => pick([local(iv), local(iv), local('q'),
+                            constant(pick([3, 7, 15, -16]))]);
+  switch (random(6)) {
+    case 0: case 1:
+      return binop(pick(['and', 'or', 'xor', 'sub', 'mul']), local(iv),
+                   operand());
+    case 2:
+      return binop(pick(['shl', 'shr_s', 'shr_u']), local(iv),
+                   chance(2) ? constant(1 + random(3)) : local('q'));
+    case 3:
+      return {k: 'select',
+              c: pick([local('q'), cmp('lt_s', local(iv), constant(3)),
+                       {k: 'isnull', arr: 'b'}]),
+              t: local(iv), e: local('q')};
+    case 4:
+      return chance(2) ? {k: 'aget', arr: 'b', idx: constant(random(3))}
+                       : {k: 'sget'};
+    default:
+      return {k: 'high', signed: chance(2), e: local(iv)};
+  }
+}
+
+const kSameKind = [['and', 'or', 'xor'], ['shl', 'shr_s', 'shr_u']];
+const kCommutative = ['and', 'or', 'xor', 'mul', 'add'];
+
+// The expression {e} computed again: the same value, possibly written
+// differently (commuted), or, if {near_miss}, a close but different one
+// (another operation of the same kind, swapped operands, another
+// condition, the other extension). An element of an array or the field
+// of a struct is loaded again, and may have changed in between.
+function recompute(e, near_miss) {
+  switch (e.k) {
+    case 'binop': {
+      if (!near_miss) {
+        return kCommutative.includes(e.op) && chance(2)
+            ? binop(e.op, e.r, e.l) : binop(e.op, e.l, e.r);
+      }
+      let kinds = kSameKind.find(kinds => kinds.includes(e.op));
+      if (kinds && chance(3)) {
+        return binop(pick(kinds.filter(op => op != e.op)), e.l, e.r);
+      }
+      return e.op == 'sub' || e.op == 'shl' ? binop(e.op, e.r, e.l)
+          : binop(e.op == 'mul' ? 'add' : 'sub', e.l, e.r);
+    }
+    case 'select':
+      if (!near_miss) return {...e};
+      return chance(2) ? {...e, t: e.e, e: e.t}
+                       : {...e, c: eqz(e.c)};
+    case 'high':
+      return {...e, signed: near_miss ? !e.signed : e.signed};
+    default:
+      return {...e};
+  }
+}
+
+// A function that computes a few base expressions several times (see
+// {randomBaseExpression}), and accesses arrays at small offsets of them,
+// in guarded accesses, merges and loops, possibly with stores in between.
+// The analysis identifies equal computations (see {CanonicalValue}), so
+// facts shown for one of them are used for the others, which must
+// compute the same value. Near misses (see {recompute}) must not be
+// identified.
+function randomCanonicalFunction() {
+  let bases = [randomBaseExpression('p')];
+  if (chance(2)) bases.push(randomBaseExpression('p'));
+  let near_miss = () => chance(4);
+  let use = () => recompute(pick(bases), near_miss());
+  let arr = chance(4) ? 'b' : 'a';
+  // Statements using the base expressions, in a loop over {i} when
+  // {in_loop}.
+  function statements(depth, in_loop) {
+    let result = [];
+    let count = 2 + random(4);
+    for (let n = 0; n < count; n++) {
+      if (chance(6)) {
+        // A condition combining a bounds check with another condition:
+        // when {(e + d >= a.length) | c} does not hold, {e + d} is within
+        // bounds, and when {(e + d < a.length) & c} holds, too.
+        let d = smallOffset();
+        let length = lengthMinus(arr, pick([0, 0, 1]));
+        let other = pick([local('q'), eqz(local('q')),
+                          cmp('lt_s', local('p'), constant(random(8)))]);
+        let c = chance(2)
+            ? binop('or', cmp('ge_u', index(use(), d), length), other)
+            : binop('and', cmp('lt_u', index(use(), d), length),
+                    cmp('lt_s', local('p'), constant(random(8))));
+        result.push({k: 'if', c,
+                     then: burst(arr, use(), d), else: burst(arr, use(), d)});
+        continue;
+      }
+      switch (random(depth < 2 ? 9 : 6)) {
+        case 0: case 1: {
+          // if (e + d < a.length - r) { accesses around e' + d }
+          let d = smallOffset();
+          let r = pick([0, 0, 1, 2]);
+          let c = relation(pick(['lt_u', 'lt_u', 'lt_s', 'le_s']),
+                           index(use(), d), lengthMinus(arr, r));
+          let then = [];
+          for (let k = 1 + random(3); k > 0; k--) {
+            then.push(access(chance(5) ? 'b' : arr,
+                             index(use(), d + random(r + 2))));
+          }
+          let otherwise = chance(2) ? [] : [access(arr, index(use(), d))];
+          result.push(chance(4) ? {k: 'if', c: eqz(c), then: otherwise,
+                                   else: then}
+                                : {k: 'if', c, then, else: otherwise});
+          break;
+        }
+        case 2:
+          result.push(access(chance(4) ? 'b' : arr,
+                             index(use(), smallOffset())));
+          break;
+        case 3:
+          // A store that may change an element or a field loaded by a
+          // base expression ({a} and {b} may be the same array, and {u}
+          // is {s} or {t}), with a small value, which can be an index.
+          result.push(chance(2)
+              ? {k: 'store', arr: pick(['a', 'b']), idx: constant(random(3)),
+                 value: random(8)}
+              : {k: 'sset', n: pick(['s', 't']), value: constant(random(8))});
+          break;
+        case 4:
+          if (in_loop) {
+            // Accesses at a base expression of the loop variable, so that
+            // facts from one iteration are about other values in the next
+            // one.
+            let e = randomBaseExpression('i');
+            result.push(access(arr, index(e, smallOffset())),
+                        access(arr, index(recompute(e, near_miss()),
+                                          smallOffset())));
+          } else {
+            result.push(set('acc', binop('xor', local('acc'),
+                                         constant(random(100)))));
+          }
+          break;
+        case 5:
+          result.push(...burst(arr, use(), smallOffset()));
+          break;
+        case 6: case 7:
+          // A merge: what is known after it is what both branches show.
+          result.push({k: 'if', c: pick([local('q'),
+                                         cmp('lt_s', local('p'), use())]),
+                       then: statements(depth + 1, in_loop),
+                       else: statements(depth + 1, in_loop)});
+          break;
+        default:
+          // for (i = 0; i < 4; i++) { ... }
+          result.push(
+              set('i', constant(0)),
+              {k: 'block', label: 'out', body: [{
+                k: 'loop', label: 'loop', body: [
+                  brIf('out', cmp('ge_s', local('i'), constant(4))),
+                  ...statements(depth + 1, true),
+                  set('i', index(local('i'), 1)),
+                  {k: 'br', label: 'loop'},
+                ]}]});
+          break;
+      }
+    }
+    return result;
+  }
+  // The structs: {s.f} and {t.f} are small values, and {u} is one of
+  // them, so that loads of {u.f} cannot be replaced by the values stored.
+  return [
+    {k: 'snew', n: 's', value: binop('and', local('p'), constant(7))},
+    {k: 'snew', n: 't', value: constant(random(8))},
+    {k: 'salias', c: local('q')},
+    ...statements(0, false),
+  ];
+}
+
 // Replaces {i + d} by {i + d + k} in the accesses and conditions of {s}.
 function shiftStatement(s, k) {
   function shift(e) {
@@ -664,7 +875,8 @@ function shiftStatement(s, k) {
 
 // Code generation.
 const kBinops = {add: kExprI32Add, sub: kExprI32Sub, xor: kExprI32Xor,
-                 and: kExprI32And};
+                 and: kExprI32And, or: kExprI32Ior, mul: kExprI32Mul,
+                 shl: kExprI32Shl, shr_s: kExprI32ShrS, shr_u: kExprI32ShrU};
 const kComparisons = {
   lt_s: kExprI32LtS, lt_u: kExprI32LtU, le_s: kExprI32LeS, le_u: kExprI32LeU,
   gt_s: kExprI32GtS, gt_u: kExprI32GtU, ge_s: kExprI32GeS, ge_u: kExprI32GeU,
@@ -693,6 +905,16 @@ function emitExpression(e, array) {
       return [...emitExpression(e.c, array), kExprIf, kWasmI32,
               ...emitExpression(e.t, array), kExprElse,
               ...emitExpression(e.e, array), kExprEnd];
+    case 'aget':
+      return [kExprLocalGet, kLocals[e.arr], ...emitExpression(e.idx, array),
+              kGCPrefix, kExprArrayGet, array];
+    case 'sget':
+      return [kExprLocalGet, kLocals.u, kGCPrefix, kExprStructGet, struct, 0];
+    case 'high':
+      // The high half of {e} extended to 64 bits.
+      return [...emitExpression(e.e, array),
+              e.signed ? kExprI64SConvertI32 : kExprI64UConvertI32,
+              ...wasmI64Const(32), kExprI64ShrU, kExprI32ConvertI64];
   }
   throw new Error(`unknown expression ${e.k}`);
 }
@@ -746,6 +968,21 @@ function emitStatements(statements, array, labels) {
         code.push(kGCPrefix, kExprArrayNewFixed, array, s.count,
                   kExprLocalSet, kLocals.c);
         break;
+      case 'snew':
+        code.push(...emitExpression(s.value, array), kGCPrefix, kExprStructNew,
+                  struct, kExprLocalSet, kLocals[s.n]);
+        break;
+      case 'sset':
+        code.push(kExprLocalGet, kLocals[s.n],
+                  ...emitExpression(s.value, array),
+                  kGCPrefix, kExprStructSet, struct, 0);
+        break;
+      case 'salias':
+        code.push(...emitExpression(s.c, array),
+                  kExprIf, kWasmRefNull, struct,
+                  kExprLocalGet, kLocals.s, kExprElse, kExprLocalGet, kLocals.t,
+                  kExprEnd, kExprLocalSet, kLocals.u);
+        break;
       case 'block':
       case 'loop':
         code.push(s.k == 'block' ? kExprBlock : kExprLoop, kWasmVoid,
@@ -761,7 +998,8 @@ function emitStatements(statements, array, labels) {
 
 // Pseudo-code, for debugging.
 const kOperators = {
-  add: '+', sub: '-', xor: '^', and: '&', lt_s: '<s', lt_u: '<u', le_s: '<=s',
+  add: '+', sub: '-', xor: '^', and: '&', or: '|', mul: '*', shl: '<<',
+  shr_s: '>>s', shr_u: '>>u', lt_s: '<s', lt_u: '<u', le_s: '<=s',
   le_u: '<=u', gt_s: '>s', gt_u: '>u', ge_s: '>=s', ge_u: '>=u', eq: '==',
   ne: '!=',
 };
@@ -779,6 +1017,10 @@ function printExpression(e) {
     case 'select':
       return `(${printExpression(e.c)} ? ${printExpression(e.t)} : ` +
              `${printExpression(e.e)})`;
+    case 'aget': return `${e.arr}[${printExpression(e.idx)}]`;
+    case 'sget': return 'u.f';
+    case 'high':
+      return `high${e.signed ? '_s' : '_u'}(${printExpression(e.e)})`;
   }
 }
 
@@ -819,6 +1061,15 @@ function printStatements(statements, indent = '  ') {
       case 'newfixed':
         lines.push(`${indent}c = new_fixed T[${s.count}];`);
         break;
+      case 'snew':
+        lines.push(`${indent}${s.n} = new S(${printExpression(s.value)});`);
+        break;
+      case 'sset':
+        lines.push(`${indent}${s.n}.f = ${printExpression(s.value)};`);
+        break;
+      case 'salias':
+        lines.push(`${indent}u = ${printExpression(s.c)} ? s : t;`);
+        break;
       case 'block':
       case 'loop':
         lines.push(`${indent}${s.k} ${s.label} {`,
@@ -839,7 +1090,8 @@ function randomInputs() {
   let inputs = {
     lengths: [pick(kLengths), pick(kLengths)],
     p: pick(kParams),
-    q: random(2),
+    // Mostly a flag, otherwise an operand of base expressions.
+    q: chance(2) ? random(2) : pick(kParams),
     same: chance(8),
     nulls: [chance(32), chance(16)],
   };
@@ -848,6 +1100,7 @@ function randomInputs() {
 
 let builder = new WasmModuleBuilder();
 let array = builder.addArray(kWasmI32);
+let struct = builder.addStruct([makeField(kWasmI32, true)]);
 builder.addFunction('make', makeSig([kWasmI32], [wasmRefType(array)]))
   .addBody([kExprLocalGet, 0, kGCPrefix, kExprArrayNewDefault, array])
   .exportFunc();
@@ -866,12 +1119,14 @@ let sig = makeSig([wasmRefNullType(array), wasmRefNullType(array),
 let functions = [];
 for (let f = 0; f < kFunctionCount; f++) {
   let statements = chance(4) ? randomDecreasingFunction()
+                 : chance(4) ? randomCanonicalFunction()
                  : chance(3) ? randomAllocationFunction()
                  : randomFunction();
   functions.push(statements);
   builder.addFunction(`f${f}`, sig)
     .addLocals(kWasmI32, 6)
     .addLocals(wasmRefNullType(array), 1)
+    .addLocals(wasmRefNullType(struct), 3)
     .addBody([...emitStatements(statements, array, []),
               kExprLocalGet, kLocals.acc])
     .exportFunc();
@@ -885,7 +1140,8 @@ function run(f, inputs) {
   let arrays = inputs.lengths.map((length, n) => {
     if (inputs.nulls[n]) return null;
     let a = exports.make(length);
-    for (let k = 0; k < length; k++) exports.set(a, k, 100 * (n + 1) + k);
+    // Small values, which can be indices.
+    for (let k = 0; k < length; k++) exports.set(a, k, (3 * k + n) % 7);
     return a;
   });
   if (inputs.same) arrays[1] = arrays[0];
