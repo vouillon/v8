@@ -1966,6 +1966,166 @@ TEST_F(WasmBoundsCheckEliminationReducerTest,
   ASSERT_GE(test.CountOp(Opcode::kTrapIf), 2u);
 }
 
+// A 64-bit value whose low 32 bits are {low} and high 32 bits are {high}.
+template <typename Asm_t>
+static V<Word64> Wide(Asm_t& Asm, V<Word32> low, V<Word32> high) {
+  return __ Word64BitwiseOr(
+      __ ChangeUint32ToUint64(low),
+      __ Word64ShiftLeft(__ ChangeUint32ToUint64(high), 32));
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedOCamlBoundsCheck) {
+  // a[0]; if (zext(a.length - 1) <=u x) fail; a[trunc(x) + 1];
+  // The OCaml bounds check of a 64-bit index {x} shows that {x} is less
+  // than 2^32, and that {trunc(x) < a.length - 1}.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = Wide(Asm, i, c);
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm, __ Uint64LessThanOrEqual(
+                    __ ChangeUint32ToUint64(ReducedLength(Asm, a, 1)), x));
+    BoundsCheck(Asm, a, __ TruncateWord64ToWord32(x), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedNonStrictComparison) {
+  // a[0]; if (x >u zext(a.length - 1)) fail; a[trunc(x)];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = Wide(Asm, i, c);
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm, __ Uint64LessThan(
+                    __ ChangeUint32ToUint64(ReducedLength(Asm, a, 1)), x));
+    BoundsCheck(Asm, a, __ TruncateWord64ToWord32(x), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedExtendedIndex) {
+  // if (zext(a.length) <=u zext(i) + 1) fail; a[i+1];
+  // This needs no min length, unlike {i <u a.length - 1}.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Uint64LessThanOrEqual(
+                    __ ChangeUint32ToUint64(length),
+                    __ Word64Add(__ ChangeUint32ToUint64(i),
+                                 __ Word64Constant(uint64_t{1}))));
+    BoundsCheck(Asm, a, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedSignExtendedIndex) {
+  // if (zext(a.length) <=u sext(i) + 1) fail; a[i+1];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Uint64LessThanOrEqual(
+                    __ ChangeUint32ToUint64(length),
+                    __ Word64Add(__ ChangeInt32ToInt64(i),
+                                 __ Word64Constant(uint64_t{1}))));
+    BoundsCheck(Asm, a, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedSignedComparison) {
+  // b[trunc(x)]; if (zext(a.length) <=s x) fail; a[trunc(x)];
+  // A negative {x} passes the signed test, whatever {trunc(x)} is (and
+  // the first access shows that it is non-negative).
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = Wide(Asm, i, c);
+    BoundsCheck(Asm, b, __ TruncateWord64ToWord32(x), 0);
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Int64LessThanOrEqual(__ ChangeUint32ToUint64(length), x));
+    BoundsCheck(Asm, a, __ TruncateWord64ToWord32(x), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedWithoutZeroExtension) {
+  // if (sext(a.length) <=u x) fail; a[trunc(x)];
+  // Only a zero-extended right side is recognized.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = Wide(Asm, i, c);
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Uint64LessThanOrEqual(__ ChangeInt32ToInt64(length), x));
+    BoundsCheck(Asm, a, __ TruncateWord64ToWord32(x), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedNotHolding) {
+  // if (x <u zext(5)) fail; a[4]; with x = zext(a.length) + 2^32
+  // {zext(5) <=u x} holds for any length, and says nothing about
+  // {trunc(x)}, which is {a.length}: only the normalized relation, whose
+  // right side is {x}, may be narrowed.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    V<Word64> x = __ Word64Add(__ ChangeUint32ToUint64(length),
+                               __ Word64Constant(uint64_t{1} << 32));
+    FailIf(Asm,
+           __ Uint64LessThan(x, __ ChangeUint32ToUint64(__ Word32Constant(5))));
+    BoundsCheck(Asm, a, {}, 4);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedTrapIsKept) {
+  // a[i]; trap if !(x <u zext(a.length)); with trunc(x) = i
+  // The trap holds for {x >= 2^32} although {trunc(x) < a.length}.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = Wide(Asm, i, c);
+    BoundsCheck(Asm, a, __ TruncateWord64ToWord32(x), 0);
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    __ TrapIfNot(__ Uint64LessThan(x, __ ChangeUint32ToUint64(length)),
+                 TrapId::kTrapArrayOutOfBounds);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       NarrowedComparisonCreatesNoTruncation) {
+  // if (zext(a.length) <=u x) fail;
+  // a[trunc(x + 1)]; a[trunc(x + 2)]; a[trunc(x + 3)];
+  // No operation computes trunc(x), so it cannot be the base of the
+  // accesses, nor of the guard of a fallback sequence.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = Wide(Asm, i, c);
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    FailIf(Asm, __ Uint64LessThanOrEqual(__ ChangeUint32ToUint64(length), x));
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 2), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 3), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedLoopBound) {
+  // for (k = 0; zext(k) <u zext(a.length); k++) a[k];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    using Test = WasmBoundsCheckEliminationReducerTest;
+    Loop(
+        Asm, 0, 1,
+        [&](V<Word32> k) {
+          V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+          return __ Uint64LessThanOrEqual(__ ChangeUint32ToUint64(length),
+                                          __ ChangeUint32ToUint64(k));
+        },
+        [&](V<Word32> k) { Test::BoundsCheck(Asm, a, k, 0); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"
 
 }  // namespace v8::internal::compiler::turboshaft

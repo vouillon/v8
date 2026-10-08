@@ -101,6 +101,18 @@ namespace v8::internal::compiler::turboshaft {
 // that {a.length - r} is positive, and that {base + n <u a.length - r}.
 // Since array lengths are less than 2^30, {base + n} is non-negative
 // when some {base + m} is within bounds and {n - m} is at most 2^30.
+// Languages with 64-bit integers may compare a 64-bit index with the
+// zero-extended array length: {X <u zext(l)} (or {X <=u zext(l)}) shows
+// that {X} is less than 2^32, so that it is the same as
+// {trunc(X) <u l}. Such comparisons are taken into account as the
+// latter, reading {X} as its truncation, which is {x} for {zext(x)} or
+// {sext(x)}, and {trunc(Y) + n} for {Y + n}, so that {zext(i) + 1 <u
+// zext(a.length)} is the bounds check {i + 1 < a.length}. They only
+// show facts, and are never eliminated: when {X} is 2^32 or more, the
+// comparison fails while {trunc(X) <u l} may hold. Similarly, the index
+// {trunc(Y + n)} of an access is {trunc(Y) + n} when an operation
+// computing {trunc(Y)} already exists (for the index of a previous
+// access {a[trunc(Y)]}).
 // Branch conditions combining comparisons are also taken into account:
 // when {x | y} does not hold, neither {x} nor {y} holds, and when
 // {x & y} holds for two comparisons (whose values are 0 or 1), both
@@ -798,6 +810,21 @@ class OffsetRange {
 //                     (= ((_ extract 31 0) (bvsub x c))
 //                        (bvsub ((_ extract 31 0) x) ((_ extract 31 0) c))))))
 //   (check-sat)
+//
+// [narrowed-comparison] A 64-bit unsigned comparison of {X} with a
+// zero-extended {y} is the 32-bit comparison of the truncation of {X}
+// with {y}, and the truncation of an extension of {x} is {x}:
+//
+//   (declare-const X (_ BitVec 64))
+//   (declare-const y (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (assert (not (and (=> (bvult X ((_ zero_extend 32) y))
+//                         (bvult ((_ extract 31 0) X) y))
+//                     (=> (bvule X ((_ zero_extend 32) y))
+//                         (bvule ((_ extract 31 0) X) y))
+//                     (= ((_ extract 31 0) ((_ zero_extend 32) x)) x)
+//                     (= ((_ extract 31 0) ((_ sign_extend 32) x)) x))))
+//   (check-sat)
 
 // Maps keys of type {K} to values of type {V}. Supports snapshotting
 // for control flow merge points.
@@ -1130,6 +1157,7 @@ class WasmBoundsCheckEliminationAnalyzer {
         redundant_traps_(phase_zone),
         canonical_values_(phase_zone),
         values_by_structure_(phase_zone),
+        truncations_(phase_zone),
         fallback_sequence_starts_(phase_zone),
         known_bounds_checks_(phase_zone),
         known_non_negative_offsets_(phase_zone),
@@ -1205,6 +1233,10 @@ class WasmBoundsCheckEliminationAnalyzer {
     bool not_equal;
     OpIndex left;
     OpIndex right;
+    // A 64-bit comparison {left < zext(right)} or {left <= zext(right)}
+    // (unsigned), read as the 32-bit comparison of the truncation of
+    // {left} (a 64-bit value) with {right} (see {Normalize}).
+    bool narrowed = false;
 
     bool is_signed() const {
       return kind == ComparisonOp::Kind::kSignedLessThan ||
@@ -1386,7 +1418,12 @@ class WasmBoundsCheckEliminationAnalyzer {
   std::optional<uint32_t> TryExtractI32Const(OpIndex expr) const;
   std::optional<uint32_t> TryExtractI64ConstLow(OpIndex expr) const;
   static uint64_t ChangeOptions(const ChangeOp& change);
-  OpIndex ExistingTruncation(const ChangeOp& change, OpIndex x) const;
+  static uint64_t ChangeOptions(ChangeOp::Kind kind,
+                                ChangeOp::Assumption assumption,
+                                RegisterRepresentation from,
+                                RegisterRepresentation to);
+  OpIndex TruncationKey(OpIndex x) const;
+  OpIndex ExistingTruncation(OpIndex x) const;
 
   const Graph& graph_;
   Zone* phase_zone_;
@@ -1399,6 +1436,11 @@ class WasmBoundsCheckEliminationAnalyzer {
   // structure (the first operation found with this structure).
   mutable ZoneAbslFlatHashMap<OpIndex, OpIndex> canonical_values_;
   mutable ZoneAbslFlatHashMap<StructuralKey, OpIndex> values_by_structure_;
+  // The first TruncateWord64ToWord32 operation found for each canonical
+  // value of its input (see {ExistingTruncation}). The canonical value
+  // of the truncation may instead be a 64-bit operation, which must
+  // not be emitted (see {TruncationKey}).
+  mutable ZoneAbslFlatHashMap<OpIndex, OpIndex> truncations_;
 
   // Fallback sequences keyed by their start index.
   ZoneAbslFlatHashMap<OpIndex, FallbackInstructionSequence>

@@ -246,8 +246,10 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
       // including non-strict comparisons rewritten as strict ones (see
       // {TryExtractBoundsCheckCondition}), are only used for what they
       // show, even for a trap.
-      bool is_bounds_check =
-          relation->is_strict() && !is_signed && reduction == 0;
+      // Neither is a narrowed 64-bit comparison, which also fails when
+      // its 64-bit index is 2^32 or more.
+      bool is_bounds_check = relation->is_strict() && !is_signed &&
+                             reduction == 0 && !relation->narrowed;
       ProcessBoundsCheck(is_bounds_check ? trap_if : OpIndex::Invalid(),
                          bounds_check, base_value, array_length, reduction);
       // With {index < a.length - reduction}, the length is at least
@@ -701,32 +703,51 @@ WasmBoundsCheckEliminationAnalyzer::Normalize(OpIndex condition,
   using Kind = ComparisonOp::Kind;
   const ComparisonOp* comparison =
       graph_.Get(condition).TryCast<ComparisonOp>();
-  if (!comparison || comparison->rep != RegisterRepresentation::Word32()) {
+  if (!comparison || (comparison->rep != RegisterRepresentation::Word32() &&
+                      comparison->rep != RegisterRepresentation::Word64())) {
     return std::nullopt;
   }
-  if (holds) {
-    return Relation{comparison->kind, false, comparison->left(),
+  Relation relation{comparison->kind, false, comparison->left(),
                     comparison->right()};
+  if (!holds) {
+    switch (comparison->kind) {
+      case Kind::kEqual:
+        relation.not_equal = true;
+        break;
+      // !(a < b) is (b <= a), and !(a <= b) is (b < a).
+      case Kind::kSignedLessThan:
+        relation = Relation{Kind::kSignedLessThanOrEqual, false,
+                            comparison->right(), comparison->left()};
+        break;
+      case Kind::kSignedLessThanOrEqual:
+        relation = Relation{Kind::kSignedLessThan, false, comparison->right(),
+                            comparison->left()};
+        break;
+      case Kind::kUnsignedLessThan:
+        relation = Relation{Kind::kUnsignedLessThanOrEqual, false,
+                            comparison->right(), comparison->left()};
+        break;
+      case Kind::kUnsignedLessThanOrEqual:
+        relation = Relation{Kind::kUnsignedLessThan, false, comparison->right(),
+                            comparison->left()};
+        break;
+    }
   }
-  switch (comparison->kind) {
-    case Kind::kEqual:
-      return Relation{Kind::kEqual, true, comparison->left(),
-                      comparison->right()};
-    // !(a < b) is (b <= a), and !(a <= b) is (b < a).
-    case Kind::kSignedLessThan:
-      return Relation{Kind::kSignedLessThanOrEqual, false, comparison->right(),
-                      comparison->left()};
-    case Kind::kSignedLessThanOrEqual:
-      return Relation{Kind::kSignedLessThan, false, comparison->right(),
-                      comparison->left()};
-    case Kind::kUnsignedLessThan:
-      return Relation{Kind::kUnsignedLessThanOrEqual, false,
-                      comparison->right(), comparison->left()};
-    case Kind::kUnsignedLessThanOrEqual:
-      return Relation{Kind::kUnsignedLessThan, false, comparison->right(),
-                      comparison->left()};
+  if (comparison->rep == RegisterRepresentation::Word32()) return relation;
+  // A 64-bit comparison {X < zext(y)} or {X <= zext(y)} (unsigned) shows
+  // that {X} is less than 2^32, and is then the same as the comparison of
+  // {trunc(X)} with {y} ([narrowed-comparison]). This must be done on the
+  // normalized relation: when {X < zext(y)} does not hold, {zext(y) <= X}
+  // says nothing about {trunc(X)}. The left side remains {X}, which is
+  // read as its truncation (see {DecomposeIndex}).
+  if (relation.kind != Kind::kUnsignedLessThan &&
+      relation.kind != Kind::kUnsignedLessThanOrEqual) {
+    return std::nullopt;
   }
-  UNREACHABLE();
+  const ChangeOp* zext = graph_.Get(ResolveReplacements(relation.right))
+                             .TryCast<Opmask::kChangeUint32ToUint64>();
+  if (zext == nullptr) return std::nullopt;
+  return Relation{relation.kind, false, relation.left, zext->input(), true};
 }
 
 bool WasmBoundsCheckEliminationAnalyzer::Dominates(const Block* dominator,
@@ -1354,6 +1375,44 @@ WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
     if (auto constant = TryExtractI32Const(index)) {
       return {OpIndex::Invalid(), OpIndex::Invalid(), offset + *constant};
     }
+    // A 64-bit value {X}, the left side of a narrowed comparison (see
+    // {Normalize}), is read as its truncation to 32 bits: {trunc(n)} for
+    // a constant {n}, {x} for {zext(x)} or {sext(x)}
+    // ([narrowed-comparison]), {trunc(Y) + n} for {Y + n}
+    // ([truncated-addition]), and otherwise a value whose canonical value
+    // is the one of {trunc(X)} (see {TruncationKey}).
+    if (const Operation& wide = graph_.Get(index);
+        wide.outputs_rep().size() == 1 &&
+        wide.outputs_rep()[0] == RegisterRepresentation::Word64()) {
+      if (auto constant = TryExtractI64ConstLow(index)) {
+        return {OpIndex::Invalid(), OpIndex::Invalid(), offset + *constant};
+      }
+      if (depth < kMaxDepth) {
+        if (const ChangeOp* change = wide.TryCast<ChangeOp>();
+            change && (change->Is<Opmask::kChangeUint32ToUint64>() ||
+                       change->Is<Opmask::kChangeInt32ToInt64>())) {
+          index = change->input();
+          continue;
+        }
+        if (const WordBinopOp* binop = wide.TryCast<WordBinopOp>();
+            binop && (binop->kind == WordBinopOp::Kind::kAdd ||
+                      binop->kind == WordBinopOp::Kind::kSub)) {
+          if (auto constant = TryExtractI64ConstLow(binop->right())) {
+            offset +=
+                binop->kind == WordBinopOp::Kind::kAdd ? *constant : -*constant;
+            index = binop->left();
+            continue;
+          }
+          if (auto constant = TryExtractI64ConstLow(binop->left());
+              constant.has_value() && binop->kind == WordBinopOp::Kind::kAdd) {
+            offset += *constant;
+            index = binop->right();
+            continue;
+          }
+        }
+      }
+      return {OpIndex::Invalid(), TruncationKey(index), offset};
+    }
     if (depth == kMaxDepth) break;
     // a[trunc(base64 + n)]: languages with 64-bit integers compute the
     // index of {a[i + 1]} as {trunc(i + 1)}, which is {trunc(i) + 1}
@@ -1370,7 +1429,7 @@ WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
       if (std::optional<uint32_t> constant = TryExtractI64ConstLow(op->right());
           constant.has_value() && (op->kind == WordBinopOp::Kind::kAdd ||
                                    op->kind == WordBinopOp::Kind::kSub)) {
-        base = ExistingTruncation(*truncation, op->left());
+        base = ExistingTruncation(op->left());
         if (base.valid()) {
           offset +=
               op->kind == WordBinopOp::Kind::kAdd ? *constant : -*constant;
@@ -1379,7 +1438,7 @@ WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
                      TryExtractI64ConstLow(op->left());
                  left_constant.has_value() &&
                  op->kind == WordBinopOp::Kind::kAdd) {
-        base = ExistingTruncation(*truncation, op->right());
+        base = ExistingTruncation(op->right());
         if (base.valid()) offset += *left_constant;
       }
       if (!base.valid()) break;
@@ -1493,9 +1552,12 @@ OpIndex WasmBoundsCheckEliminationAnalyzer::CanonicalValue(OpIndex value,
     }
     case Opcode::kChange: {
       const ChangeOp& change = op.Cast<ChangeOp>();
-      key = StructuralKey{op.opcode, ChangeOptions(change), 0,
-                          CanonicalValue(change.input(), depth + 1),
+      OpIndex input = CanonicalValue(change.input(), depth + 1);
+      key = StructuralKey{op.opcode, ChangeOptions(change), 0, input,
                           OpIndex::Invalid()};
+      if (change.Is<Opmask::kTruncateWord64ToWord32>()) {
+        truncations_.emplace(input, value);
+      }
       break;
     }
     case Opcode::kArrayLength:
@@ -1568,26 +1630,53 @@ bool WasmBoundsCheckEliminationAnalyzer::IsKnownSmi(OpIndex object) const {
 // The options of a Change, in the structural key of its canonical value.
 uint64_t WasmBoundsCheckEliminationAnalyzer::ChangeOptions(
     const ChangeOp& change) {
-  return static_cast<uint64_t>(change.kind) |
-         static_cast<uint64_t>(change.assumption) << 8 |
-         static_cast<uint64_t>(change.from.value()) << 16 |
-         static_cast<uint64_t>(change.to.value()) << 24;
+  return ChangeOptions(change.kind, change.assumption, change.from, change.to);
 }
 
-// An operation computing the same truncation as {change} (to 32 bits) of
-// {x} instead of its input, if one has been seen already (see
-// {CanonicalValue}) and is computed before the current operation (in
-// the current block, or in a block that dominates it), so that it can be
-// used wherever an index used by the current operation is, including by
-// the guard of a fallback sequence starting there. Values seen already
-// may come later in the block: the conditions of a loop are processed
-// at its header.
+uint64_t WasmBoundsCheckEliminationAnalyzer::ChangeOptions(
+    ChangeOp::Kind kind, ChangeOp::Assumption assumption,
+    RegisterRepresentation from, RegisterRepresentation to) {
+  return static_cast<uint64_t>(kind) | static_cast<uint64_t>(assumption) << 8 |
+         static_cast<uint64_t>(from.value()) << 16 |
+         static_cast<uint64_t>(to.value()) << 24;
+}
+
+// A value whose canonical value is the one of the truncation to 32 bits
+// of the 64-bit value {x}. This is the first TruncateWord64ToWord32
+// operation of {x} found (see {CanonicalValue}), if any. Otherwise, the
+// canonical value of {x} becomes the canonical value of its truncation.
+// This 64-bit operation is only used to compare canonical values: as
+// the options of the structural keys include the representations of the
+// inputs, no 32-bit value other than a truncation of {x} has the same
+// canonical value, and no operation has the same canonical value as an
+// operation where {trunc(x)} replaces {x}. It is never emitted: only
+// bounds checks of the input graph, whose index is a 32-bit value, start
+// fallback sequences, and only a truncation found by
+// {ExistingTruncation} is used for an index.
+OpIndex WasmBoundsCheckEliminationAnalyzer::TruncationKey(OpIndex x) const {
+  OpIndex canonical = CanonicalValue(x);
+  return values_by_structure_
+      .emplace(StructuralKey{Opcode::kChange,
+                             ChangeOptions(ChangeOp::Kind::kTruncate,
+                                           ChangeOp::Assumption::kNoAssumption,
+                                           RegisterRepresentation::Word64(),
+                                           RegisterRepresentation::Word32()),
+                             0, canonical, OpIndex::Invalid()},
+               canonical)
+      .first->second;
+}
+
+// A TruncateWord64ToWord32 operation of {x} (or of a value with the same
+// canonical value), if one has been seen already (see {CanonicalValue})
+// and is computed before the current operation (in the current block,
+// or in a block that dominates it), so that it can be used wherever an
+// index used by the current operation is, including by the guard of a
+// fallback sequence starting there. Values seen already may come later
+// in the block: the conditions of a loop are processed at its header.
 OpIndex WasmBoundsCheckEliminationAnalyzer::ExistingTruncation(
-    const ChangeOp& change, OpIndex x) const {
-  auto it = values_by_structure_.find(
-      StructuralKey{Opcode::kChange, ChangeOptions(change), 0,
-                    CanonicalValue(x), OpIndex::Invalid()});
-  if (it == values_by_structure_.end() || current_block_ == nullptr) {
+    OpIndex x) const {
+  auto it = truncations_.find(CanonicalValue(x));
+  if (it == truncations_.end() || current_block_ == nullptr) {
     return OpIndex::Invalid();
   }
   OpIndex truncation = it->second;
