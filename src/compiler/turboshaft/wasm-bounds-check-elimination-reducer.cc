@@ -499,7 +499,12 @@ void WasmBoundsCheckEliminationAnalyzer::UpdateKnownBoundsChecks(
 // If {base + n} is known to be non-negative for some {n} below
 // {range}, whose offsets are within bounds, then all the offsets from
 // {n} to {range.upper()} are within bounds ([non-negative-and-check]).
-// Returns this larger range for the lowest such {n}, if valid.
+// Returns this larger range for the lowest such {n}, if valid. It is
+// always valid when the facts hold: {base + n} is then at least 0 and
+// {base + range.upper()} less than 2^30 (array lengths, and constants
+// used as lengths, are less than 2^30, see [constant-length]). But it
+// may not be in unreachable code, where facts may contradict each other,
+// so the second check is needed: as a DCHECK, it fails on random tests.
 std::optional<OffsetRange>
 WasmBoundsCheckEliminationAnalyzer::ExtendDownToNonNegative(
     const OffsetRange& range, const std::optional<OffsetRange>& non_negative) {
@@ -1021,10 +1026,15 @@ WasmBoundsCheckEliminationAnalyzer::FindNotEqualBound(
   uint32_t all_offsets = (1u << induction.step) - 1;
   for (const Candidate& candidate : candidates) {
     if (candidate.offsets != all_offsets) continue;
-    // {x} must be computed before the loop, so that it is the same in
-    // the whole loop. In practice, {EntryLowerBound} only finds a lower
-    // bound for a value computed before the loop, but this is not
-    // obvious, so we check it.
+    // {x} must be the same in the whole loop. The operation {x_value}
+    // may be computed in the loop although {EntryLowerBound} finds a
+    // lower bound for {x}: when it computes again a value computed before
+    // the loop, with the same canonical value, as when the bound of an
+    // exit test is recomputed in each iteration (as a DCHECK, this check
+    // fails on random tests). {x} is then still the same in the whole
+    // loop, but we only accept an operation computed before the loop,
+    // which the uses of {x_value} below (see {RecordLoopBound}) can rely
+    // on without further argument.
     if (!TryExtractI32Const(candidate.x_value).has_value() &&
         !Dominates(&graph_.Get(graph_.BlockOf(candidate.x_value)), forward)) {
       continue;

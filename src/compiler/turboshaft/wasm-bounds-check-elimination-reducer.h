@@ -310,6 +310,14 @@ class OffsetRange {
       // {second} should not wrap around the lower bound of {first}.
       if (second_lower > second_upper) continue;
       uint32_t size = std::max(first->upper_ - first->lower_, second_upper);
+      // The hull would span 2^31 values or more, and would not be a valid
+      // range. This cannot happen for two ranges of offsets within the
+      // bounds of the same array for the same base (as array lengths, and
+      // constants used as lengths, are less than 2^30, see
+      // [constant-length]), nor for two ranges of non-negative offsets of
+      // the same base. But it can in unreachable code, where facts may
+      // contradict each other, so this check is needed: as a DCHECK, it
+      // fails on random tests.
       if (static_cast<int32_t>(size) < 0) continue;
       if (!result.has_value() || size < result->upper_ - result->lower_) {
         result = OffsetRange(first->lower_, first->lower_ + size);
