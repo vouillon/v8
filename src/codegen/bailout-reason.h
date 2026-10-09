@@ -117,6 +117,9 @@ namespace internal {
     "A type assertion failed in Turboshaft-generated code")                   \
   V(kTurboshaftLoadEliminationError,                                          \
     "Turboshaft's load elimination wrongly eliminated a Load")                \
+  V(kTurboshaftWasmBoundsCheckEliminationError,                               \
+    "Turboshaft's Wasm bounds check elimination wrongly eliminated a bounds " \
+    "check")                                                                  \
   V(kMetadataAreaStartDoesNotMatch,                                           \
     "The metadata doesn't belong to the chunk")                               \
   V(kExternalPointerTagMismatch,                                              \
