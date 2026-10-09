@@ -221,6 +221,40 @@ class GraphVisitor : public OutputGraphAssembler<GraphVisitor<AfterNext>,
         input_block, added_block_phi_input);
   }
 
+  // Visits and emits the instructions from {start} to {end}, followed
+  // by an Unreachable because this sequence is not expected to
+  // terminate normally. The old to new mapping is cleared afterwards,
+  // so the operations can be emitted again later. When the current block
+  // uses variables, the values set by the copy are never used, since
+  // nothing follows the Unreachable. The range must be within
+  // {input_block}, and must not separate an operation that can throw
+  // from the DidntThrow that follows it. It may include the operation
+  // being visited, which is then emitted again after the range.
+  void CloneAndInlineTrappingInstructions(OpIndex start, OpIndex end,
+                                          const Block* input_block) {
+    DCHECK_EQ(Asm().input_graph().BlockOf(start), input_block->index());
+    DCHECK_EQ(
+        Asm().input_graph().BlockOf(Asm().input_graph().PreviousIndex(end)),
+        input_block->index());
+    // Visiting operations changes the current origin, which should be
+    // restored for the operation we are in the middle of visiting.
+    OpIndex origin = Asm().current_operation_origin();
+    auto all_ops = Asm().input_graph().OperationIndices(start, end);
+    for (OpIndex op : all_ops) {
+      if (!VisitOpAndUpdateMapping<false>(op, input_block)) {
+        break;
+      }
+    }
+    Asm().Unreachable();
+    // Reset old to new mapping
+    if (!current_block_needs_variables_) {
+      for (OpIndex op : all_ops) {
+        op_mapping_[op] = OpIndex::Invalid();
+      }
+    }
+    Asm().SetCurrentOrigin(origin);
+  }
+
   // {InlineOp} introduces two limitations unlike {CloneAndInlineBlock}:
   // 1. The input operation must not be emitted anymore as part of its
   // regular input block;

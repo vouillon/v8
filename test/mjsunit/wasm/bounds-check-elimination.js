@@ -102,7 +102,8 @@ function store(array, param, offset, value) {
   addArrayHelpers(builder, array);
   let sig = makeSig([wasmRefNullType(array), kWasmI32], []);
   let sequences = {
-    // Each sequence of accesses is a list of offsets.
+    // Each sequence of accesses is a list of offsets. On 64-bit targets,
+    // pairs of accesses with no known bound get fallback code.
     below: [1, 0],
     above: [0, 1],
     middle: [0, 2, 1],
@@ -112,6 +113,8 @@ function store(array, param, offset, value) {
     zigzag: [2, 3, 1, 4, 0],
     wrapAround: [-2, -1, 0, 1],
     large: [0x7ffffffd, 0x7ffffffe, 0x7fffffff, -0x80000000],
+    // With a single-comparison guard checking both bounds (on 64-bit
+    // targets), three accesses are enough for a fallback sequence.
     three: [0, 1, 2],
     threeBelow: [2, 1, 0],
     threeWrapAround: [-1, 0, 1],
@@ -159,8 +162,9 @@ function store(array, param, offset, value) {
   // 2 * i, computed anew each time.
   let twice = [kExprLocalGet, 1, ...wasmI32Const(2), kExprI32Mul];
   // if (c) a[2 * i]; a[2 * i] = 1; a[2 * i + 1] = 2; ... a[2 * i + 3] = 4;
-  // The stores use the values of 2 * i computed after the if, and not
-  // the one computed in the if, which has the same structure.
+  // The four stores after the if use a fallback sequence, whose guard
+  // must use the value of 2 * i computed after the if, and not the one
+  // computed in the if, which has the same structure.
   let stores = [];
   for (let k = 0; k < 4; k++) {
     stores.push(kExprLocalGet, 0, ...twice);
@@ -344,6 +348,16 @@ function store(array, param, offset, value) {
                      ...wasmI32Const(0x80000000 | 0), kExprI32LtU],
                     [access(1, 0, 1), access(1, -0x55555556, 2)]),
     },
+    // The same with three accesses, each extending the range, so that a
+    // guard checking only one bound would be enough for the sequence to
+    // be kept.
+    farNonNegativeThree: {
+      condition: i => ((i + 0x55555555) >>> 0) < 0x80000000,
+      code: guarded([...wasmI32Const(0x55555555), kExprI32Add,
+                     ...wasmI32Const(0x80000000 | 0), kExprI32LtU],
+                    [access(1, 0, 1), access(1, -0x55555555, 2),
+                     access(1, -0x55555556, 3)]),
+    },
     // Offsets that are too far apart for i >= 0 to help.
     farOffsets: {
       condition: i => true,
@@ -356,6 +370,8 @@ function store(array, param, offset, value) {
     gtS: [[1, 1, 1], [1, 0, 2]],
     geS: [[1, 1, 1], [1, 0, 2]],
     farNonNegative: [[1, 0, 1], [1, -0x55555556, 2]],
+    farNonNegativeThree: [[1, 0, 1], [1, -0x55555555, 2],
+                          [1, -0x55555556, 3]],
     farOffsets: [[0, 0, 1], [1, 0x7fffffff, 2], [1, -2, 3]],
   };
   for (let [name, {code}] of Object.entries(cases)) {
@@ -1070,8 +1086,9 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
   }
 
   // A burst of accesses with the same base and nearby offsets, in any
-  // order. They are mostly to the same array, with some accesses to
-  // other arrays or with offsets close to other anchors mixed in.
+  // order, which fallback code can cover. They are mostly to the same
+  // array, with some accesses to other arrays or with offsets close to
+  // other anchors mixed in.
   function randomBurst(array, base, anchor, anchors) {
     let statements = [];
     let size = 2 + random(6);
@@ -1111,7 +1128,7 @@ const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)
             ? {kind: 'if', condition, then, else: otherwise}
             : {kind: 'if', condition, then: otherwise, else: then});
       } else if (r < 19) {
-        // Some unrelated computation.
+        // Some unrelated computation, to make fallback code larger.
         statements.push({kind: 'filler', size: random(30)});
       } else if (r < 22 && depth < 2) {
         statements.push({
