@@ -3823,6 +3823,8 @@ filegroup(
             "src/compiler/turboshaft/int64-lowering-phase.h",
             "src/compiler/turboshaft/int64-lowering-reducer.h",
             "src/compiler/turboshaft/wasm-assembler-helpers.h",
+            "src/compiler/turboshaft/wasm-bounds-check-elimination-reducer.cc",
+            "src/compiler/turboshaft/wasm-bounds-check-elimination-reducer.h",
             "src/compiler/turboshaft/wasm-debug-memory-lowering-phase.cc",
             "src/compiler/turboshaft/wasm-debug-memory-lowering-phase.h",
             "src/compiler/turboshaft/wasm-gc-optimize-phase.cc",
