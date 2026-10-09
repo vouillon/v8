@@ -4,6 +4,7 @@
 
 #include "src/compiler/turboshaft/wasm-bounds-check-elimination-reducer.h"
 
+#include "src/base/small-vector.h"
 #include "src/compiler/turboshaft/opmasks.h"
 #include "src/wasm/wasm-objects.h"
 
@@ -24,6 +25,10 @@ namespace v8::internal::compiler::turboshaft {
 static constexpr uint32_t kMaxArrayLength = 1u << 30;
 static_assert(v8::internal::WasmArray::MaxLength(1) < kMaxArrayLength);
 static constexpr uint32_t kMaxReduction = 1u << 16;
+// The largest step of a loop recognized as unrolled, with an exit test
+// on each value of the loop variable (see {FindNotEqualBound} and
+// {HasDecreasingLowerBound}).
+static constexpr uint32_t kMaxUnrolledStep = 16;
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBlock(const Block& block) {
   BeginBlock(&block);
@@ -54,6 +59,8 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
   predecessor_bounds_check_snapshots_.clear();
   predecessor_non_negative_snapshots_.clear();
   predecessor_min_length_snapshots_.clear();
+  predecessor_length_alias_snapshots_.clear();
+  bool all_predecessors_have_length_aliases = true;
   for (const Block* p : block->PredecessorsIterable()) {
     std::optional<Snapshot> pred_snapshots =
         block_to_snapshot_mapping_[p->index()];
@@ -74,6 +81,12 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
     predecessor_non_negative_snapshots_.push_back(
         pred_snapshots->non_negative_offsets);
     predecessor_min_length_snapshots_.push_back(pred_snapshots->min_lengths);
+    if (pred_snapshots->length_aliases.has_value()) {
+      predecessor_length_alias_snapshots_.push_back(
+          *pred_snapshots->length_aliases);
+    } else {
+      all_predecessors_have_length_aliases = false;
+    }
   }
   // Without merge functions, the new snapshots only contain what is
   // known in all predecessors, that is, in the common ancestor of the
@@ -90,6 +103,24 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
       base::VectorOf(predecessor_non_negative_snapshots_));
   known_min_lengths_.StartNewSnapshot(
       base::VectorOf(predecessor_min_length_snapshots_));
+  // Length aliases are rare, so their table is only used once one has
+  // been recorded. A predecessor without a snapshot of this table then
+  // has no alias (and the current block is not dominated by the loop
+  // header that recorded them).
+  DCHECK(!length_aliases_open_);
+  if (has_length_aliases_) {
+    if (all_predecessors_have_length_aliases) {
+      known_length_aliases_.StartNewSnapshot(
+          base::VectorOf(predecessor_length_alias_snapshots_));
+    } else {
+      known_length_aliases_.StartNewSnapshot();
+    }
+    length_aliases_open_ = true;
+  }
+
+  if (block->IsLoop() && !ShouldSkipOptimizationStep()) {
+    ProcessLoopHeader(block);
+  }
 
   if (block->IsBranchTarget() && !ShouldSkipOptimizationStep()) {
     // The current block is a branch target, so we see if the branch
@@ -99,9 +130,14 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
 }
 
 void WasmBoundsCheckEliminationAnalyzer::FinishBlock(const Block* block) {
+  std::optional<LengthAliasMap::Snapshot> length_aliases;
+  if (length_aliases_open_) {
+    length_aliases = known_length_aliases_.Seal();
+    length_aliases_open_ = false;
+  }
   block_to_snapshot_mapping_[block->index()] =
       Snapshot{known_bounds_checks_.Seal(), known_non_negative_offsets_.Seal(),
-               known_min_lengths_.Seal()};
+               known_min_lengths_.Seal(), length_aliases};
 }
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBranch(const Block* block) {
@@ -377,6 +413,560 @@ WasmBoundsCheckEliminationAnalyzer::Normalize(OpIndex condition,
                   zext->input(), /*narrowed=*/true};
 }
 
+template <typename F>
+void WasmBoundsCheckEliminationAnalyzer::ForEachDominatingCondition(
+    const Block* block, const Block* stop, const F& f, int max_branches) const {
+  for (const Block* b = block; b != nullptr && b != stop && max_branches > 0;
+       b = b->GetDominator()) {
+    if (!b->IsBranchTarget()) continue;
+    max_branches--;
+    const BranchOp* branch =
+        b->LastPredecessor()->LastOperation(graph_).TryCast<BranchOp>();
+    if (!branch) continue;
+    ForEachCondition(branch->condition(), b == branch->if_true, f);
+  }
+}
+
+bool WasmBoundsCheckEliminationAnalyzer::Dominates(const Block* dominator,
+                                                   const Block* block) const {
+  // Depths decrease by one along the chain of dominators, so {dominator}
+  // cannot be found once a shallower block is reached.
+  for (const Block* b = block; b != nullptr && b->Depth() >= dominator->Depth();
+       b = b->GetDominator()) {
+    if (b == dominator) return true;
+  }
+  return false;
+}
+
+// Loop induction. A loop phi {i = phi(c0, i + c)}, where {c0 >= 0} and
+// {c > 0} are constants, is non-negative in the whole loop when the back
+// edge is only taken if {i < x} or {i <= x}, for a bound {x} small
+// enough that {i + c} cannot overflow (see {IsSmallBound}). It is also
+// non-negative when the back edge is only taken if {i + k != x} for all
+// {k} below {c} (for a small {c}), for a loop-invariant {x}, and the
+// loop is only entered if {c0 <= x}: {i} is then at most {x} in the
+// whole loop ([induction-not-equal]), which is a bounds check fact when
+// {x} is an array length minus a constant (see {RecordLoopBound}).
+//
+// These facts are recorded at the header, so they must hold whenever the
+// header is executed, which is shown by induction on the iterations.
+// The invariant may be stronger than the facts recorded: for a
+// not-equal bound, it is {0 <= i <= x}, while only {0 <= i} is recorded
+// when {x} is not an array length minus a constant, and {0 <= i} alone
+// is not preserved ({i != x} does not prevent {i + 1} from
+// overflowing). The induction covers all the facts recorded at the
+// header together, in the order in which they are recorded: later phis
+// of the header may use facts recorded for earlier ones (length aliases
+// and min lengths, see {ProcessDecreasingInduction}).
+// When the loop is entered, {i} is {c0}, which is non-negative, and at
+// most {x} for a not-equal bound (see {EntryLowerBound}). When the back
+// edge is taken, the conditions collected below hold: they are the
+// branch conditions of the dominators of the back edge within the loop
+// (branch targets have a single predecessor), read from the graph, not
+// from the tables of facts. They held when they were tested, and still
+// hold at the back edge, as their operands are not computed again in
+// between: they are computed in dominators of the branch, and the
+// header, where {i} is defined, is not executed again before the back
+// edge (see {CanonicalValue}). The current value of {i} satisfied the
+// invariant (induction hypothesis), and the lemmas show that {i + c},
+// the value of {i} at the next iteration, does too. For a
+// small bound, the lemmas hold for any value of {x}, so {x} can change
+// in the loop. For a not-equal bound, {x} must be the same as when
+// entering the loop, so it must be computed before the loop (see
+// {FindNotEqualBound}). The facts then remain true in the blocks
+// dominated by the header, including after the loop, as long as {i} is
+// not computed again, that is, until the header is executed again (see
+// {CanonicalValue}).
+void WasmBoundsCheckEliminationAnalyzer::ProcessLoopHeader(
+    const Block* header) {
+  if (header->PredecessorCount() != 2) return;
+  const Block* back_edge = header->LastPredecessor();
+  const Block* forward = back_edge->NeighboringPredecessor();
+  // The conditions that hold whenever the back edge is taken, and the
+  // values that are not 0 then (conditions that hold, but are not
+  // comparisons, as {i} for an exit test {i == 0}).
+  base::SmallVector<Relation, 8> conditions;
+  base::SmallVector<OpIndex, 4> non_zero;
+  ForEachDominatingCondition(
+      back_edge, header, [&](OpIndex condition, bool holds) {
+        if (auto relation = Normalize(condition, holds)) {
+          conditions.push_back(*relation);
+        } else if (holds) {
+          non_zero.push_back(condition);
+        }
+      });
+  if (conditions.empty() && non_zero.empty()) return;
+  for (OpIndex index : graph_.OperationIndices(*header)) {
+    const PhiOp* phi = graph_.Get(index).TryCast<PhiOp>();
+    if (!phi) continue;
+    std::optional<InductionVariable> induction =
+        TryMatchInductionVariable(index, *phi);
+    if (!induction.has_value()) {
+      ProcessDecreasingInduction(index, *phi, conditions, non_zero, forward);
+      continue;
+    }
+    std::optional<LoopBound> bound =
+        FindNotEqualBound(*induction, conditions, forward);
+    if (!bound.has_value() && !HasSmallBound(*induction, conditions)) {
+      continue;
+    }
+    TRACE("  Loop induction: "
+          << index << " is non-negative ("
+          << (bound.has_value() ? "not-equal bound" : "small bound") << ")");
+    RecordNonNegativeOffset(induction->value, 0);
+    if (bound.has_value()) RecordLoopBound(*induction, *bound);
+  }
+}
+
+// Recognizes {i = phi(c0, i + c)}, where {c0 >= 0} and {0 < c <= 2^30}
+// are constants.
+std::optional<WasmBoundsCheckEliminationAnalyzer::InductionVariable>
+WasmBoundsCheckEliminationAnalyzer::TryMatchInductionVariable(
+    OpIndex index, const PhiOp& phi) const {
+  if (phi.rep != RegisterRepresentation::Word32() || phi.input_count != 2) {
+    return std::nullopt;
+  }
+  std::optional<uint32_t> init = TryExtractI32Const(phi.input(0));
+  if (!init.has_value() || static_cast<int32_t>(*init) < 0) {
+    return std::nullopt;
+  }
+  OpIndex value = CanonicalValue(index);
+  BaseAndOffset step = ExtractBaseAndOffset(phi.input(1));
+  if (step.base != value || step.offset == 0 || step.offset > kMaxArrayLength) {
+    return std::nullopt;
+  }
+  return InductionVariable{value, *init, step.offset};
+}
+
+// Decreasing loop induction. A loop phi {i = phi(i0, i - c)}, where
+// {0 < c <= 2^30} is a constant, is non-negative in the whole loop if
+// {i0} is non-negative when entering the loop, and the back edge is only
+// taken if {i - c} is non-negative (see {HasDecreasingLowerBound}). As
+// {i} then decreases without wrapping around, it is at most {i0} in the
+// whole loop ([induction-decreasing]). When {i0} is an array length
+// minus a constant {r >= 1}, as in {for (i = a.length - 1; i >= 0; i--)},
+// the offsets 0 to {r - 1} of {i} are thus within bounds
+// ([induction-not-equal-bounds]).
+//
+// As for increasing loops (see {ProcessLoopHeader}), these facts hold
+// whenever the header is executed, by induction on the iterations, with
+// the invariant {0 <= i <= i0}, and also {y <= i} for a not-equal bound.
+// {i0} may be an array length minus a constant only known from a length
+// alias, or have a lower bound only known from a min length, recorded
+// at the header for an earlier phi (see {RecordLoopBound}): these facts
+// are part of the same induction, recorded before. When the loop is
+// entered, {i} is {i0}, which is non-negative (see
+// {EntryLowerBoundOfStart}), and at least {y} for a not-equal bound,
+// since {y <= i0} then. When the back edge is taken, the conditions
+// collected at the header, including the values known to be different
+// from 0, held for the current value of {i}, which satisfied the facts,
+// and the lemmas show that {i - c} does too. The bound {i0} is the same
+// in the whole loop: it is the input of the phi for the forward edge, so
+// it is computed before the loop, and so is the array length it is
+// derived from, or it is known to be equal to an array length minus a
+// constant in the whole loop (see {TryResolveMergeBound}). The bound {y}
+// is a constant.
+template <typename Conditions, typename Values>
+void WasmBoundsCheckEliminationAnalyzer::ProcessDecreasingInduction(
+    OpIndex index, const PhiOp& phi, const Conditions& conditions,
+    const Values& non_zero, const Block* forward) {
+  if (phi.rep != RegisterRepresentation::Word32() || phi.input_count != 2) {
+    return;
+  }
+  OpIndex value = CanonicalValue(index);
+  BaseAndOffset step = ExtractBaseAndOffset(phi.input(1));
+  uint32_t decrement = 0u - step.offset;
+  if (step.base != value || decrement == 0 || decrement > kMaxArrayLength) {
+    return;
+  }
+  OpIndex init = phi.input(0);
+  // The lower bound of {i0} walks the dominators of the loop, so it is
+  // only computed once some condition may show the induction.
+  std::optional<std::optional<int64_t>> cached_init_lower;
+  auto init_lower = [&]() {
+    if (!cached_init_lower.has_value()) {
+      cached_init_lower = EntryLowerBoundOfStart(init, forward);
+    }
+    return *cached_init_lower;
+  };
+  if (!HasDecreasingLowerBound(value, decrement, conditions, non_zero,
+                               init_lower)) {
+    return;
+  }
+  std::optional<int64_t> lower = init_lower();
+  if (!lower.has_value() || *lower < 0) return;
+  TRACE("  Loop induction: " << index << " is non-negative (decreasing)");
+  RecordNonNegativeOffset(value, 0);
+  std::optional<ReducedLength> length = TryExtractArrayLength(init);
+  if (!length.has_value() || length->reduction == 0) return;
+  OpIndex length_key = LengthKey(length->length);
+  uint32_t last = length->reduction - 1;
+  TRACE("  Loop induction: offsets [0, " << last << "] of " << value
+                                         << " below length " << length_key);
+  BoundsCheckKey key(value, length_key);
+  // The loop phi is defined in the loop header, so nothing is known yet
+  // about it.
+  DCHECK(!known_bounds_checks_.Get(key).has_value());
+  known_bounds_checks_.Set(key, OffsetRange(0, last));
+  RecordMinLength(length_key, uint64_t{last} + 1);
+}
+
+// For a decreasing loop phi {i = phi(i0, i - c)}, with {0 <= i}, whether
+// the back edge is only taken if {i - c} is non-negative:
+// - when {lo <= i + d} (or {lo < i + d}), signed, with a constant {lo}
+//   and {-2^30 <= d <= 0} such that {lo - d >= c} (or {lo + 1 - d >= c}),
+//   as for an exit test {i >= 0} after decrementing {i}, or {i > 0}
+//   before ([induction-decreasing]);
+// - when {i + k != y} for all {k} below the step (for a small step), for
+//   a constant {y} with {0 <= y <= i0} when entering the loop (where
+//   {i0} is at least {init_lower()}, if any), as for OCaml loops
+//   {for i = i0 downto y}: {i} then remains at least {y}
+//   ([induction-decreasing-not-equal]). The values in {non_zero} are
+//   also known to be different from 0 when the back edge is taken.
+template <typename Conditions, typename Values, typename InitLower>
+bool WasmBoundsCheckEliminationAnalyzer::HasDecreasingLowerBound(
+    OpIndex value, uint32_t decrement, const Conditions& conditions,
+    const Values& non_zero, const InitLower& init_lower) const {
+  // The values {v} such that the back edge is only taken if {i != v}.
+  base::SmallVector<int64_t, kMaxUnrolledStep> excluded;
+  // {i + n != k} is {i != k - n}, for an {i} below 2^31.
+  auto exclude = [&](uint32_t n, uint32_t k) {
+    uint32_t v = k - n;
+    if (v <= kMaxInt) excluded.push_back(v);
+  };
+  for (OpIndex v : non_zero) {
+    BaseAndOffset i = ExtractBaseAndOffset(v);
+    if (i.base == value) exclude(i.offset, 0);
+  }
+  for (const Relation& relation : conditions) {
+    if (relation.not_equal) {
+      for (auto [index, other] : {std::pair{relation.left, relation.right},
+                                  std::pair{relation.right, relation.left}}) {
+        BaseAndOffset i = ExtractBaseAndOffset(index);
+        if (i.base != value) continue;
+        if (auto k = TryExtractI32Const(other)) exclude(i.offset, *k);
+        break;
+      }
+      continue;
+    }
+    if (relation.kind == ComparisonOp::Kind::kEqual || !relation.is_signed()) {
+      continue;
+    }
+    std::optional<uint32_t> lo = TryExtractI32Const(relation.left);
+    if (!lo.has_value()) continue;
+    BaseAndOffset i = ExtractBaseAndOffset(relation.right);
+    if (i.base != value) continue;
+    int64_t d = static_cast<int32_t>(i.offset);
+    if (d > 0 || d < -int64_t{kMaxArrayLength}) continue;
+    int64_t lower = static_cast<int32_t>(*lo) + (relation.is_strict() ? 1 : 0);
+    if (lower - d >= decrement) return true;
+  }
+  if (decrement > kMaxUnrolledStep) return false;
+  for (int64_t y : excluded) {
+    std::optional<int64_t> lower = init_lower();
+    if (!lower.has_value() || y > *lower) continue;
+    bool all_excluded = true;
+    for (uint32_t k = 1; k < decrement && all_excluded; k++) {
+      all_excluded =
+          std::find(excluded.begin(), excluded.end(), y + k) != excluded.end();
+    }
+    if (all_excluded) return true;
+  }
+  return false;
+}
+
+// Whether the back edge is only taken if {i < x} or {i <= x}, for a
+// bound {x} small enough that {i + c} cannot overflow.
+template <typename Conditions>
+bool WasmBoundsCheckEliminationAnalyzer::HasSmallBound(
+    const InductionVariable& induction, const Conditions& conditions) const {
+  for (const Relation& relation : conditions) {
+    if (relation.kind == ComparisonOp::Kind::kEqual) continue;
+    BaseAndOffset left = ExtractBaseAndOffset(relation.left, relation.narrowed);
+    if (left.base != induction.value || left.offset != 0) continue;
+    if (IsSmallBound(relation.right, induction.step, relation.is_signed(),
+                     !relation.is_strict())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Whether {i < x} (or {i <= x} if {inclusive}), for a non-negative
+// {i}, shows that {i + step} does not overflow ([induction-constant],
+// [induction-length]).
+bool WasmBoundsCheckEliminationAnalyzer::IsSmallBound(OpIndex x, uint32_t step,
+                                                      bool is_signed,
+                                                      bool inclusive) const {
+  if (auto constant = TryExtractI32Const(x)) {
+    // {i < x <= 2^31 - step} (or {i <= x <= 2^31 - 1 - step}), so that
+    // {i + step <= 2^31 - 1}. A negative {x} is fine for a signed
+    // comparison: the back edge is then never taken.
+    uint32_t limit = uint32_t{kMaxInt} - step + (inclusive ? 0 : 1);
+    return is_signed
+               ? static_cast<int32_t>(*constant) <= static_cast<int32_t>(limit)
+               : *constant <= limit;
+  }
+  // {x = a.length - r} is less than 2^30 as a signed integer. As an
+  // unsigned integer, it may wrap around unless {r} is 0.
+  std::optional<ReducedLength> length = TryExtractArrayLength(x);
+  return length.has_value() && (is_signed || length->reduction == 0);
+}
+
+// Looks for a loop-invariant {x} such that the back edge is only taken
+// if {i + k != x} for all {k} below the step, as after unrolling a loop
+// with a step of 1, and such that the loop is only entered if
+// {c0 <= x}. Then, {i} never goes past {x} ([induction-not-equal]).
+template <typename Conditions>
+std::optional<WasmBoundsCheckEliminationAnalyzer::LoopBound>
+WasmBoundsCheckEliminationAnalyzer::FindNotEqualBound(
+    const InductionVariable& induction, const Conditions& conditions,
+    const Block* forward) const {
+  if (induction.step > kMaxUnrolledStep) return std::nullopt;
+  // For each candidate {x} (by canonical value): an operation computing
+  // it, and the offsets {k} with {i + k != x}, as a bit mask.
+  struct Candidate {
+    OpIndex x;
+    OpIndex x_value;
+    uint32_t offsets;
+  };
+  base::SmallVector<Candidate, 4> candidates;
+  for (const Relation& relation : conditions) {
+    if (!relation.not_equal) continue;
+    for (auto [index, other] : {std::pair{relation.left, relation.right},
+                                std::pair{relation.right, relation.left}}) {
+      BaseAndOffset i = ExtractBaseAndOffset(index);
+      if (i.base != induction.value) continue;
+      if (i.offset < induction.step) {
+        OpIndex x = CanonicalValue(other);
+        auto it = std::find_if(candidates.begin(), candidates.end(),
+                               [&](const Candidate& c) { return c.x == x; });
+        if (it == candidates.end()) {
+          candidates.push_back({x, other, 0});
+          it = candidates.end() - 1;
+        }
+        it->offsets |= 1u << i.offset;
+      }
+      break;
+    }
+  }
+  uint32_t all_offsets = (1u << induction.step) - 1;
+  for (const Candidate& candidate : candidates) {
+    if (candidate.offsets != all_offsets) continue;
+    // {x} must be the same in the whole loop. The operation {x_value}
+    // may be computed in the loop although {EntryLowerBound} finds a
+    // lower bound for {x}: when it computes again a value computed before
+    // the loop, with the same canonical value, as when the bound of an
+    // exit test is recomputed in each iteration (as a DCHECK, this check
+    // fails on random tests). {x} is then still the same in the whole
+    // loop, but we only accept an operation computed before the loop,
+    // which the uses of {x_value} below (see {RecordLoopBound}) can rely
+    // on without further argument.
+    if (!TryExtractI32Const(candidate.x_value).has_value() &&
+        !Dominates(&graph_.Get(graph_.BlockOf(candidate.x_value)), forward)) {
+      continue;
+    }
+    std::optional<int64_t> lower =
+        EntryLowerBound(candidate.x, candidate.x_value, forward);
+    if (lower.has_value() && static_cast<int32_t>(induction.init) <= *lower) {
+      return LoopBound{candidate.x_value, *lower};
+    }
+  }
+  return std::nullopt;
+}
+
+// A lower bound of {x} (the canonical value of {x_value}) when entering
+// the loop from {forward}: {k <= x} or {k < x} (signed), raised past the
+// values that {x} is known to differ from ({x != k}, or a branch on
+// {x}, which shows that {x != 0}).
+std::optional<int64_t> WasmBoundsCheckEliminationAnalyzer::EntryLowerBound(
+    OpIndex x, OpIndex x_value, const Block* forward) const {
+  std::optional<int64_t> lower;
+  if (auto constant = TryExtractI32Const(x_value)) {
+    lower = static_cast<int32_t>(*constant);
+  }
+  base::SmallVector<int64_t, 4> excluded;
+  // The conditions that bound {x} when entering a loop are usually tested
+  // right before it (the guard of an OCaml for loop, the test of a peeled
+  // iteration). Only the last {kMaxEntryBranches} branches are looked at,
+  // rather than all the dominators of the loop, so that the cost does
+  // not grow with the number of loops of the function.
+  static constexpr int kMaxEntryBranches = 16;
+  ForEachDominatingCondition(
+      forward, nullptr,
+      [&](OpIndex condition, bool holds) {
+        std::optional<Relation> relation = Normalize(condition, holds);
+        if (!relation.has_value()) {
+          if (holds && CanonicalValue(condition) == x) excluded.push_back(0);
+          return;
+        }
+        if (relation->kind == ComparisonOp::Kind::kEqual) {
+          if (!relation->not_equal) return;
+          OpIndex other = CanonicalValue(relation->left) == x ? relation->right
+                          : CanonicalValue(relation->right) == x
+                              ? relation->left
+                              : OpIndex::Invalid();
+          if (!other.valid()) return;
+          if (auto k = TryExtractI32Const(other)) {
+            excluded.push_back(static_cast<int32_t>(*k));
+          }
+          return;
+        }
+        if (!relation->is_signed() || CanonicalValue(relation->right) != x) {
+          return;
+        }
+        auto k = TryExtractI32Const(relation->left);
+        if (!k.has_value()) return;
+        int64_t bound =
+            static_cast<int32_t>(*k) + (relation->is_strict() ? 1 : 0);
+        if (!lower.has_value() || bound > *lower) lower = bound;
+      },
+      kMaxEntryBranches);
+  if (!lower.has_value()) return std::nullopt;
+  int64_t bound = *lower;
+  while (std::find(excluded.begin(), excluded.end(), bound) != excluded.end()) {
+    bound++;
+  }
+  return bound;
+}
+
+// A lower bound of {init} when entering the loop from {forward}, from
+// the conditions on {init}, and, when {init} is {x + o} with
+// {-2^30 <= o < 0}, as for the start {x - 1} of a loop whose first
+// iteration was peeled, from the conditions on {x} or, when {x} is an
+// array length, from its min length: if {x} is at least {lo} with
+// {lo + o >= 0}, then {x + o} does not wrap around, and is at least
+// {lo + o} ([entry-lower-bound-offset]). The min length is the one known
+// at the header, which may come from facts recorded there for an earlier
+// phi (see {RecordLoopBound}): these hold whenever the header is
+// executed, in particular when the loop is entered.
+std::optional<int64_t>
+WasmBoundsCheckEliminationAnalyzer::EntryLowerBoundOfStart(
+    OpIndex init, const Block* forward) const {
+  std::optional<int64_t> lower =
+      EntryLowerBound(CanonicalValue(init), init, forward);
+  auto raise = [&](int64_t bound) {
+    if (bound >= 0 && (!lower.has_value() || bound > *lower)) lower = bound;
+  };
+  if (std::optional<ReducedLength> length = TryExtractArrayLength(init)) {
+    raise(int64_t{MinLength(LengthKey(length->length))} - length->reduction);
+  }
+  // {x + o} or {x - (-o)}, for the value {x} on which conditions may have
+  // been tested (not decomposed further).
+  const WordBinopOp* binop =
+      graph_.Get(ResolveReplacements(init)).TryCast<WordBinopOp>();
+  if (binop == nullptr || binop->rep != WordRepresentation::Word32()) {
+    return lower;
+  }
+  std::optional<uint32_t> constant = TryExtractI32Const(binop->right());
+  if (!constant.has_value()) return lower;
+  int64_t o;
+  if (binop->kind == WordBinopOp::Kind::kAdd) {
+    o = static_cast<int32_t>(*constant);
+  } else if (binop->kind == WordBinopOp::Kind::kSub) {
+    o = -int64_t{static_cast<int32_t>(*constant)};
+  } else {
+    return lower;
+  }
+  if (o >= 0 || o < -int64_t{kMaxArrayLength}) return lower;
+  OpIndex x = binop->left();
+  if (std::optional<int64_t> x_lower =
+          EntryLowerBound(CanonicalValue(x), x, forward)) {
+    raise(*x_lower + o);
+  }
+  return lower;
+}
+
+// With {0 <= i <= x} in the loop, if {x} is {a.length - r} with
+// {r >= 1}, the offsets 0 to {r - 1} of {i} are within bounds
+// ([induction-not-equal-bounds]).
+void WasmBoundsCheckEliminationAnalyzer::RecordLoopBound(
+    const InductionVariable& induction, const LoopBound& bound) {
+  std::optional<ReducedLength> length = TryExtractArrayLength(bound.x);
+  if (!length.has_value()) length = TryResolveMergeBound(bound);
+  if (!length.has_value() || length->reduction == 0) return;
+  OpIndex length_key = LengthKey(length->length);
+  uint32_t last = length->reduction - 1;
+  TRACE("  Loop induction: offsets [0, " << last << "] of " << induction.value
+                                         << " below length " << length_key);
+  BoundsCheckKey key(induction.value, length_key);
+  // The loop phi is defined in the loop header, so nothing is known yet
+  // about it.
+  DCHECK(!known_bounds_checks_.Get(key).has_value());
+  known_bounds_checks_.Set(key, OffsetRange(0, last));
+  RecordMinLength(length_key, uint64_t{last} + 1);
+}
+
+// With {x = phi(...) + offset}, where the phi is a merge (not a loop
+// phi), and {x} at least {x_lower_bound} when entering the loop, the
+// constant inputs {k} of the phi with {k + offset < x_lower_bound} are
+// ruled out in the loop. If a single input remains, {x} is this input
+// plus {offset} in the loop. For instance, for the length of an array
+// that may be empty (a constant 0 on the other path) minus 1, and a loop
+// that is only entered if it is non-negative. If {x} is then an array
+// length minus a constant, this is recorded as a length alias, which
+// holds in the blocks dominated by the loop header.
+//
+// The alias holds in a block {b} dominated by the header, although the
+// length {l} in the remaining input does not dominate {b}. Consider an
+// execution reaching {b}. The merge block {m} dominates {forward} (it
+// dominates {x}, which does), which dominates {b} (the header's other
+// predecessor is the back edge). The last execution of {m} before {b}
+// is thus followed by an execution of {forward}, and {m} is not
+// executed again in between (any path from {m} to the header goes
+// through {forward}). When {forward} was last executed, the conditions
+// dominating it held, so {x} was at least {x_lower_bound}, and that
+// execution of {m} took the edge of the remaining input, which then
+// had the value of {l} plus a constant. None of the leaves of the
+// canonical value of {l} (see {CanonicalValue}: its array, possibly
+// behind casts, or the replacement of {l} by load elimination) is
+// computed again before {b}. Otherwise, as {m} is not a loop header, it
+// does not dominate the block {d} where such a leaf is computed ({d}
+// dominates the predecessor of {m} for the remaining input, which {m}
+// does not dominate), including when {d} would be {m} itself. There
+// would then be a path to {d} that avoids {m}, followed by a path from
+// {d} to {b} that avoids {m}, while {m} dominates {b}. So in {b}, {x} is
+// {l} minus a constant, for the value of {l} computed from the current
+// values of these leaves, which is what facts about the length refer to
+// (they are keyed by its canonical value).
+std::optional<ReducedLength>
+WasmBoundsCheckEliminationAnalyzer::TryResolveMergeBound(
+    const LoopBound& bound) {
+  BaseAndOffset x = ExtractBaseAndOffset(bound.x);
+  if (!x.base.valid()) return std::nullopt;
+  const PhiOp* merge = graph_.Get(x.base).TryCast<PhiOp>();
+  if (!merge || graph_.Get(graph_.BlockOf(x.base)).IsLoop()) {
+    return std::nullopt;
+  }
+  OpIndex remaining = OpIndex::Invalid();
+  for (OpIndex input : merge->inputs()) {
+    if (auto k = TryExtractI32Const(input)) {
+      int64_t candidate = static_cast<int32_t>(*k + x.offset);
+      if (candidate < bound.x_lower_bound) continue;
+    }
+    if (remaining.valid()) return std::nullopt;
+    remaining = input;
+  }
+  if (!remaining.valid()) return std::nullopt;
+  BaseAndOffset input = DecomposeIndex(remaining);
+  if (!input.base_value.valid() ||
+      !graph_.Get(input.base_value).Is<ArrayLengthOp>()) {
+    return std::nullopt;
+  }
+  ReducedLength length{input.base_value, 0u - (input.offset + x.offset)};
+  if (length.reduction > kMaxReduction) return std::nullopt;
+  if (!length_aliases_open_) {
+    // The first alias: no block had any before.
+    known_length_aliases_.StartNewSnapshot();
+    length_aliases_open_ = true;
+  }
+  TRACE("  Length alias: " << bound.x << " is " << length.length << " - "
+                           << length.reduction << " in the loop");
+  known_length_aliases_.Set(CanonicalValue(bound.x), length);
+  has_length_aliases_ = true;
+  return length;
+}
+
 // If {base + n} is known to be non-negative for some {n} below
 // {range}, whose offsets are within bounds, then all the offsets from
 // {n} to {range.upper()} are within bounds ([non-negative-and-check]).
@@ -502,18 +1092,23 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundsCheckCondition(
 }
 
 // Recognizes {a.length - r} for a small constant {r} (possibly written
-// {a.length + (-r)}), where {a.length} is an ArrayLength operation.
+// {a.length + (-r)}, or with nested additions of constants), where
+// {a.length} is an ArrayLength operation, and values known from
+// {known_length_aliases_} to be equal to such an expression.
 std::optional<ReducedLength>
 WasmBoundsCheckEliminationAnalyzer::TryExtractArrayLength(
     OpIndex length) const {
   BaseAndOffset b = DecomposeIndex(length);
-  if (!b.base_value.valid() || !graph_.Get(b.base_value).Is<ArrayLengthOp>()) {
-    return std::nullopt;
+  if (b.base_value.valid() && graph_.Get(b.base_value).Is<ArrayLengthOp>()) {
+    uint32_t reduction = 0u - b.offset;
+    // Only small reductions are useful (see "Limits" in the header).
+    if (reduction > kMaxReduction) return std::nullopt;
+    return ReducedLength{b.base_value, reduction};
   }
-  uint32_t reduction = 0u - b.offset;
-  // Only small reductions are useful (see "Limits" in the header).
-  if (reduction > kMaxReduction) return std::nullopt;
-  return ReducedLength{b.base_value, reduction};
+  if (length_aliases_open_) {
+    return known_length_aliases_.Get(CanonicalValue(length));
+  }
+  return std::nullopt;
 }
 
 // The key of an array length: its canonical value, which is the same for
@@ -728,19 +1323,20 @@ WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index,
 // point {p} is only used at points {q} dominated by {p} (see
 // {BeginBlock}), and none of its leaves (the operations whose canonical
 // value is not structural: phis, loads, parameters...) is defined at a
-// point strictly dominated by {p}: they are defined in dominators of
-// {p}. Such a leaf is then not executed again between the last
-// execution of {p} and {q}: as {p} does not dominate it, there is a path
-// to it that avoids {p}, which, followed by the execution from the leaf
-// to {q}, would reach {q} without going through {p}. By induction on
-// canonical values, a value used at {q} (and so computed in a dominator
-// of {q}) is equal to its canonical value, computed from the current
-// values of its leaves, and so two values used at {q} with the same
-// canonical value are equal. This holds with the representatives of
-// structural keys, and with the depth limit below, whose cut-off values
-// are leaves, computed in dominators of the values that use them. The
-// canonical value of a truncation {trunc(X)} to 32 bits may instead be
-// the canonical value of its 64-bit input {X} (see {TruncationKey}): the
+// point strictly dominated by {p}. Such a leaf is then not executed
+// again between the last execution of {p} and {q}: as {p} does not
+// dominate it, there is a path to it that avoids {p}, which, followed
+// by the execution from the leaf to {q}, would reach {q} without going
+// through {p}. Usually, the leaves of a fact are defined in dominators
+// of {p}, but those of a fact learnt from a length alias are not (see
+// {LengthAliasMap}). By induction on canonical values, a value used at
+// {q} (and so computed in a dominator of {q}) is equal to its canonical
+// value, computed from the current values of its leaves, and so two
+// values used at {q} with the same canonical value are equal. This holds with
+// the representatives of structural keys, and with the depth limit below, whose
+// cut-off values are leaves, computed in dominators of the values that use
+// them. The canonical value of a truncation {trunc(X)} to 32 bits may instead
+// be the canonical value of its 64-bit input {X} (see {TruncationKey}): the
 // truncation is then equal to the truncation of its canonical value,
 // which is enough, as the options of structural keys include the
 // representations of their inputs, so that no other 32-bit value, and no
