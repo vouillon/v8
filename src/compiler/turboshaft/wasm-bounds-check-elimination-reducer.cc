@@ -33,9 +33,13 @@ static constexpr uint32_t kMaxUnrolledStep = 16;
 void WasmBoundsCheckEliminationAnalyzer::ProcessBlock(const Block& block) {
   BeginBlock(&block);
   for (OpIndex op_idx : graph_.OperationIndices(block)) {
-    if (const TrapIfOp* trap_if = graph_.Get(op_idx).TryCast<TrapIfOp>();
+    const Operation& op = graph_.Get(op_idx);
+    if (const TrapIfOp* trap_if = op.TryCast<TrapIfOp>();
         trap_if && !ShouldSkipOptimizationStep()) {
       ProcessTrapIf(op_idx, *trap_if);
+    } else if (const WasmAllocateArrayOp* allocation =
+                   op.TryCast<WasmAllocateArrayOp>()) {
+      RecordKnownLength(allocation->length());
     }
   }
   FinishBlock(&block);
@@ -962,9 +966,10 @@ WasmBoundsCheckEliminationAnalyzer::TryResolveMergeBound(
 // {n} to {range.upper()} are within bounds ([non-negative-and-check]).
 // Returns this larger range for the lowest such {n}, if valid. It is
 // always valid when the facts hold: {base + n} is then at least 0 and
-// {base + range.upper()} less than 2^30. But it may not be in
-// unreachable code, where facts may contradict each other, so the second
-// check is needed.
+// {base + range.upper()} less than 2^30 (array lengths, and constants
+// used as lengths, are less than 2^30, see [constant-length]). But it
+// may not be in unreachable code, where facts may contradict each other,
+// so the second check is needed.
 std::optional<OffsetRange>
 WasmBoundsCheckEliminationAnalyzer::ExtendDownToNonNegative(
     const OffsetRange& range, const std::optional<OffsetRange>& non_negative) {
@@ -1032,6 +1037,16 @@ void WasmBoundsCheckEliminationAnalyzer::RecordNonNegativeOffset(
 }
 
 uint32_t WasmBoundsCheckEliminationAnalyzer::MinLength(OpIndex length) const {
+  // A constant length is its own min length ([constant-length]). The
+  // constant may be 2^30 or more in unreachable code: after an allocation
+  // with such a constant length, which always traps, load elimination
+  // replaces the length of the array by the constant, which is then
+  // reached through the ArrayLength operation (see {IsKnownLength})
+  // rather than rejected by {TryExtractArrayLength}.
+  if (std::optional<uint32_t> constant = TryExtractI32Const(length);
+      constant.has_value() && *constant < kMaxArrayLength) {
+    return *constant;
+  }
   return known_min_lengths_.Get(length).value_or(0);
 }
 
@@ -1044,6 +1059,30 @@ void WasmBoundsCheckEliminationAnalyzer::RecordMinLength(OpIndex length,
   if (min_length > kMaxInt) return;
   TRACE("  Min length for " << length << ": " << min_length);
   known_min_lengths_.Set(length, static_cast<uint32_t>(min_length));
+}
+
+// Whether {value} is known to be the length of an array, and so less than
+// 2^30: an ArrayLength operation, or a value whose canonical value has
+// an entry in {known_min_lengths_}. Entries only exist for array
+// lengths: the canonical values of ArrayLength operations (possibly
+// replaced by load elimination), of lengths known from length aliases,
+// and of the lengths of allocations (see {RecordKnownLength}), where
+// they hold.
+bool WasmBoundsCheckEliminationAnalyzer::IsKnownLength(OpIndex value) const {
+  return graph_.Get(value).Is<ArrayLengthOp>() ||
+         known_min_lengths_.Get(CanonicalValue(value)).has_value();
+}
+
+// Records that {value} is the length of an array, as the length of an
+// array allocated successfully ([allocation-length], see "Limits" in the
+// header).
+void WasmBoundsCheckEliminationAnalyzer::RecordKnownLength(OpIndex value) {
+  OpIndex key = CanonicalValue(value);
+  // A constant is used as an array length anyway (see {MinLength}).
+  if (TryExtractI32Const(key).has_value()) return;
+  if (known_min_lengths_.Get(key).has_value()) return;
+  TRACE("  Known length: " << value);
+  known_min_lengths_.Set(key, 0);
 }
 
 // Attempts to decode a bounds check condition of the form:
@@ -1083,13 +1122,22 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundsCheckCondition(
 
 // Recognizes {a.length - r} for a small constant {r} (possibly written
 // {a.length + (-r)}, or with nested additions of constants), where
-// {a.length} is an ArrayLength operation, and values known from
-// {known_length_aliases_} to be equal to such an expression.
+// {a.length} is an ArrayLength operation, or a value known to be an
+// array length (see {IsKnownLength}), constants below 2^30, and values
+// known from {known_length_aliases_} to be equal to such an
+// expression.
 std::optional<ReducedLength>
 WasmBoundsCheckEliminationAnalyzer::TryExtractArrayLength(
     OpIndex length) const {
   BaseAndOffset b = DecomposeIndex(length);
-  if (b.base_value.valid() && graph_.Get(b.base_value).Is<ArrayLengthOp>()) {
+  // A constant {c < 2^30} is the same as the length of an array of
+  // length {c} for the analysis, which only assumes that array lengths
+  // are less than 2^30 ([constant-length]).
+  if (!b.base_value.valid()) {
+    if (b.offset >= kMaxArrayLength) return std::nullopt;
+    return ReducedLength{length, 0};
+  }
+  if (IsKnownLength(b.base_value)) {
     uint32_t reduction = 0u - b.offset;
     // Only small reductions are useful (see "Limits" in the header).
     if (reduction > kMaxReduction) return std::nullopt;
