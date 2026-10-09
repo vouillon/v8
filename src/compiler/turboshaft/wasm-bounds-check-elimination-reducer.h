@@ -69,14 +69,38 @@ namespace v8::internal::compiler::turboshaft {
 // element of the arrays it uses for OCaml arrays, so the OCaml bounds
 // check of an access {a.(i)} is {i < a.length - 1}, which shows that
 // the Wasm access {a[i+1]} is within bounds, as long as some previous
-// access to {a} showed that its length is at least 1.
+// access to {a} showed that its length is at least 1. A non-strict
+// condition {base + n <= a.length - r} is the same as
+// {base + n < a.length - (r - 1)} when {r >= 1}.
 //
-// The analysis also tracks a lower bound on the length of each array,
-// which bounds checks raise: any successful bounds check of {a} shows
-// that its length is at least 1, and {n < a.length - r} for a constant
-// {n} that it is at least {n + r + 1}. It shows that the constant
-// indices below it are within bounds, and that {a.length - r} does not
-// wrap around when it is at least {r}.
+// The analysis also tracks a lower bound on the length of each array.
+// It shows that the constant indices below it are within bounds, and
+// that {a.length - r} does not wrap around when it is at least {r}. It
+// comes from bounds checks, from conditions {n <= a.length - r} for a
+// constant {n}, and from tests {a.length - r != n} when the length is
+// known to be at least {n + r} (for instance, {a.length != 0} shows that
+// the length is at least 1).
+//
+// Signed conditions {base + n <s a.length - r}, as produced by languages
+// with signed integers (Java, Kotlin, Dart...), are taken into account
+// when {base + n} is known to be non-negative: the condition then shows
+// that {a.length - r} is positive, and that {base + n <u a.length - r}.
+// Since array lengths are less than 2^30, {base + n} is non-negative
+// when some {base + m} is within bounds and {n - m} is at most 2^30.
+// Languages with 64-bit integers may compare a 64-bit index with the
+// zero-extended array length: {X <u zext(l)} (or {X <=u zext(l)}) shows
+// that {X} is less than 2^32, so that it is the same comparison of
+// {trunc(X)} with {l}. Such comparisons are taken into account as the
+// latter, reading {X} as its truncation, which is {x} for {zext(x)} or
+// {sext(x)}, and {trunc(Y) + n} for {Y + n}, so that {zext(i) + 1 <u
+// zext(a.length)} is the bounds check {i + 1 < a.length}. They only
+// show facts, and are never eliminated: when {X} is 2^32 or more, the
+// comparison fails while {trunc(X) <u l} may hold.
+// Conditions of branches and traps combining other conditions are also
+// taken into account: when {x | y} does not hold (is 0), neither {x} nor
+// {y} holds, when {x & y} holds (is not 0), neither {x} nor {y} is 0 (so
+// that comparisons, whose values are 0 or 1, hold), and {x == 0} holds
+// when {x} does not.
 //
 // Facts are about values: a bounds check {base + n < l} depends on the
 // value {l}, not on the array whose length it is. Bounds checks are
@@ -109,7 +133,9 @@ namespace v8::internal::compiler::turboshaft {
 // The constants {r} in conditions {x < a.length - r} are at most
 // {kMaxReduction} = 2^16. This limit is arbitrary, since only small
 // constants are useful. It keeps the range of offsets from {n} to
-// {n + r} shown by such a condition valid.
+// {n + r} shown by such a condition valid, and it ensures that
+// {a.length - r} is negative (as a signed integer) rather than a large
+// positive value when {a.length < r}.
 
 // Key for grouping bounds checks by base and array length. The length
 // is the canonical value of an array length (see {LengthKey}): a bounds
@@ -241,7 +267,7 @@ class OffsetRange {
 //     (bvsge v #x00000000))
 //
 // Array lengths {l} are assumed to be non-negative as signed integers
-// (less than 2^31, see "Limits" above).
+// (less than 2^31), or less than 2^30 where needed (see "Limits" above).
 //
 // [covered] A bounds check is redundant when its offset is covered by
 // a range of offsets within bounds:
@@ -303,15 +329,18 @@ class OffsetRange {
 //   (assert (not (non-negative (bvadd x n))))
 //   (check-sat)
 //
-// [non-negative-index] So do unsigned comparisons with small enough
-// bounds: {x <u b} with {b <= 2^31}, and {x <=u b} with {b < 2^31} (in
-// particular, {b} can be an array length minus a constant that does not
-// wrap around):
+// [non-negative-index] So do comparisons with small enough bounds, or
+// large enough ones for signed comparisons: {x <u b} with {b <= 2^31},
+// {x <=u b} with {b < 2^31} (in particular, {b} can be an array length
+// minus a constant that does not wrap around), {b <s x} with {b >= -1}
+// and {b <=s x} with {b >= 0}:
 //
 //   (declare-const x (_ BitVec 32))
 //   (declare-const b (_ BitVec 32))
 //   (assert (or (and (bvult x b) (bvule b #x80000000))
-//               (and (bvule x b) (bvule b #x7fffffff))))
+//               (and (bvule x b) (bvule b #x7fffffff))
+//               (and (bvslt b x) (bvsge b #xffffffff))
+//               (and (bvsle b x) (bvsge b #x00000000))))
 //   (assert (not (non-negative x)))
 //   (check-sat)
 //
@@ -403,6 +432,92 @@ class OffsetRange {
 //   (assert (not (bvult n l)))
 //   (check-sat)
 //
+// [signed-check] A signed condition {x + n <s l - r} with {x + n}
+// non-negative (and a small constant {r}) shows the unsigned condition,
+// and that {l - r} does not wrap around:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const r (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvule r #x00010000))
+//   (assert (non-negative (bvadd x n)))
+//   (assert (bvslt (bvadd x n) (bvsub l r)))
+//   (assert (not (and (bvult (bvadd x n) (bvsub l r))
+//                     (bvuge l (bvadd r #x00000001)))))
+//   (check-sat)
+//
+// [non-negative-near-bounds] With array lengths less than 2^30, if
+// {x + m} is within bounds, then {x + m + d} is non-negative for {d} at
+// most 2^30:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const m (_ BitVec 32))
+//   (declare-const d (_ BitVec 32))
+//   (assert (bvult l #x40000000))
+//   (assert (bvult (bvadd x m) l))
+//   (assert (bvule d #x40000000))
+//   (assert (not (non-negative (bvadd (bvadd x m) d))))
+//   (check-sat)
+//
+// [not-equal-length] A test {x + m + 1 != l} extends a known range
+// ending at {x + m}:
+//
+//   (declare-const x (_ BitVec 32))
+//   (declare-const m (_ BitVec 32))
+//   (declare-const l (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvult (bvadd x m) l))
+//   (assert (not (= (bvadd (bvadd x m) #x00000001) l)))
+//   (assert (not (bvult (bvadd (bvadd x m) #x00000001) l)))
+//   (check-sat)
+//
+// [non-strict-length] A non-strict condition {x <= l - r} implies
+// {x < l - (r - 1)} for {r >= 1}, when the comparison is signed ({s}),
+// or when {l} is at least {r}:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const r (_ BitVec 32))
+//   (declare-const s Bool)
+//   (assert (bvsge l #x00000000))
+//   (assert (bvuge r #x00000001))
+//   (assert (bvule r #x00010000))
+//   (assert (or (and s (bvsle x (bvsub l r)))
+//               (and (not s) (bvuge l r) (bvule x (bvsub l r)))))
+//   (assert (not (ite s (bvslt x (bvsub l (bvsub r #x00000001)))
+//                       (bvult x (bvsub l (bvsub r #x00000001))))))
+//   (check-sat)
+//
+// [non-strict-constant] For a constant {n >= 1}, {n <= y} implies
+// {n - 1 < y}, signed ({s}) or unsigned:
+//
+//   (declare-const n (_ BitVec 32))
+//   (declare-const y (_ BitVec 32))
+//   (declare-const s Bool)
+//   (assert (or (and s (bvsge n #x00000001) (bvsle n y))
+//               (and (not s) (bvuge n #x00000001) (bvule n y))))
+//   (assert (not (ite s (bvslt (bvsub n #x00000001) y)
+//                       (bvult (bvsub n #x00000001) y))))
+//   (check-sat)
+//
+// [not-equal-min-length] A test {l - r != n}, when {l} is known to be at
+// least {n + r}, shows that {l} is at least {n + r + 1}:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const r (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvule r #x00010000))
+//   (assert (bvule n #x7fffffff))
+//   (assert (bvule (bvadd n r) #x7fffffff))
+//   (assert (bvuge l (bvadd n r)))
+//   (assert (not (= (bvsub l r) n)))
+//   (assert (not (bvuge l (bvadd (bvadd n r) #x00000001))))
+//   (check-sat)
+//
 // [truncated-addition] The truncation to 32 bits of a 64-bit addition
 // (or subtraction) is the addition of the truncations:
 //
@@ -412,6 +527,21 @@ class OffsetRange {
 //                        (bvadd ((_ extract 31 0) x) ((_ extract 31 0) c)))
 //                     (= ((_ extract 31 0) (bvsub x c))
 //                        (bvsub ((_ extract 31 0) x) ((_ extract 31 0) c))))))
+//   (check-sat)
+//
+// [narrowed-comparison] A 64-bit unsigned comparison of {X} with a
+// zero-extended {y} is the 32-bit comparison of the truncation of {X}
+// with {y}, and the truncation of an extension of {x} is {x}:
+//
+//   (declare-const X (_ BitVec 64))
+//   (declare-const y (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (assert (not (and (=> (bvult X ((_ zero_extend 32) y))
+//                         (bvult ((_ extract 31 0) X) y))
+//                     (=> (bvule X ((_ zero_extend 32) y))
+//                         (bvule ((_ extract 31 0) X) y))
+//                     (= ((_ extract 31 0) ((_ zero_extend 32) x)) x)
+//                     (= ((_ extract 31 0) ((_ sign_extend 32) x)) x))))
 //   (check-sat)
 
 // Maps keys of type {K} to values of type {V}. Supports snapshotting
@@ -526,11 +656,17 @@ class WasmBoundsCheckEliminationAnalyzer {
 
   // A condition that holds, normalized to {left kind right}, where
   // {kind} is a less-than comparison ({a < b} that does not hold is
-  // {b <= a}).
+  // {b <= a}), or to {left == right}, or {left != right} if
+  // {not_equal}.
   struct Relation {
     ComparisonOp::Kind kind;
+    bool not_equal;
     OpIndex left;
     OpIndex right;
+    // A 64-bit comparison {left < zext(right)} or {left <= zext(right)}
+    // (unsigned), read as the 32-bit comparison of the truncation of
+    // {left} (a 64-bit value) with {right} (see {Normalize}).
+    bool narrowed = false;
 
     bool is_signed() const {
       return kind == ComparisonOp::Kind::kSignedLessThan ||
@@ -542,17 +678,21 @@ class WasmBoundsCheckEliminationAnalyzer {
     }
   };
 
-  // A condition {index <u a.length - reduction}, where {reduction} is a
-  // constant (usually 0).
+  // A condition {index < a.length - reduction}, where {reduction} is a
+  // constant (usually 0), and the comparison is signed or unsigned.
   struct BoundsCheckCondition {
     BoundsCheck bounds_check;
     uint32_t reduction;
+    bool is_signed;
   };
 
   // An index decomposed as {base + offset}. {base} is the canonical
   // value of {base_value} (see {CanonicalValue}), an operation computing
   // the base, which is only used to recognize array lengths, and is not
   // necessarily available where the index is (see {ExistingTruncation}).
+  // For the left side of a narrowed relation (see {DecomposeIndex}),
+  // {base_value} may be a 64-bit operation whose truncation is the base,
+  // so that {base} is its truncation key (see {TruncationKey}).
   struct BaseAndOffset {
     OpIndex base;
     OpIndex base_value;
@@ -588,10 +728,21 @@ class WasmBoundsCheckEliminationAnalyzer {
   OpIndex ResolveAliases(OpIndex object) const;
   OpIndex ResolveReplacements(OpIndex value) const;
 
+  void ProcessCondition(OpIndex trap_if, OpIndex condition, bool holds);
   void ProcessComparison(OpIndex trap_if, OpIndex condition, bool holds);
+  void ProcessNotEqual(const Relation& relation);
+  void ProcessNotEqualToConstant(const ReducedLength& length, uint32_t n);
   void ProcessBoundsCheck(OpIndex trap_if, const BoundsCheck& bounds_check,
                           uint32_t reduction);
 
+  // Calls {f(condition, holds)} for the conditions combined by
+  // {condition} (with and, or, and comparisons to 0) whose value is
+  // known when {condition} holds, or does not hold if not {holds}. These
+  // conditions are comparisons, or other values, which hold when they
+  // are not 0.
+  template <typename F>
+  void ForEachCondition(OpIndex condition, bool holds, const F& f,
+                        int depth = 0) const;
   std::optional<Relation> Normalize(OpIndex condition, bool holds) const;
 
   static std::optional<OffsetRange> ExtendDownToNonNegative(
@@ -600,6 +751,7 @@ class WasmBoundsCheckEliminationAnalyzer {
       const BoundsCheckKey& key,
       const std::optional<OffsetRange>& non_negative) const;
   std::optional<OffsetRange> NonNegativeOffsets(OpIndex base) const;
+  bool IsKnownNonNegative(const BoundsCheckKey& key, uint32_t offset) const;
   void RecordNonNegativeOffset(OpIndex base, uint32_t offset);
   uint32_t MinLength(OpIndex length) const;
   void RecordMinLength(OpIndex length, uint64_t min_length);
@@ -611,13 +763,18 @@ class WasmBoundsCheckEliminationAnalyzer {
   bool IsArrayLengthWithoutWrapAround(OpIndex length) const;
   std::optional<BaseAndOffset> TryExtractNonNegativeIndex(
       const Relation& relation) const;
-  BaseAndOffset ExtractBaseAndOffset(OpIndex index) const;
-  BaseAndOffset DecomposeIndex(OpIndex index) const;
+  BaseAndOffset ExtractBaseAndOffset(OpIndex index, bool wide = false) const;
+  BaseAndOffset DecomposeIndex(OpIndex index, bool wide = false) const;
   OpIndex CanonicalValue(OpIndex value, int depth = 0) const;
   bool IsKnownSmi(OpIndex object) const;
   std::optional<uint32_t> TryExtractI32Const(OpIndex expr) const;
   std::optional<uint32_t> TryExtractI64ConstLow(OpIndex expr) const;
   static uint64_t ChangeOptions(const ChangeOp& change);
+  static uint64_t ChangeOptions(ChangeOp::Kind kind,
+                                ChangeOp::Assumption assumption,
+                                RegisterRepresentation from,
+                                RegisterRepresentation to);
+  OpIndex TruncationKey(OpIndex x) const;
   OpIndex ExistingTruncation(OpIndex x) const;
 
   const Graph& graph_;
@@ -633,7 +790,9 @@ class WasmBoundsCheckEliminationAnalyzer {
   mutable ZoneAbslFlatHashMap<StructuralKey, OpIndex> values_by_structure_;
   // The first TruncateWord64ToWord32 operation found for each canonical
   // value of its input (see {ExistingTruncation}), which may be in any
-  // block.
+  // block. The canonical value
+  // of the truncation may instead be a 64-bit operation (see
+  // {TruncationKey}).
   mutable ZoneAbslFlatHashMap<OpIndex, OpIndex> truncations_;
 
   // Summary of all the bounds check information collected so far.
