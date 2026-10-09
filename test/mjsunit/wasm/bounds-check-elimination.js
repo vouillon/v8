@@ -500,6 +500,90 @@ function store(array, param, offset, value) {
   }
 })();
 
+(function TestUnreachableLargeConstantLength() {
+  print(arguments.callee.name);
+  // c = new T[-1]; c[5] = 1; if (i + 1 <u c.length - 1) c[i + 1] = 1;
+  // The allocation always traps, so the code after it is unreachable,
+  // but it is still analyzed. Load elimination replaces c.length by the
+  // constant -1, which must not be used as a min length.
+  let builder = new WasmModuleBuilder();
+  let array = builder.addArray(kWasmI32);
+  builder.addFunction('f', makeSig([kWasmI32], []))
+    .addLocals(wasmRefNullType(array), 1)
+    .addBody([
+      ...wasmI32Const(-1),
+      kGCPrefix, kExprArrayNewDefault, array,
+      kExprLocalSet, 1,
+      kExprLocalGet, 1, ...wasmI32Const(5), ...wasmI32Const(1),
+      kGCPrefix, kExprArraySet, array,
+      kExprLocalGet, 0, ...wasmI32Const(1), kExprI32Add,
+      kExprLocalGet, 1,
+      kGCPrefix, kExprArrayLen,
+      ...wasmI32Const(1), kExprI32Sub,
+      kExprI32LtU,
+      kExprIf, kWasmVoid,
+        kExprLocalGet, 1,
+        kExprLocalGet, 0, ...wasmI32Const(1), kExprI32Add,
+        ...wasmI32Const(1),
+        kGCPrefix, kExprArraySet, array,
+      kExprEnd,
+    ])
+    .exportFunc();
+  let instance = builder.instantiate();
+  assertTraps(kTrapArrayTooLarge, () => instance.exports.f(0));
+})();
+
+(function TestAllocationLengths() {
+  print(arguments.callee.name);
+  let builder = new WasmModuleBuilder();
+  let array = builder.addArray(kWasmI32);
+  // x = new T[n]; for (i = 0; i < n; i++) { x[i] = i; acc += x[i]; }
+  // The loop condition is a bounds check of x.
+  builder.addFunction('fill', makeSig([kWasmI32], [kWasmI32]))
+    .addLocals(wasmRefNullType(array), 1)
+    .addLocals(kWasmI32, 2)
+    .addBody([
+      kExprLocalGet, 0, kGCPrefix, kExprArrayNewDefault, array,
+      kExprLocalSet, 1,
+      kExprLoop, kWasmVoid,
+        kExprLocalGet, 2, kExprLocalGet, 0, kExprI32LtS,
+        kExprIf, kWasmVoid,
+          kExprLocalGet, 1, kExprLocalGet, 2, kExprLocalGet, 2,
+          kGCPrefix, kExprArraySet, array,
+          kExprLocalGet, 3,
+          kExprLocalGet, 1, kExprLocalGet, 2, kGCPrefix, kExprArrayGet, array,
+          kExprI32Add, kExprLocalSet, 3,
+          kExprLocalGet, 2, ...wasmI32Const(1), kExprI32Add, kExprLocalSet, 2,
+          kExprBr, 1,
+        kExprEnd,
+      kExprEnd,
+      kExprLocalGet, 3,
+    ])
+    .exportFunc();
+  // x = [1, 2, 3]; x[0] + x[2] + x[i]: the length of x is the constant 3.
+  builder.addFunction('fixed', makeSig([kWasmI32], [kWasmI32]))
+    .addLocals(wasmRefNullType(array), 1)
+    .addBody([
+      ...wasmI32Const(1), ...wasmI32Const(2), ...wasmI32Const(3),
+      kGCPrefix, kExprArrayNewFixed, array, 3,
+      kExprLocalSet, 1,
+      kExprLocalGet, 1, ...wasmI32Const(0), kGCPrefix, kExprArrayGet, array,
+      kExprLocalGet, 1, ...wasmI32Const(2), kGCPrefix, kExprArrayGet, array,
+      kExprI32Add,
+      kExprLocalGet, 1, kExprLocalGet, 0, kGCPrefix, kExprArrayGet, array,
+      kExprI32Add,
+    ])
+    .exportFunc();
+  let instance = builder.instantiate();
+  assertEquals(0, instance.exports.fill(0));
+  assertEquals(10, instance.exports.fill(5));
+  assertTraps(kTrapArrayTooLarge, () => instance.exports.fill(-1));
+  assertTraps(kTrapArrayTooLarge, () => instance.exports.fill(1 << 30));
+  assertEquals(6, instance.exports.fixed(1));
+  assertTraps(kTrapArrayOutOfBounds, () => instance.exports.fixed(3));
+  assertTraps(kTrapArrayOutOfBounds, () => instance.exports.fixed(-1));
+})();
+
 // Randomly generated functions, compared against a JS model. For stress
 // testing, a different seed can be passed with: d8 ... -- <seed>
 const kRandomSeed = (typeof arguments != 'undefined' && arguments.length > 0)

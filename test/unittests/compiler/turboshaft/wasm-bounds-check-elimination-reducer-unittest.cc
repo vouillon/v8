@@ -2507,6 +2507,182 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, NarrowedLoopBound) {
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
 }
 
+// The bounds check {index + offset <u length}, for an arbitrary
+// {length}.
+template <typename Asm_t>
+static void BoundsCheckWithLength(Asm_t& Asm, V<Word32> length, V<Word32> index,
+                                  int32_t offset) {
+  V<Word32> full_index =
+      offset == 0 ? index : __ Word32Add(index, __ Word32Constant(offset));
+  __ TrapIfNot(__ Uint32LessThan(full_index, length),
+               TrapId::kTrapArrayOutOfBounds);
+}
+
+// Allocates an array of length {length} (the map is not used by the
+// analysis). With load elimination, the length of the new array is then
+// {length}.
+template <typename Asm_t>
+static V<WasmArrayNullable> AllocateArray(Asm_t& Asm, V<WasmArrayNullable> any,
+                                          V<Word32> length) {
+  return __ WasmAllocateArray(V<Map>::Cast(any), length, &kI32ArrayType,
+                              SharedFlag{false});
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, AllocationLength) {
+  // x = new T[c]; a[i]; if (i <s c - 1) { x[i+1]; x[i]; }
+  // c is an array length after the allocation, so the condition covers
+  // both accesses.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<WasmArrayNullable> x = AllocateArray(Asm, a, c);
+    BoundsCheck(Asm, a, i, 0);
+    If(Asm, __ Int32LessThan(i, __ Word32Sub(c, __ Word32Constant(1))), [&] {
+      BoundsCheck(Asm, x, i, 1);
+      BoundsCheck(Asm, x, i, 0);
+    });
+  });
+  RunWithLoadElimination(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, AllocationLengthRecomputed) {
+  // x = new T[i + c]; a[i]; if (i <s (i + c) - 1) { x[i+1]; x[i]; }
+  // The length is computed again for the condition.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<WasmArrayNullable> x = AllocateArray(Asm, a, __ Word32Add(i, c));
+    BoundsCheck(Asm, a, i, 0);
+    V<Word32> length = __ Word32Add(i, c);
+    If(Asm, __ Int32LessThan(i, __ Word32Sub(length, __ Word32Constant(1))),
+       [&] {
+         BoundsCheck(Asm, x, i, 1);
+         BoundsCheck(Asm, x, i, 0);
+       });
+  });
+  RunWithLoadElimination(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, AllocationShowsNonNegativeIndex) {
+  // new T[c]; if (i <u c) { a[i+2]; a[i]; }
+  // c is an array length, so i is non-negative, and the first check of a
+  // covers the second one.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    AllocateArray(Asm, a, c);
+    If(Asm, __ Uint32LessThan(i, c), [&] {
+      BoundsCheck(Asm, a, i, 2);
+      BoundsCheck(Asm, a, i, 0);
+    });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LengthWithoutAllocation) {
+  // if (i <u c) { a[i+2]; a[i]; }
+  // Without the allocation, c may be 0xffffffff, and i may be -2.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    If(Asm, __ Uint32LessThan(i, c), [&] {
+      BoundsCheck(Asm, a, i, 2);
+      BoundsCheck(Asm, a, i, 0);
+    });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, AllocationKeepsMinLength) {
+  // a[5]; new T[a.length]; if (i <u a.length - 3) a[i+3];
+  // The allocation does not lower the min length of a.length, which
+  // shows that a.length - 3 does not wrap around.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 5);
+    AllocateArray(Asm, a, __ ArrayLength(a, compiler::kWithNullCheck));
+    If(Asm, __ Uint32LessThan(i, ReducedLength(Asm, a, 3)),
+       [&] { BoundsCheck(Asm, a, i, 3); });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, AllocationInBranch) {
+  // if (i) new T[c]; if (i <u c) { a[i+2]; a[i]; }
+  // c is only known to be an array length in the branch.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    If(Asm, i, [&] { AllocateArray(Asm, a, c); });
+    If(Asm, __ Uint32LessThan(i, c), [&] {
+      BoundsCheck(Asm, a, i, 2);
+      BoundsCheck(Asm, a, i, 0);
+    });
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, LengthBeforeAllocation) {
+  // a[i]; if (i <s c - 1) { x = new T[c]; x[i+1]; x[i]; }
+  // The condition is tested before c is known to be an array length, so
+  // only the check of x[i+1] covers the one of x[i] (as i is
+  // non-negative).
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    If(Asm, __ Int32LessThan(i, __ Word32Sub(c, __ Word32Constant(1))), [&] {
+      V<WasmArrayNullable> x = AllocateArray(Asm, a, c);
+      BoundsCheck(Asm, x, i, 1);
+      BoundsCheck(Asm, x, i, 0);
+    });
+  });
+  RunWithLoadElimination(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, AllocationLengthLoop) {
+  // x = new T[c]; for (k = 0; k <s c; k++) x[k];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<WasmArrayNullable> x = AllocateArray(Asm, a, c);
+    Loop(
+        Asm, 0, 1, [&](V<Word32> k) { return __ Int32LessThanOrEqual(c, k); },
+        [&](V<Word32> k) { BoundsCheck(Asm, x, k, 0); });
+  });
+  RunWithLoadElimination(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, ConstantAllocationLength) {
+  // x = new T[3]; x[2]; x[0];
+  // The length is known to be 3.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<WasmArrayNullable> x = AllocateArray(Asm, a, __ Word32Constant(3));
+    BoundsCheck(Asm, x, {}, 2);
+    BoundsCheck(Asm, x, {}, 0);
+  });
+  RunWithLoadElimination(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       ConstantAllocationLengthTooLarge) {
+  // x = new T[3]; x[2]; x[3];
+  // The last access is out of bounds.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<WasmArrayNullable> x = AllocateArray(Asm, a, __ Word32Constant(3));
+    BoundsCheck(Asm, x, {}, 2);
+    BoundsCheck(Asm, x, {}, 3);
+  });
+  RunWithLoadElimination(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, ConstantLengthCondition) {
+  // x = new T[3]; if (i <u 3) x[i];
+  // The condition is a bounds check against the constant length.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<WasmArrayNullable> x = AllocateArray(Asm, a, __ Word32Constant(3));
+    If(Asm, __ Uint32LessThan(i, __ Word32Constant(3)),
+       [&] { BoundsCheck(Asm, x, i, 0); });
+  });
+  RunWithLoadElimination(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"
 
 }  // namespace v8::internal::compiler::turboshaft
