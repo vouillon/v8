@@ -122,18 +122,60 @@ namespace v8::internal::compiler::turboshaft {
 // {trunc(Y) + n} when an operation computing {trunc(Y)} already exists
 // (for the index of a previous access {a[trunc(Y)]}).
 //
+// Loop variables are shown to be non-negative by induction. A loop phi
+// {i = phi(c0, i + c)}, with constants {c0 >= 0} and {c > 0}, is
+// non-negative in the whole loop (and after it) if its back edge is only
+// taken when {i < x} or {i <= x}, for a bound {x} small enough that
+// {i + c} cannot overflow: an array length minus a constant (for an
+// unsigned comparison, the array length itself), or a constant at most
+// {2^31 - c}. Loops written {for (i = c0; i != x; i++)}, as OCaml {for}
+// loops are compiled, are handled too, when the loop is only entered if
+// {c0 <= x}, for a loop-invariant {x}: {i} is then at most {x} in the
+// loop, and when {x} is an array length minus {r >= 1}, the offsets 0
+// to {r - 1} of {i} are within bounds. After loop unrolling, the step is
+// {c > 1} and the back edge is taken when {i + k != x} for all {k} from
+// 0 to {c - 1}, which works the same way. In the unrolled copies, a
+// test {i + k != a.length - r} then shows that {i + k + r} is within
+// bounds when {i + k + r - 1} is. When {x} is a phi plus a constant, the
+// constant inputs of the phi for which the loop is not entered are
+// ruled out: if a single input remains, {x} is this input plus the
+// constant in the loop. For instance, with {x = phi(a.length, 0) - 1}
+// (the length of an array that may be empty, minus 1), the loop is not
+// entered when {x} is -1, so {x} is {a.length - 1} in the loop, which
+// is recorded in {known_length_aliases_}.
+//
+// Decreasing loop phis {i = phi(i0, i - c)} are non-negative in the
+// whole loop when {i0} is non-negative when entering the loop (which may
+// be shown by conditions on {x} when {i0} is {x - k}, as for a loop whose
+// first iteration was peeled), and the back edge is only taken when
+// {i - c} is non-negative: when {lo <= i + d} for constants with
+// {lo - d >= c}, as for an exit test {i >= 0} after
+// decrementing {i}, or {i > 0} before, or when {i + k != y} for all {k}
+// below {c}, for a constant {y} with {0 <= y <= i0} when entering the
+// loop, as for an OCaml loop {for i = i0 downto y}. As {i} then
+// decreases without wrapping around, it is at most {i0}, and when {i0}
+// is {a.length - r} with {r >= 1}, the offsets 0 to {r - 1} of {i} are
+// within bounds, as in {for (i = a.length - 1; i >= 0; i--)}.
+//
 // Facts are recorded at the point where a condition is known to hold:
-// right after a trap, or at the start of a branch target. They are only
-// used in blocks dominated by that point (see {BeginBlock}), where they
-// still hold (see {CanonicalValue}).
+// right after a trap, or at the start of a branch target, and at loop
+// headers for facts shown by induction (see {ProcessLoopHeader}). They
+// are only used in blocks dominated by that point (see {BeginBlock}),
+// where they still hold (see {CanonicalValue}, and {LengthAliasMap} for
+// length aliases).
 //
 // Limits
 //
 // Array lengths are less than {kMaxArrayLength} = 2^30 (as checked by a
-// static_assert on {WasmArray::MaxLength}). Since they are less than
-// 2^31, an index within bounds is non-negative as a signed integer, and
-// ranges of offsets that span at most 2^31 values can be compared in
-// modular arithmetic (see {OffsetRange}).
+// static_assert on {WasmArray::MaxLength}):
+// - Since they are less than 2^31, an index within bounds is
+//   non-negative as a signed integer, and ranges of offsets that span
+//   at most 2^31 values can be compared in modular arithmetic (see
+//   {OffsetRange}).
+// - Since they are less than 2^30, a non-negative index at most an array
+//   length can be incremented by a step of up to 2^30 without
+//   overflowing, which loop induction relies on, and an index at most
+//   2^30 above an index within bounds is non-negative.
 // The constants {r} in conditions {x < a.length - r} are at most
 // {kMaxReduction} = 2^16. This limit is arbitrary, since only small
 // constants are useful. It keeps the range of offsets from {n} to
@@ -522,6 +564,135 @@ class OffsetRange {
 //   (assert (not (bvuge l (bvadd (bvadd n r) #x00000001))))
 //   (check-sat)
 //
+// [induction-constant] Induction for loop phis {i = phi(c0, i + c)}: if
+// {i} is non-negative and the back edge is only taken when {i < x} (or
+// {i <= x}), then {i + c} is non-negative for a constant bound {x} at
+// most {2^31 - c} (at most {2^31 - 1 - c} for {i <= x}), with a signed
+// or unsigned comparison. For a signed comparison, a negative {x} is
+// allowed: the back edge is then never taken.
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (assert (non-negative i))
+//   (assert (bvugt c #x00000000))
+//   (assert (bvule c #x40000000))
+//   (assert (or (and (bvult i x) (bvule x (bvsub #x80000000 c)))
+//               (and (bvslt i x) (bvsle x (bvsub #x80000000 c)))
+//               (and (bvule i x) (bvule x (bvsub #x7fffffff c)))
+//               (and (bvsle i x) (bvsle x (bvsub #x7fffffff c)))))
+//   (assert (not (non-negative (bvadd i c))))
+//   (check-sat)
+//
+// [induction-length] The same holds for a bound {l - r}, where {l} is
+// an array length, with a signed comparison, and for the bound {l}
+// with an unsigned comparison ({i < x} implies {i <= x}):
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const l (_ BitVec 32))
+//   (declare-const r (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (assert (bvult l #x40000000))
+//   (assert (bvule r #x00010000))
+//   (assert (non-negative i))
+//   (assert (or (bvsle i (bvsub l r)) (bvule i l)))
+//   (assert (bvugt c #x00000000))
+//   (assert (bvule c #x40000000))
+//   (assert (not (non-negative (bvadd i c))))
+//   (check-sat)
+//
+// [induction-not-equal] For {i != x} loops, {0 <= i <= x} is preserved
+// by each increment of 1, which cannot overflow (and so by an unrolled
+// step {c}, with {i + k != x} for all {k} below {c}):
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (assert (non-negative i))
+//   (assert (bvsle i x))
+//   (assert (not (= i x)))
+//   (assert (not (and (non-negative (bvadd i #x00000001))
+//                     (bvsle (bvadd i #x00000001) x))))
+//   (check-sat)
+//
+// [induction-not-equal-bounds] and {0 <= i <= l - r} shows that the
+// offsets 0 to {r - 1} of {i} are within bounds:
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const l (_ BitVec 32))
+//   (declare-const r (_ BitVec 32))
+//   (declare-const k (_ BitVec 32))
+//   (assert (bvult l #x40000000))
+//   (assert (bvuge r #x00000001))
+//   (assert (bvule r #x00010000))
+//   (assert (non-negative i))
+//   (assert (bvsle i (bvsub l r)))
+//   (assert (bvult k r))
+//   (assert (not (bvult (bvadd i k) l)))
+//   (check-sat)
+//
+// [induction-decreasing] Induction for decreasing loop phis
+// {i = phi(i0, i - c)}: if {0 <= i <= i0} and the back edge is only
+// taken when {lo <= i + d} (or {lo < i + d}), signed, with
+// {-2^30 <= d <= 0} and {lo - d >= c} (or {lo + 1 - d >= c}) as
+// integers, then {0 <= i - c <= i0}:
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const i0 (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (declare-const d (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (assert (non-negative i))
+//   (assert (bvsle i i0))
+//   (assert (bvugt c #x00000000))
+//   (assert (bvule c #x40000000))
+//   (assert (bvsge d #xc0000000))
+//   (assert (bvsle d #x00000000))
+//   (assert (or (and (bvsle lo (bvadd i d))
+//                    (bvsge (bvsub ((_ sign_extend 32) lo)
+//                                  ((_ sign_extend 32) d))
+//                           ((_ zero_extend 32) c)))
+//               (and (bvslt lo (bvadd i d))
+//                    (bvsge (bvsub (bvadd ((_ sign_extend 32) lo)
+//                                         #x0000000000000001)
+//                                  ((_ sign_extend 32) d))
+//                           ((_ zero_extend 32) c)))))
+//   (assert (not (and (non-negative (bvsub i c)) (bvsle (bvsub i c) i0))))
+//   (check-sat)
+//
+// [induction-decreasing-not-equal] For decreasing {i != y} loops,
+// {0 <= y <= i <= i0} is preserved by a decrement {c} when the back edge
+// is only taken if {i != y + k} for all {k} below {c}, that is, if
+// {i - y} is not below {c}:
+//
+//   (declare-const i (_ BitVec 32))
+//   (declare-const i0 (_ BitVec 32))
+//   (declare-const y (_ BitVec 32))
+//   (declare-const c (_ BitVec 32))
+//   (assert (non-negative y))
+//   (assert (bvsle y i))
+//   (assert (bvsle i i0))
+//   (assert (bvugt c #x00000000))
+//   (assert (bvule c #x40000000))
+//   (assert (not (bvult (bvsub i y) c)))
+//   (assert (not (and (bvsle y (bvsub i c)) (bvsle (bvsub i c) i0))))
+//   (check-sat)
+//
+// [entry-lower-bound-offset] If {x >= lo} (signed) and
+// {-2^30 <= o < 0} with {lo + o >= 0} as integers, then {x + o} does
+// not wrap around, and is at least {lo + o}:
+//
+//   (declare-const x (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (declare-const o (_ BitVec 32))
+//   (assert (bvsge x lo))
+//   (assert (bvslt o #x00000000))
+//   (assert (bvsge o #xc0000000))
+//   (assert (bvsge (bvadd ((_ sign_extend 32) lo) ((_ sign_extend 32) o))
+//                  #x0000000000000000))
+//   (assert (not (and (non-negative (bvadd x o))
+//                     (bvsge (bvadd x o) (bvadd lo o)))))
+//   (check-sat)
+//
 // [truncated-addition] The truncation to 32 bits of a 64-bit addition
 // (or subtraction) is the addition of the truncations:
 //
@@ -597,6 +768,20 @@ using NonNegativeOffsetMap = KeyedSnapshotTable<OpIndex, OffsetRange>;
 // Maps array lengths (by canonical value) to a lower bound.
 using MinLengthMap = KeyedSnapshotTable<OpIndex, uint32_t>;
 
+// Maps values to an array length minus a constant that they are equal
+// to, when this is only known in part of the graph (see
+// {ProcessLoopHeader}). The ArrayLength operation may be an input of a
+// merge phi, and then does not dominate the uses of the alias. Facts
+// learnt from it (bounds checks and min lengths of the length) are
+// still sound: they hold when they are recorded (see
+// {TryResolveMergeBound}), and they remain true in the blocks dominated
+// by the point where they are recorded, although their leaves (see
+// {CanonicalValue}) do not dominate it. These leaves are not defined in
+// blocks dominated by the merge block of the alias, which dominates
+// that point, so they are not computed again before such blocks are
+// reached.
+using LengthAliasMap = KeyedSnapshotTable<OpIndex, ReducedLength>;
+
 class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
  public:
   // {load_elimination} is optional. When provided, values replaced by
@@ -614,10 +799,12 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
         known_bounds_checks_(phase_zone),
         known_non_negative_offsets_(phase_zone),
         known_min_lengths_(phase_zone),
+        known_length_aliases_(phase_zone),
         block_to_snapshot_mapping_(graph.block_count(), phase_zone),
         predecessor_bounds_check_snapshots_(phase_zone),
         predecessor_non_negative_snapshots_(phase_zone),
-        predecessor_min_length_snapshots_(phase_zone) {}
+        predecessor_min_length_snapshots_(phase_zone),
+        predecessor_length_alias_snapshots_(phase_zone) {}
 
   void Run() {
     // On wasm_of_ocaml programs, about one operation in 10 gets a canonical
@@ -656,6 +843,8 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
     BoundsCheckMap::Snapshot bounds_checks;
     NonNegativeOffsetMap::Snapshot non_negative_offsets;
     MinLengthMap::Snapshot min_lengths;
+    // Only once some length alias has been recorded.
+    std::optional<LengthAliasMap::Snapshot> length_aliases;
   };
 
   // A condition that holds, normalized to {left kind right}, where
@@ -703,6 +892,21 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
     uint32_t offset;
   };
 
+  // A loop phi {i = phi(init, i + step)}, where {value} is the
+  // canonical value of {i}.
+  struct InductionVariable {
+    OpIndex value;
+    uint32_t init;
+    uint32_t step;
+  };
+
+  // A bound {i <= x} of an induction variable in the loop, where {x} is
+  // at least {x_lower_bound} when entering the loop.
+  struct LoopBound {
+    OpIndex x;
+    int64_t x_lower_bound;
+  };
+
   // Identifies an operation whose value only depends on its inputs (see
   // {CanonicalValue}) by its opcode, options and the canonical values of
   // its inputs.
@@ -739,6 +943,35 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   void ProcessBoundsCheck(OpIndex trap_if, const BoundsCheck& bounds_check,
                           uint32_t reduction);
 
+  void ProcessLoopHeader(const Block* header);
+  std::optional<InductionVariable> TryMatchInductionVariable(
+      OpIndex index, const PhiOp& phi) const;
+  template <typename Conditions>
+  bool HasSmallBound(const InductionVariable& induction,
+                     const Conditions& conditions) const;
+  bool IsSmallBound(OpIndex x, uint32_t step, bool is_signed,
+                    bool inclusive) const;
+  template <typename Conditions, typename Values>
+  void ProcessDecreasingInduction(OpIndex index, const PhiOp& phi,
+                                  const Conditions& conditions,
+                                  const Values& non_zero, const Block* forward);
+  template <typename Conditions, typename Values, typename InitLower>
+  bool HasDecreasingLowerBound(OpIndex value, uint32_t decrement,
+                               const Conditions& conditions,
+                               const Values& non_zero,
+                               const InitLower& init_lower) const;
+  template <typename Conditions>
+  std::optional<LoopBound> FindNotEqualBound(const InductionVariable& induction,
+                                             const Conditions& conditions,
+                                             const Block* forward) const;
+  std::optional<int64_t> EntryLowerBound(OpIndex x, OpIndex x_value,
+                                         const Block* forward) const;
+  std::optional<int64_t> EntryLowerBoundOfStart(OpIndex init,
+                                                const Block* forward) const;
+  void RecordLoopBound(const InductionVariable& induction,
+                       const LoopBound& bound);
+  std::optional<ReducedLength> TryResolveMergeBound(const LoopBound& bound);
+
   // Calls {f(condition, holds)} for the conditions combined by
   // {condition} (with and, or, and comparisons to 0) whose value is
   // known when {condition} holds, or does not hold if not {holds}. These
@@ -747,7 +980,14 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   template <typename F>
   void ForEachCondition(OpIndex condition, bool holds, const F& f,
                         int depth = 0) const;
+  // Calls {f(condition, holds)} for the conditions of the branches
+  // leading to {block} from {stop} (excluded) in the dominator tree, or
+  // only for the last {max_branches} of them.
+  template <typename F>
+  void ForEachDominatingCondition(const Block* block, const Block* stop,
+                                  const F& f, int max_branches = kMaxInt) const;
   std::optional<Relation> Normalize(OpIndex condition, bool holds) const;
+  bool Dominates(const Block* dominator, const Block* block) const;
 
   static std::optional<OffsetRange> ExtendDownToNonNegative(
       const OffsetRange& range, const std::optional<OffsetRange>& non_negative);
@@ -802,6 +1042,12 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   BoundsCheckMap known_bounds_checks_;
   NonNegativeOffsetMap known_non_negative_offsets_;
   MinLengthMap known_min_lengths_;
+  LengthAliasMap known_length_aliases_;
+  // Whether some length alias has been recorded.
+  bool has_length_aliases_ = false;
+  // Whether {known_length_aliases_} has an open snapshot for the current
+  // block.
+  bool length_aliases_open_ = false;
 
   FixedBlockSidetable<std::optional<Snapshot>> block_to_snapshot_mapping_;
 
@@ -812,6 +1058,7 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   ZoneVector<NonNegativeOffsetMap::Snapshot>
       predecessor_non_negative_snapshots_;
   ZoneVector<MinLengthMap::Snapshot> predecessor_min_length_snapshots_;
+  ZoneVector<LengthAliasMap::Snapshot> predecessor_length_alias_snapshots_;
 };
 
 template <class Next>
