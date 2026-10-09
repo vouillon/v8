@@ -221,6 +221,48 @@ class GraphVisitor : public OutputGraphAssembler<GraphVisitor<AfterNext>,
         input_block, added_block_phi_input);
   }
 
+  // Visits and emits the instructions in [start, end), followed by an
+  // Unreachable: the caller guarantees that the copy does not complete
+  // (one of its traps fires). Afterwards, the old to new mapping of the
+  // range is cleared, so that the operations can be emitted again. When
+  // the current block uses variables, the mapping is left as is, and the
+  // values set by the copy are never used, since nothing follows the
+  // Unreachable. The range must be within
+  // {input_block}, and must not separate an operation that can throw
+  // from the DidntThrow that follows it. It may include the operation
+  // being visited, which is then emitted again after the range.
+  void CloneAndInlineTrappingInstructions(OpIndex start, OpIndex end,
+                                          const Block* input_block) {
+    DCHECK_EQ(Asm().input_graph().BlockOf(start), input_block->index());
+    DCHECK_EQ(
+        Asm().input_graph().BlockOf(Asm().input_graph().PreviousIndex(end)),
+        input_block->index());
+    // Visiting operations changes the current origin, which should be
+    // restored for the operation we are in the middle of visiting.
+    OpIndex origin = Asm().current_operation_origin();
+    auto all_ops = Asm().input_graph().OperationIndices(start, end);
+    for (OpIndex op : all_ops) {
+      // The copy is emitted into a block with a single predecessor, and
+      // the original block continues after the range, so the range holds
+      // no phi and no terminator.
+      DCHECK(!Asm().input_graph().Get(op).template Is<PhiOp>());
+      DCHECK(!Asm().input_graph().Get(op).IsBlockTerminator());
+      if (!VisitOpAndUpdateMapping<false>(op, input_block)) {
+        break;
+      }
+    }
+    // An operation of the range may have been reduced to an unconditional
+    // trap, which ends the current block (as for an access to an array
+    // that is known to be null).
+    if (!Asm().generating_unreachable_operations()) Asm().Unreachable();
+    if (!current_block_needs_variables_) {
+      for (OpIndex op : all_ops) {
+        op_mapping_[op] = OpIndex::Invalid();
+      }
+    }
+    Asm().SetCurrentOrigin(origin);
+  }
+
   // {InlineOp} introduces two limitations unlike {CloneAndInlineBlock}:
   // 1. The input operation must not be emitted anymore as part of its
   // regular input block;

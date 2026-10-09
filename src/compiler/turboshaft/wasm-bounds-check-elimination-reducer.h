@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <optional>
+#include <set>
 
+#include "src/common/scoped-modification.h"
 #include "src/compiler/turboshaft/analyzer-iterator.h"
 #include "src/compiler/turboshaft/assembler.h"
 #include "src/compiler/turboshaft/graph.h"
@@ -183,6 +185,47 @@ namespace v8::internal::compiler::turboshaft {
 // loop exits, so {i} is not non-negative in the whole loop, and the rule
 // does not apply.
 //
+// When a block checks several offsets of the same base and array, the
+// instructions from the first of these checks to the last can form a
+// fallback sequence, and be duplicated into two paths:
+// 1. A fast path, taken when a guard on the smallest and the largest
+//    offsets succeeds, where these bounds checks, the guarded checks,
+//    are removed.
+// 2. The fallback code, taken otherwise, which runs a copy of the
+//    instructions with all their checks, and ends with an Unreachable.
+//    One of the checks then fails, at its original position and after
+//    the same side effects as in the original code.
+//
+// For example, consider:
+//     a[0] = 10;
+//     a[1] = 11;
+// This can be rewritten as:
+//     if (1 < a.length) {
+//         // Fast path: guarded bounds checks removed
+//         a[0] = 10;
+//         a[1] = 11;
+//     } else {
+//         // Fallback code: the original bounds checks
+//         a[0] = 10;
+//         a[1] = 11;
+//         // One of these checks fails.
+//         unreachable;
+//     }
+//
+// The guard checks the smallest and the largest offsets of the guarded
+// checks, unless one of these two checks is implied by what is already
+// known when entering the sequence. In the example above, the check
+// {0 < a.length} is implied by {1 < a.length}. But for a dynamic index,
+// the sequence
+//     a[i] = 10;
+//     a[i+1] = 11;
+// needs a two-sided guard {i < a.length && i + 1 < a.length}, unless
+// {i} is already known to be non-negative, in which case the one-sided
+// guard {i + 1 < a.length} is enough. On 64-bit targets, the two checks
+// are done with a single 64-bit comparison
+// {zext(i) + 1 < zext(a.length)}. The argument for the correctness of
+// fallback code is given at {FallbackInstructionSequence}.
+//
 // Facts are recorded at the point where a condition is known to hold:
 // right after a trap, or at the start of a branch target, at loop
 // headers for facts shown by induction (see {ProcessLoopHeader}), and
@@ -233,6 +276,9 @@ struct BoundsCheckKey {
   OpIndex length;
 
   bool operator==(const BoundsCheckKey& other) const = default;
+  bool operator<(const BoundsCheckKey& other) const {
+    return std::tie(base, length) < std::tie(other.base, other.length);
+  }
 
   template <typename H>
   friend H AbslHashValue(H h, const BoundsCheckKey& key) {
@@ -247,6 +293,9 @@ struct BoundsCheck {
   uint32_t offset;
 
   bool operator==(const BoundsCheck& other) const = default;
+  bool operator<(const BoundsCheck& other) const {
+    return std::tie(key, offset) < std::tie(other.key, other.offset);
+  }
 };
 
 // A range of 32-bit offsets [lower, upper] in modular arithmetic. It
@@ -350,6 +399,8 @@ class OffsetRange {
 //     (bvsge (bvsub n2 n1) #x00000000))
 //   (define-fun non-negative ((v (_ BitVec 32))) Bool
 //     (bvsge v #x00000000))
+//   (define-fun zext ((v (_ BitVec 32))) (_ BitVec 64)
+//     ((_ zero_extend 32) v))
 //
 // Array lengths {l} are assumed to be non-negative as signed integers
 // (less than 2^31), or less than 2^30 where needed (see "Limits" above).
@@ -785,6 +836,64 @@ class OffsetRange {
 //                     (= ((_ extract 31 0) ((_ zero_extend 32) x)) x)
 //                     (= ((_ extract 31 0) ((_ sign_extend 32) x)) x))))
 //   (check-sat)
+//
+// [guard-one-sided] A guard for the range lo..hi only needs to check hi
+// when some x + n with n <= lo is known to be non-negative (in
+// particular, when it is known to be within bounds): this is
+// [non-negative-and-check] with m = hi. Symmetrically, it only needs to
+// check lo when x + n is known to be within bounds for some n >= hi:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const n (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (declare-const hi (_ BitVec 32))
+//   (declare-const k (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (bvult (bvadd x n) l))
+//   (assert (bvult (bvadd x lo) l))
+//   (assert (valid-range lo hi))
+//   (assert (valid-range hi n))
+//   (assert (valid-range lo n))
+//   (assert (valid-range lo k))
+//   (assert (valid-range k hi))
+//   (assert (not (bvult (bvadd x k) l)))
+//   (check-sat)
+//
+// [guard-two-sided] On 64-bit targets, a guard checking both bounds of
+// the range lo..hi is the single comparison
+// zext(x + lo) + (hi - lo) < zext(l), with 64-bit zero extensions. It
+// shows that all the offsets of the range are within bounds:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (declare-const hi (_ BitVec 32))
+//   (declare-const k (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (valid-range lo hi))
+//   (assert (bvult (bvadd (zext (bvadd x lo)) (zext (bvsub hi lo)))
+//                  (zext l)))
+//   (assert (valid-range lo k))
+//   (assert (valid-range k hi))
+//   (assert (not (bvult (bvadd x k) l)))
+//   (check-sat)
+//
+// [guard-two-sided-complete] It holds whenever the offsets {lo} and {hi}
+// are both within bounds, so the guard never sends to the fallback code a
+// sequence whose checks would all succeed:
+//
+//   (declare-const l (_ BitVec 32))
+//   (declare-const x (_ BitVec 32))
+//   (declare-const lo (_ BitVec 32))
+//   (declare-const hi (_ BitVec 32))
+//   (assert (bvsge l #x00000000))
+//   (assert (valid-range lo hi))
+//   (assert (bvult (bvadd x lo) l))
+//   (assert (bvult (bvadd x hi) l))
+//   (assert (not (bvult (bvadd (zext (bvadd x lo)) (zext (bvsub hi lo)))
+//                       (zext l))))
+//   (check-sat)
 
 // A SnapshotTable whose keys are values of type {K}, created on first
 // use.
@@ -856,6 +965,275 @@ using MinLengthMap = KeyedSnapshotTable<OpIndex, uint32_t>;
 // are reached.
 using LengthAliasMap = KeyedSnapshotTable<OpIndex, ReducedLength>;
 
+// A sequence of instructions of a block, for which the reducer emits:
+// - a guard, which checks the smallest and the largest offsets of the
+//   guarded traps (a two-sided guard), or only one of them when the
+//   other check is implied by what is known at the start of the
+//   sequence (a one-sided guard),
+// - a fast path, when the guard succeeds: the instructions without the
+//   guarded traps,
+// - fallback code, when the guard fails: a copy of the instructions with
+//   the guarded traps, followed by an Unreachable.
+//
+// On the fast path, the guarded traps are all within bounds: their
+// offsets are within the range checked by the guard ([covered],
+// [guard-one-sided], [guard-two-sided]), for the same values of the
+// base and of the array length, which do not change within the
+// sequence.
+//
+// When the guard fails, one of the checked bounds is out of bounds.
+// These bounds are offsets of guarded traps, which are still in the
+// fallback code. Traps are also kept in the order of the original
+// instructions, so the first one that fails traps in the fallback code,
+// at its original position, after the same side effects as in the
+// original code. The Unreachable is never reached. The fallback code
+// only lacks two kinds of traps. The first are traps whose condition the
+// analysis showed to hold at their position, whatever the path to it.
+// The second are traps guarded by another sequence emitted earlier on
+// the path, whose guard succeeded. This is why sequences are never
+// emitted in fallback code
+// (see {WasmBoundsCheckEliminationReducer::in_fallback_code_}).
+class FallbackInstructionSequence {
+ public:
+  // Heuristic: only generate fallback code if the instruction
+  // sequence is at most this factor times the number of eliminated
+  // bounds checks, so that the code size grows at most linearly. Calls,
+  // which this count does not weigh by their size, end sequences (see
+  // {ProcessBlock}).
+  static constexpr uint32_t kInstructionBudgetPerTrap = 20;
+
+  // Heuristic: only generate fallback code if it eliminates at least
+  // this number of bounds checks, once the checks of the guard are
+  // taken into account. Sequences that eliminate a single check save
+  // little at run time, while the duplicated code makes compilation
+  // noticeably slower (mostly in later phases, such as late load
+  // elimination).
+  //
+  // The exception is a sequence whose guard checks both bounds with a
+  // single comparison (on 64-bit targets), which is accepted when it
+  // eliminates a single check. Such sequences are typical of byte
+  // accesses to an array, as in
+  //     a[i] = v; a[i+1] = v >> 8;
+  // where nothing is known about {i} with respect to the length of {a}:
+  // the two bounds checks are still replaced by a single one. In code
+  // produced by wasm_of_ocaml, sequences eliminating a single check
+  // almost always have one of their bounds already known, and they are
+  // frequent enough to slow down compilation.
+  static constexpr int kMinEliminatedChecks = 2;
+
+  // On 64-bit targets, a guard checking both bounds is a single
+  // comparison, done on 64 bits (see {EmitTwoSidedBoundsCheck}).
+  static constexpr bool kSingleComparisonTwoSidedGuard = Is64();
+
+  // Which bounds of {offsets} the guard needs to check.
+  struct Guard {
+    bool check_lower;
+    bool check_upper;
+    // Whether the guard checks both bounds with a single comparison.
+    bool IsSingleComparison() const {
+      return check_lower && check_upper && kSingleComparisonTwoSidedGuard;
+    }
+    // The number of comparisons of the guard.
+    int check_count() const {
+      return IsSingleComparison() ? 1 : check_lower + check_upper;
+    }
+  };
+
+  FallbackInstructionSequence(Zone* zone, const BoundsCheckKey& key,
+                              OpIndex index, uint32_t index_offset,
+                              OpIndex array_length, OffsetRange offsets,
+                              std::optional<OffsetRange> known_offsets,
+                              std::optional<OffsetRange> non_negative_offsets,
+                              OpIndex start_index, OpIndex end_index,
+                              uint32_t start_position, uint32_t end_position,
+                              std::initializer_list<OpIndex> guarded)
+      : key_(key),
+        index_(index),
+        index_offset_(index_offset),
+        array_length_(array_length),
+        offsets_(offsets),
+        known_offsets_(known_offsets),
+        non_negative_offsets_(non_negative_offsets),
+        start_index_(start_index),
+        end_index_(end_index),
+        start_position_(start_position),
+        end_position_(end_position),
+        guarded_traps_(guarded, zone) {
+    DCHECK_LT(start_index, end_index);
+    DCHECK_LT(start_position, end_position);
+    std::sort(guarded_traps_.begin(), guarded_traps_.end());
+  }
+
+  // Movable, not copyable.
+  FallbackInstructionSequence(const FallbackInstructionSequence&) = delete;
+  FallbackInstructionSequence& operator=(const FallbackInstructionSequence&) =
+      delete;
+  FallbackInstructionSequence(FallbackInstructionSequence&&) noexcept = default;
+  FallbackInstructionSequence& operator=(
+      FallbackInstructionSequence&&) noexcept = default;
+
+  const BoundsCheckKey& key() const { return key_; }
+  OpIndex index() const { return index_; }
+  uint32_t index_offset() const { return index_offset_; }
+  OpIndex array_length() const { return array_length_; }
+  const OffsetRange& offsets() const { return offsets_; }
+  OpIndex start_index() const { return start_index_; }
+  OpIndex end_index() const { return end_index_; }
+  const ZoneVector<OpIndex>& guarded_traps() const { return guarded_traps_; }
+
+  Guard ComputeGuard() const {
+    return ComputeGuard(offsets_, known_offsets_, non_negative_offsets_);
+  }
+
+  uint32_t instruction_count() const { return end_position_ - start_position_; }
+
+  bool ShouldKeep() const {
+    return IsProfitable(instruction_count(), guarded_traps_.size(),
+                        ComputeGuard());
+  }
+
+  // Whether {other}, which ends after {this}, can be merged into
+  // {this}: they must overlap or be adjacent, and the merged sequence
+  // must be profitable.
+  bool CanCoalesce(const FallbackInstructionSequence& other) const {
+    DCHECK_EQ(key_, other.key_);
+    DCHECK_LE(end_index_, other.end_index_);
+    if (end_index_ < other.start_index_) return false;
+    const FallbackInstructionSequence& first =
+        start_index_ <= other.start_index_ ? *this : other;
+    // Both ranges are within the current known offsets, which only grow
+    // within a block ([range-containment]), so their hull is valid.
+    std::optional<OffsetRange> merged_offsets = offsets_.Hull(other.offsets_);
+    DCHECK(merged_offsets.has_value());
+    size_t trap_count = guarded_traps_.size();
+    for (OpIndex trap : other.guarded_traps_) {
+      if (!std::binary_search(guarded_traps_.begin(), guarded_traps_.end(),
+                              trap)) {
+        trap_count++;
+      }
+    }
+    return IsProfitable(other.end_position_ - first.start_position_, trap_count,
+                        ComputeGuard(*merged_offsets, first.known_offsets_,
+                                     first.non_negative_offsets_));
+  }
+
+  void Coalesce(const FallbackInstructionSequence& other) {
+    DCHECK(CanCoalesce(other));
+    offsets_ = *offsets_.Hull(other.offsets_);
+    if (other.start_index_ < start_index_) {
+      // The guard moves to the start of {other}, so it can only rely
+      // on what is known there, and on values computed before it.
+      index_ = other.index_;
+      index_offset_ = other.index_offset_;
+      array_length_ = other.array_length_;
+      known_offsets_ = other.known_offsets_;
+      non_negative_offsets_ = other.non_negative_offsets_;
+      start_index_ = other.start_index_;
+      start_position_ = other.start_position_;
+    }
+    end_index_ = other.end_index_;
+    end_position_ = other.end_position_;
+    for (OpIndex trap : other.guarded_traps_) {
+      auto it =
+          std::lower_bound(guarded_traps_.begin(), guarded_traps_.end(), trap);
+      if (it == guarded_traps_.end() || *it != trap) {
+        guarded_traps_.insert(it, 1, trap);
+      }
+    }
+  }
+
+ private:
+  static Guard ComputeGuard(const OffsetRange& offsets,
+                            const std::optional<OffsetRange>& known,
+                            const std::optional<OffsetRange>& non_negative) {
+    bool lower_implied =
+        (known && ImpliesLowerBound(*known, offsets)) ||
+        (non_negative && ImpliesLowerBound(*non_negative, offsets));
+    bool upper_implied = known && ImpliesUpperBound(*known, offsets);
+    // When both checks are implied, we still check the upper bound (a
+    // one-sided guard, since the lower bound is implied) rather than
+    // proving that the guard can be omitted. This is not expected in
+    // practice: the first guarded trap would then usually have been
+    // redundant.
+    return {!lower_implied, lower_implied || !upper_implied};
+  }
+
+  // Whether some offset {n <= offsets.lower()} from {facts} is such
+  // that {base + n} is non-negative, so that only the upper bound of
+  // {offsets} needs to be checked ([guard-one-sided]). Offsets within
+  // bounds are non-negative, so {facts} can be either kind of range.
+  // The closest such {n} is used, since the range from {n} to
+  // {offsets.upper()} must be valid.
+  static bool ImpliesLowerBound(const OffsetRange& facts,
+                                const OffsetRange& offsets) {
+    OffsetRange::RelativePosition position = facts.Classify(offsets.lower());
+    // Either {n = offsets.lower()}, or {n = facts.upper()}.
+    return position == OffsetRange::RelativePosition::kInside ||
+           (position == OffsetRange::RelativePosition::kAbove &&
+            OffsetRange::IsValidRange(facts.upper(), offsets.upper()));
+  }
+
+  // Whether some offset {n >= offsets.upper()} from {known} is within
+  // bounds, so that only the lower bound of {offsets} needs to be
+  // checked ([guard-one-sided]).
+  static bool ImpliesUpperBound(const OffsetRange& known,
+                                const OffsetRange& offsets) {
+    OffsetRange::RelativePosition position = known.Classify(offsets.upper());
+    // Either {n = offsets.upper()}, or {n = known.lower()}.
+    return position == OffsetRange::RelativePosition::kInside ||
+           (position == OffsetRange::RelativePosition::kBelow &&
+            OffsetRange::IsValidRange(offsets.lower(), known.lower()));
+  }
+
+  // Whether the sequence removes at least {kMinEliminatedChecks} more
+  // bounds checks than its guard adds (1 for a guard that is a single
+  // comparison), with at most {kInstructionBudgetPerTrap} instructions
+  // per removed check.
+  static bool IsProfitable(uint32_t instruction_count, size_t trap_count,
+                           Guard guard) {
+    int eliminated = static_cast<int>(trap_count) - guard.check_count();
+    int min_eliminated = guard.IsSingleComparison() ? 1 : kMinEliminatedChecks;
+    return eliminated >= min_eliminated &&
+           instruction_count <=
+               kInstructionBudgetPerTrap * static_cast<uint32_t>(eliminated);
+  }
+
+  BoundsCheckKey key_;
+  // The index of the first guarded trap, {key_.base + index_offset_},
+  // from which the guard computes the indices it checks. It is computed
+  // before the start of the sequence (it is an input of the trap's
+  // condition), while {key_.base} is a canonical value, which may be an
+  // operation computed elsewhere (see {CanonicalValue}).
+  OpIndex index_;
+  uint32_t index_offset_;
+  // The array length used by the guard: the length operand of the
+  // condition of the first guarded trap, computed before the start of
+  // the sequence.
+  OpIndex array_length_;
+
+  // The smallest range containing the offsets of the guarded traps.
+  // Its bounds are offsets of guarded traps.
+  OffsetRange offsets_;
+
+  // What is known when entering the sequence: the offsets within
+  // bounds, and the offsets {n} for which {key_.base + n} is
+  // non-negative.
+  std::optional<OffsetRange> known_offsets_;
+  std::optional<OffsetRange> non_negative_offsets_;
+
+  // Range of instructions to clone [start_index, end_index), and their
+  // positions in the block. The range starts at a trap, or at its
+  // condition right before it, and ends right after a trap.
+  OpIndex start_index_;
+  OpIndex end_index_;
+  uint32_t start_position_;
+  uint32_t end_position_;
+
+  // Traps removed from the fast path (they remain in the fallback code),
+  // sorted by index.
+  ZoneVector<OpIndex> guarded_traps_;
+};
+
 class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
  public:
   // {load_elimination} is optional. When provided, values replaced by
@@ -870,11 +1248,14 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
         canonical_values_(phase_zone),
         values_by_structure_(phase_zone),
         truncations_(phase_zone),
+        fallback_sequence_starts_(phase_zone),
         known_bounds_checks_(phase_zone),
         known_non_negative_offsets_(phase_zone),
         known_min_lengths_(phase_zone),
         known_length_aliases_(phase_zone),
         block_to_snapshot_mapping_(graph.block_count(), phase_zone),
+        last_trap_bounds_checks_(phase_zone),
+        planned_fallbacks_by_key_(phase_zone),
         predecessor_bounds_check_snapshots_(phase_zone),
         predecessor_non_negative_snapshots_(phase_zone),
         predecessor_min_length_snapshots_(phase_zone),
@@ -909,6 +1290,12 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
 
   bool IsRedundantTrap(OpIndex index) const {
     return redundant_traps_.contains(index);
+  }
+
+  const FallbackInstructionSequence* FindFallbackCode(OpIndex index) const {
+    auto it = fallback_sequence_starts_.find(index);
+    if (it == fallback_sequence_starts_.end()) return nullptr;
+    return &it->second;
   }
 
  private:
@@ -949,14 +1336,41 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   // constant (usually 0), and the comparison is signed or unsigned.
   struct BoundsCheckCondition {
     BoundsCheck bounds_check;
+    // The operands of the condition {index < length}. For the condition
+    // of a trap (strict, unsigned and not narrowed), {index} is
+    // {bounds_check.key.base + bounds_check.offset}, and {length} is the
+    // array length.
+    OpIndex index;
+    OpIndex length;
     uint32_t reduction;
     bool is_signed;
   };
 
+  // A trap that may start a fallback sequence, with what is known
+  // right before it. This is also what is known at the start of the
+  // sequence, where the guard is emitted: the sequence starts at the
+  // trap, or at its condition, a comparison, which does not record any
+  // fact.
+  struct TrapInfo {
+    OpIndex trap_if;
+    // The operands of the trap's condition {index <u length}: {index} is
+    // {key.base + offset} for its key and offset.
+    OpIndex index;
+    OpIndex length;
+    // The trap, or its condition when the condition is right before
+    // the trap.
+    OpIndex start_index;
+    uint32_t start_position;
+    std::optional<OffsetRange> known_offsets;
+    std::optional<OffsetRange> non_negative_offsets;
+  };
+
   // An index decomposed as {base + offset}. {base} is the canonical
   // value of {base_value} (see {CanonicalValue}), an operation computing
-  // the base, which is only used to recognize array lengths, and is not
-  // necessarily available where the index is (see {ExistingTruncation}).
+  // the base. {base_value} is only used to recognize array lengths. It may
+  // not be available where the index is (see {ExistingTruncation}), so it
+  // is never emitted: the guards of fallback sequences use the operands
+  // of their first trap.
   // For the left side of a narrowed relation (see {DecomposeIndex}),
   // {base_value} may be a 64-bit operation whose truncation is the base,
   // so that {base} is its truncation key (see {TruncationKey}).
@@ -1015,7 +1429,7 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   void ProcessNotEqual(const Relation& relation);
   void ProcessNotEqualToConstant(const ReducedLength& length, uint32_t n);
   void ProcessBoundsCheck(OpIndex trap_if, const BoundsCheck& bounds_check,
-                          uint32_t reduction);
+                          OpIndex index, OpIndex length, uint32_t reduction);
 
   void ProcessLoopHeader(const Block* header);
   std::optional<InductionVariable> TryMatchInductionVariable(
@@ -1065,6 +1479,17 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
                                   int max_blocks = kMaxInt) const;
   std::optional<Relation> Normalize(OpIndex condition, bool holds) const;
 
+  void RecordFallbackSequence(const BoundsCheckKey& key,
+                              uint32_t previous_offset, OpIndex trap_if,
+                              uint32_t offset);
+  void UpdateKnownBoundsChecks(
+      const BoundsCheckKey& key, uint32_t offset, const OffsetRange& offsets,
+      OpIndex trap_if, OpIndex index, OpIndex length,
+      const std::optional<OffsetRange>& known_before,
+      const std::optional<OffsetRange>& non_negative_before);
+
+  void RegisterFallbackSequence(FallbackInstructionSequence&& sequence);
+
   static std::optional<OffsetRange> ExtendDownToNonNegative(
       const OffsetRange& range, const std::optional<OffsetRange>& non_negative);
   std::optional<OffsetRange> KnownOffsets(
@@ -1112,7 +1537,10 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   Zone* phase_zone_;
   const WasmLoadEliminationAnalyzer* load_elimination_;
 
-  // Set of traps identified as redundant by the analysis.
+  // The traps whose condition the analysis showed to hold at their
+  // position, whatever the path to it. The traps guarded by fallback
+  // sequences are kept apart, by the reducer (see
+  // {WasmBoundsCheckEliminationReducer::guarded_traps_}).
   ZoneAbslFlatHashSet<OpIndex> redundant_traps_;
 
   // Memoized canonical values, and the canonical value of each
@@ -1122,8 +1550,12 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   // The first TruncateWord64ToWord32 operation found for each canonical
   // value of its input (see {ExistingTruncation}), which may be in any
   // block. The canonical value of the truncation may instead be a 64-bit
-  // operation (see {TruncationKey}).
+  // operation, which is never emitted (see {TruncationKey}).
   mutable ZoneAbslFlatHashMap<OpIndex, OpIndex> truncations_;
+
+  // Fallback sequences keyed by their start index.
+  ZoneAbslFlatHashMap<OpIndex, FallbackInstructionSequence>
+      fallback_sequence_starts_;
 
   // The facts known at the current point: known offsets, non-negative
   // offsets, minimum lengths and length aliases.
@@ -1140,6 +1572,26 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   bool length_aliases_open_ = false;
 
   FixedBlockSidetable<std::optional<Snapshot>> block_to_snapshot_mapping_;
+
+  // Information about the current block. The maps are cleared at the end
+  // of each block, so they are B-tree maps: clearing one takes a time
+  // proportional to its size, while clearing a hash map takes a time
+  // proportional to its capacity.
+
+  // Position of the current operation in the block.
+  uint32_t current_position_ = 0;
+
+  // The block being processed.
+  const Block* current_block_ = nullptr;
+
+  // Previous bounds check traps that can start a fallback sequence.
+  ZoneAbslBTreeMap<BoundsCheck, TrapInfo> last_trap_bounds_checks_;
+
+  // The fallback sequences planned in this block. Sequences for
+  // different keys start at different traps, so the order in which the
+  // keys are visited does not matter.
+  ZoneAbslBTreeMap<BoundsCheckKey, ZoneVector<FallbackInstructionSequence>>
+      planned_fallbacks_by_key_;
 
   // The predecessor snapshots are used as temporary vectors when
   // starting to process a block. We store them as members to avoid
@@ -1180,18 +1632,70 @@ class WasmBoundsCheckEliminationReducer : public Next {
 
   OpIndex REDUCE_INPUT_GRAPH(TrapIf)(OpIndex ig_index,
                                      const TrapIfOp& trap_if) {
-    if (analyzer_.has_value() && analyzer_->IsRedundantTrap(ig_index)) {
-      if (v8_flags.turboshaft_verify_wasm_bounds_check_elimination) {
-        VerifyRedundantBoundsCheck(trap_if);
+    if (analyzer_.has_value()) {
+      MaybeInsertFallbackSequence(ig_index);
+      if (analyzer_->IsRedundantTrap(ig_index) ||
+          guarded_traps_.contains(ig_index)) {
+        if (v8_flags.turboshaft_verify_wasm_bounds_check_elimination) {
+          VerifyRedundantBoundsCheck(trap_if);
+        }
+        return OpIndex::Invalid();
       }
-      return OpIndex::Invalid();
     }
     return Next::ReduceInputGraphTrapIf(ig_index, trap_if);
+  }
+
+  OpIndex REDUCE_INPUT_GRAPH(Comparison)(OpIndex ig_index,
+                                         const ComparisonOp& comparison) {
+    if (analyzer_.has_value()) {
+      MaybeInsertFallbackSequence(ig_index);
+    }
+    return Next::ReduceInputGraphComparison(ig_index, comparison);
   }
 
  private:
   // Only constructed when the optimization is enabled.
   std::optional<WasmBoundsCheckEliminationAnalyzer> analyzer_;
+
+  // Whether we are emitting fallback code. Fallback sequences are only
+  // emitted on the main path. If a sequence B started within the fallback
+  // code of a sequence A, B would be emitted there, and B's guarded traps
+  // would then be removed from the rest of the graph. This includes A's
+  // fast path, emitted after A's fallback code, where B would be emitted
+  // again, with fallback code lacking B's guarded traps.
+  bool in_fallback_code_ = false;
+
+  // The traps guarded by the fallback sequences emitted so far. Once a
+  // sequence is emitted, its guarded traps are removed from the rest of
+  // the graph, which is the fast path of that sequence: the sequence was
+  // emitted on the main path, where it starts, and the rest of its block
+  // is only reached when its guard succeeds. Unlike the redundant traps
+  // of the analysis, their conditions only hold on that path.
+  ZoneAbslFlatHashSet<OpIndex> guarded_traps_{Asm().phase_zone()};
+
+#ifdef DEBUG
+  // The start indices of the sequences emitted so far. A sequence is
+  // emitted once: the phase does not clone blocks, and the fallback code
+  // of a sequence is not emitted again (see {in_fallback_code_}). Its
+  // traps are removed from the rest of the graph, so a second emission
+  // would have fallback code without them.
+  std::set<OpIndex> emitted_sequences_;
+#endif
+
+  // Inserts fallback code if the analyzer planned it here.
+  void MaybeInsertFallbackSequence(OpIndex ig_index) {
+    if (in_fallback_code_) return;
+
+    if (auto* sequence = analyzer_->FindFallbackCode(ig_index)) {
+#ifdef DEBUG
+      bool first_emission = emitted_sequences_.insert(ig_index).second;
+      DCHECK(first_emission);
+#endif
+      EmitFallbackSequence(*sequence);
+      guarded_traps_.insert(sequence->guarded_traps().begin(),
+                            sequence->guarded_traps().end());
+    }
+  }
 
   void VerifyRedundantBoundsCheck(const TrapIfOp& trap_if) {
     V<Word32> condition = __ MapToNewGraph(trap_if.condition());
@@ -1207,6 +1711,85 @@ class WasmBoundsCheckEliminationReducer : public Next {
           __ NoContextConstant());
       __ Unreachable();
     }
+  }
+
+  // Emits the guard and the fallback code of {seq} (see
+  // {FallbackInstructionSequence}), and continues with the fast path.
+  void EmitFallbackSequence(const FallbackInstructionSequence& seq) {
+    ScopedModification<bool> set_true(&in_fallback_code_, true);
+
+    // The cloned range must not separate an operation that can throw
+    // from the DidntThrow that follows it: it starts at a trap or at its
+    // condition, and ends right after a trap.
+    DCHECK(__ input_graph().Get(seq.start_index()).template Is<TrapIfOp>() ||
+           __ input_graph().Get(seq.start_index()).template Is<ComparisonOp>());
+    DCHECK(__ input_graph()
+               .Get(__ input_graph().PreviousIndex(seq.end_index()))
+               .template Is<TrapIfOp>());
+
+    const Block* input_block =
+        &__ input_graph().Get(__ input_graph().BlockOf(seq.start_index()));
+    Label<> fallback_code(this);
+    Label<> done(this);
+    FallbackInstructionSequence::Guard guard = seq.ComputeGuard();
+    if (guard.IsSingleComparison()) {
+      EmitTwoSidedBoundsCheck(seq, fallback_code);
+    } else {
+      if (guard.check_upper) {
+        EmitBoundsCheck(seq, seq.offsets().upper(), fallback_code);
+      }
+      if (guard.check_lower) {
+        EmitBoundsCheck(seq, seq.offsets().lower(), fallback_code);
+      }
+    }
+    GOTO(done);
+    BIND(fallback_code);
+    // The fallback code ends with an Unreachable, so values it defines
+    // (including variables, when the current block needs them) are not
+    // used past it: the operations of the sequence are emitted again on
+    // the fast path.
+    __ CloneAndInlineTrappingInstructions(seq.start_index(), seq.end_index(),
+                                          input_block);
+    BIND(done);
+  }
+
+  // The index {base + offset} for the key of {seq}, computed from the
+  // index of its first trap, {base + seq.index_offset()}.
+  V<Word32> GuardIndex(const FallbackInstructionSequence& seq,
+                       uint32_t offset) {
+    if (!seq.key().base.valid()) return __ Word32Constant(offset);
+    V<Word32> index = V<Word32>::Cast(__ MapToNewGraph(seq.index()));
+    uint32_t delta = offset - seq.index_offset();
+    return delta == 0 ? index : __ Word32Add(index, __ Word32Constant(delta));
+  }
+
+  // Emits a bounds check that compares {base + offset} against the
+  // array length and jumps to {fallback_code} if the index would go
+  // out of bounds.
+  void EmitBoundsCheck(const FallbackInstructionSequence& seq, uint32_t offset,
+                       Label<>& fallback_code) {
+    V<Word32> index = GuardIndex(seq, offset);
+    V<Word32> length = __ MapToNewGraph(seq.array_length());
+    GOTO_IF_NOT(LIKELY(__ Uint32LessThan(index, length)), fallback_code);
+  }
+
+  // Emits a single comparison checking that all the offsets of
+  // {seq.offsets()} are within bounds, and jumps to {fallback_code}
+  // otherwise: with {lo} and {hi} the bounds of the range,
+  //     zext(base + lo) + (hi - lo) < zext(length)
+  // computed on 64 bits, so that it cannot wrap around
+  // ([guard-two-sided]).
+  void EmitTwoSidedBoundsCheck(const FallbackInstructionSequence& seq,
+                               Label<>& fallback_code) {
+    DCHECK(FallbackInstructionSequence::kSingleComparisonTwoSidedGuard);
+    uint32_t lower = seq.offsets().lower();
+    uint32_t size = seq.offsets().upper() - lower;
+    V<Word32> start = GuardIndex(seq, lower);
+    V<Word64> end = __ Word64Add(__ ChangeUint32ToUint64(start),
+                                 __ Word64Constant(uint64_t{size}));
+    V<Word32> length = __ MapToNewGraph(seq.array_length());
+    GOTO_IF_NOT(LIKELY(__ Uint64LessThan(end, __ ChangeUint32ToUint64(length))),
+                fallback_code);
   }
 };
 
