@@ -7,6 +7,7 @@
 #include "src/compiler/js-heap-broker.h"
 #include "src/compiler/turboshaft/copying-phase.h"
 #include "src/compiler/turboshaft/phase.h"
+#include "src/compiler/turboshaft/wasm-bounds-check-elimination-reducer.h"
 #include "src/compiler/turboshaft/wasm-gc-typed-optimization-reducer.h"
 #include "src/compiler/turboshaft/wasm-load-elimination-reducer.h"
 
@@ -15,8 +16,8 @@ namespace v8::internal::compiler::turboshaft {
 void WasmGCOptimizePhase::Run(PipelineData* data, Zone* temp_zone) {
   UnparkedScopeIfNeeded scope(data->broker(),
                               v8_flags.turboshaft_trace_reduction);
-  CopyingPhase<WasmLoadEliminationReducer, WasmGCTypedOptimizationReducer>::Run(
-      data, temp_zone);
+  CopyingPhase<WasmBoundsCheckEliminationReducer, WasmLoadEliminationReducer,
+               WasmGCTypedOptimizationReducer>::Run(data, temp_zone);
 }
 
 }  // namespace v8::internal::compiler::turboshaft
