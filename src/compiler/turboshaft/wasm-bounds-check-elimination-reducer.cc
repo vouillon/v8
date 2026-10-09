@@ -32,6 +32,7 @@ static constexpr uint32_t kMaxUnrolledStep = 16;
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBlock(const Block& block) {
   BeginBlock(&block);
+  current_position_ = 0;
   for (OpIndex op_idx : graph_.OperationIndices(block)) {
     const Operation& op = graph_.Get(op_idx);
     if (const TrapIfOp* trap_if = op.TryCast<TrapIfOp>();
@@ -41,6 +42,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBlock(const Block& block) {
                    op.TryCast<WasmAllocateArrayOp>()) {
       RecordKnownLength(allocation->length());
     }
+    current_position_++;
   }
   FinishBlock(&block);
 }
@@ -59,6 +61,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessTrapIf(
 }
 
 void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
+  current_block_ = block;
   // Collect the snapshots of all predecessors.
   predecessor_bounds_check_snapshots_.clear();
   predecessor_non_negative_snapshots_.clear();
@@ -134,6 +137,38 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
 }
 
 void WasmBoundsCheckEliminationAnalyzer::FinishBlock(const Block* block) {
+  // Commit all profitable fallback sequences for this block.
+  for (auto& [_, v] : planned_fallbacks_by_key_) {
+    for (FallbackInstructionSequence& s : v) {
+      if (!s.ShouldKeep()) {
+        TRACE("  Discard fallback sequence: ["
+              << s.start_index() << ", " << s.end_index()
+              << "), not profitable (" << s.instruction_count()
+              << " instructions, " << s.covered_traps().size() << " traps, "
+              << s.ComputeGuard().check_count() << " guard checks)");
+        continue;
+      }
+      TRACE("Commit fallback sequence: ["
+            << s.start_index() << ", " << s.end_index() << "), "
+            << s.covered_traps().size() << " traps");
+      OpIndex start_index = s.start_index();
+      auto [it, inserted] =
+          fallback_sequence_starts_.try_emplace(start_index, std::move(s));
+      if (!inserted) {
+        // Sequences for different keys start at different traps, but
+        // two sequences for the same key can start at the same trap
+        // when they could not be coalesced. The second one is simply
+        // not used: its traps are only removed once a sequence covering
+        // them has been emitted.
+        TRACE("  Discard fallback sequence starting at "
+              << start_index << ": another sequence starts there");
+      }
+    }
+  }
+  planned_fallbacks_by_key_.clear();
+
+  last_trap_bounds_checks_.clear();
+
   std::optional<LengthAliasMap::Snapshot> length_aliases;
   if (length_aliases_open_) {
     length_aliases = known_length_aliases_.Seal();
@@ -192,7 +227,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
     return;
   }
   if (auto decoded = TryExtractBoundsCheckCondition(*relation)) {
-    const auto& [bounds_check, reduction, is_signed] = *decoded;
+    const auto& [bounds_check, index, length, reduction, is_signed] = *decoded;
     const auto& [key, offset] = bounds_check;
     // A signed comparison {x + n < a.length - r}, where {x + n} is known
     // to be non-negative, shows that {a.length - r} is positive, and so
@@ -213,7 +248,7 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
       bool is_bounds_check = relation->is_strict() && !is_signed &&
                              reduction == 0 && !relation->narrowed;
       ProcessBoundsCheck(is_bounds_check ? trap_if : OpIndex::Invalid(),
-                         bounds_check, reduction);
+                         bounds_check, index, length, reduction);
       // With {index < a.length - reduction}, the length is at least
       // {reduction + 1}, and more for a constant index
       // ([reduced-length-min-length], [constant-index-min-length]).
@@ -223,8 +258,10 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
       }
     }
   }
-  // This must be done after processing the bounds check: a trap must not
-  // show that its own index is non-negative.
+  // This must be done after processing the bounds check: what is known
+  // before a trap is used by the guard of a fallback sequence starting
+  // at it, and the fast path does not include the trap. So this trap
+  // must not show that its own index is non-negative.
   if (auto non_negative_index = TryExtractNonNegativeIndex(*relation)) {
     RecordNonNegativeOffset(non_negative_index->base,
                             non_negative_index->offset);
@@ -239,7 +276,9 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqual(
                                std::pair{relation.right, relation.left}}) {
     std::optional<ReducedLength> array_length = TryExtractArrayLength(length);
     if (!array_length) continue;
-    auto [base, base_value, offset] = ExtractBaseAndOffset(index);
+    BaseAndOffset decomposed = ExtractBaseAndOffset(index);
+    OpIndex base = decomposed.base;
+    uint32_t offset = decomposed.offset;
     if (!base.valid()) {
       ProcessNotEqualToConstant(*array_length, offset);
       return;
@@ -253,7 +292,8 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqual(
       continue;
     }
     TRACE("  Not equal to the array length");
-    ProcessBoundsCheck(OpIndex::Invalid(), BoundsCheck(key, last + 1), 0);
+    ProcessBoundsCheck(OpIndex::Invalid(), BoundsCheck(key, last + 1),
+                       OpIndex::Invalid(), OpIndex::Invalid(), 0);
     return;
   }
 }
@@ -272,7 +312,8 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqualToConstant(
 }
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
-    OpIndex trap_if, const BoundsCheck& bounds_check, uint32_t reduction) {
+    OpIndex trap_if, const BoundsCheck& bounds_check, OpIndex index,
+    OpIndex length, uint32_t reduction) {
   const auto& [key, offset] = bounds_check;
   // Only plain bounds checks can be eliminated.
   DCHECK_IMPLIES(trap_if.valid(), reduction == 0);
@@ -323,7 +364,121 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
   TRACE("  Known offsets for base " << key.base << " and length " << key.length
                                     << ": [" << offsets->lower() << ", "
                                     << offsets->upper() << "]");
-  known_bounds_checks_.Set(key, *offsets);
+
+  if (known.has_value() && trap_if.valid()) {
+    // The trap that established the bound of {known} on the side of
+    // {offset} can start a fallback sequence. For a trap, {reduction} is
+    // 0, and {offset} is not in {known}, so it is above or below it.
+    OffsetRange::RelativePosition position = known->Classify(offset);
+    DCHECK(position == OffsetRange::RelativePosition::kAbove ||
+           position == OffsetRange::RelativePosition::kBelow);
+    uint32_t prev_offset = position == OffsetRange::RelativePosition::kAbove
+                               ? known->upper()
+                               : known->lower();
+    RecordFallbackSequence(key, prev_offset, trap_if, offset);
+  }
+  UpdateKnownBoundsChecks(key, offset, *offsets, trap_if, index, length, known,
+                          non_negative);
+}
+
+// Record a fallback sequence covering the previous trap at
+// {previous_offset} and the current trap at {offset}.
+void WasmBoundsCheckEliminationAnalyzer::RecordFallbackSequence(
+    const BoundsCheckKey& key, uint32_t previous_offset, OpIndex trap_if,
+    uint32_t offset) {
+  DCHECK(trap_if.valid());
+
+  auto last_trap_it =
+      last_trap_bounds_checks_.find(BoundsCheck(key, previous_offset));
+  if (last_trap_it == last_trap_bounds_checks_.end()) {
+    // The prior bound was not established by a trap of this block (but
+    // by a condition of a dominating block, of the branch into this
+    // block or of a loop header, by a non-negative offset, or by a min
+    // length). The fallback code must cover instructions up to
+    // {trap_if}, and thus remain entirely within this block.
+    return;
+  }
+  const TrapInfo& previous = last_trap_it->second;
+
+  // Both offsets are within the known range, which only grows within
+  // a block ([range-containment]), so their hull is valid.
+  std::optional<OffsetRange> offsets =
+      OffsetRange(previous_offset).Hull(OffsetRange(offset));
+  DCHECK(offsets.has_value());
+
+  OpIndex fallback_end_index = graph_.NextIndex(trap_if);
+
+  TRACE("  Record fallback sequence:");
+  TRACE("    Previous trap: " << previous.trap_if);
+  TRACE("    Current trap: " << trap_if);
+  TRACE("    Instruction range: [" << previous.start_index << ", "
+                                   << fallback_end_index << ")");
+
+  FallbackInstructionSequence new_sequence(
+      phase_zone_, key, previous.index, previous_offset, previous.length,
+      *offsets, previous.known_offsets, previous.non_negative_offsets,
+      previous.start_index, fallback_end_index, previous.start_position,
+      current_position_ + 1, {previous.trap_if, trap_if});
+  RegisterFallbackSequence(std::move(new_sequence));
+}
+
+// Registers a fallback sequence for the key contained in the sequence.
+// Coalesces it with previous sequences if possible.
+void WasmBoundsCheckEliminationAnalyzer::RegisterFallbackSequence(
+    FallbackInstructionSequence&& sequence) {
+  auto [it, inserted] =
+      planned_fallbacks_by_key_.try_emplace(sequence.key(), phase_zone_);
+  auto& sequences = it->second;
+
+  sequences.emplace_back(std::move(sequence));
+
+  // Coalesce with previous sequences while possible. Coalescing can
+  // move the start of the sequence earlier, so it may then overlap
+  // with more sequences.
+  while (sequences.size() >= 2) {
+    auto& previous_sequence = sequences[sequences.size() - 2];
+    auto& current_sequence = sequences.back();
+    if (!previous_sequence.CanCoalesce(current_sequence)) break;
+    previous_sequence.Coalesce(current_sequence);
+    TRACE("  Coalesced with previous sequence:");
+    TRACE("    New range: [" << previous_sequence.start_index() << ", "
+                             << previous_sequence.end_index() << ")");
+    TRACE("    Traps: " << previous_sequence.covered_traps().size());
+    sequences.pop_back();
+  }
+}
+
+void WasmBoundsCheckEliminationAnalyzer::UpdateKnownBoundsChecks(
+    const BoundsCheckKey& key, uint32_t offset, const OffsetRange& offsets,
+    OpIndex trap_if, OpIndex index, OpIndex length,
+    const std::optional<OffsetRange>& known_before,
+    const std::optional<OffsetRange>& non_negative_before) {
+  // Records the updated bounds check range.
+  known_bounds_checks_.Set(key, offsets);
+
+  if (!trap_if.valid()) return;
+  // Traps are only considered for plain bounds checks {index <u length},
+  // whose operands are 32-bit values computed before the trap's condition,
+  // which the guard of a fallback sequence starting at the trap uses.
+  DCHECK_EQ(graph_.Get(index).outputs_rep(),
+            base::VectorOf({RegisterRepresentation::Word32()}));
+  DCHECK_EQ(graph_.Get(length).outputs_rep(),
+            base::VectorOf({RegisterRepresentation::Word32()}));
+
+  // We register a possible place to insert some fallback code. We
+  // will also clone the condition when it is right before the trap,
+  // since we don't want to keep it on the main sequence of execution.
+  OpIndex condition = graph_.Get(trap_if).Cast<TrapIfOp>().condition();
+  bool starts_at_condition = graph_.PreviousIndex(trap_if) == condition;
+  // The operation before the first one of a block is the terminator of
+  // another block, which is not a condition.
+  DCHECK_IMPLIES(starts_at_condition, current_position_ > 0);
+  OpIndex start_index = starts_at_condition ? condition : trap_if;
+  uint32_t start_position = current_position_ - starts_at_condition;
+  last_trap_bounds_checks_.insert_or_assign(
+      BoundsCheck(key, offset),
+      TrapInfo{trap_if, index, length, start_index, start_position,
+               known_before, non_negative_before});
 }
 
 template <typename F>
@@ -1119,8 +1274,10 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundsCheckCondition(
   std::optional<ReducedLength> length = TryExtractArrayLength(relation.right);
   if (!length) return std::nullopt;
   OpIndex length_key = LengthKey(length->length);
-  auto [base, base_value, offset] =
+  BaseAndOffset decomposed =
       ExtractBaseAndOffset(relation.left, relation.narrowed);
+  OpIndex base = decomposed.base;
+  uint32_t offset = decomposed.offset;
   uint32_t reduction = length->reduction;
   if (!relation.is_strict()) {
     if (reduction >= 1 &&
@@ -1135,8 +1292,8 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundsCheckCondition(
     }
   }
   return BoundsCheckCondition{
-      BoundsCheck(BoundsCheckKey(base, length_key), offset), reduction,
-      relation.is_signed()};
+      BoundsCheck(BoundsCheckKey(base, length_key), offset), relation.left,
+      relation.right, reduction, relation.is_signed()};
 }
 
 // Recognizes {a.length - r} for a small constant {r} (possibly written
@@ -1568,9 +1725,9 @@ uint64_t WasmBoundsCheckEliminationAnalyzer::ChangeOptions(
 // the options of the structural keys include the representations of the
 // inputs, no 32-bit value other than a truncation of {x} has the same
 // canonical value, and no operation has the same canonical value as an
-// operation where {trunc(x)} replaces {x}. It is never used as a 32-bit
-// value: {ExistingTruncation}, which finds the bases of 32-bit indices,
-// only returns actual truncations.
+// operation where {trunc(x)} replaces {x}. It is never emitted: the
+// guards of fallback sequences only use the indices of bounds checks of
+// the input graph, which are 32-bit values.
 OpIndex WasmBoundsCheckEliminationAnalyzer::TruncationKey(OpIndex x) const {
   OpIndex canonical = CanonicalValue(x);
   return values_by_structure_

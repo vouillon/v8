@@ -144,11 +144,48 @@ class WasmBoundsCheckEliminationReducerTest : public ReducerTest {
 
   static void Run(TestInstance& test) {
     test.Run<WasmBoundsCheckEliminationReducer>();
+    VerifyDominance(test.graph());
   }
-
   // Runs the pass with load elimination, as in the WasmGCOptimize phase.
   static void RunWithLoadElimination(TestInstance& test) {
     test.Run<WasmBoundsCheckEliminationReducer, WasmLoadEliminationReducer>();
+    VerifyDominance(test.graph());
+  }
+
+  // Checks that the inputs of the operations of {graph}, except phis,
+  // are defined in blocks that dominate their uses. Code emitted for
+  // fallback sequences must only use values available where it is.
+  static void VerifyDominance(const Graph& graph) {
+    for (const Block& block : graph.blocks()) {
+      for (OpIndex index : graph.OperationIndices(block)) {
+        const Operation& op = graph.Get(index);
+        if (op.Is<PhiOp>()) continue;
+        for (OpIndex input : op.inputs()) {
+          const Block* definition = &graph.Get(graph.BlockIndexOf(input));
+          const Block* b = &block;
+          while (b != nullptr && b != definition) b = b->GetDominator();
+          ASSERT_EQ(b, definition) << "input " << input << " of " << index
+                                   << " does not dominate it";
+        }
+      }
+    }
+  }
+
+  // The number of comparisons of a guard checking both bounds.
+  static constexpr size_t kTwoSidedGuardComparisons =
+      FallbackInstructionSequence::kSingleComparisonTwoSidedGuard ? 1 : 2;
+
+  // The number of 64-bit comparisons, as used by single-comparison
+  // guards checking both bounds.
+  static size_t CountWord64Comparisons(TestInstance& test) {
+    size_t count = 0;
+    for (const Operation& op : test.graph().AllOperations()) {
+      const ComparisonOp* comparison = op.TryCast<ComparisonOp>();
+      if (comparison && comparison->rep == RegisterRepresentation::Word64()) {
+        count++;
+      }
+    }
+    return count;
   }
 
  private:
@@ -166,17 +203,21 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, RedundantConstantIndex) {
   });
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, RedundantBetweenChecks) {
   // a[i]; a[i+2]; a[i+1];
+  // On 64-bit targets, a[i]; a[i+2]; also get fallback code.
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     BoundsCheck(Asm, a, i, 0);
     BoundsCheck(Asm, a, i, 2);
     BoundsCheck(Asm, a, i, 1);
   });
   Run(test);
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest,
@@ -189,6 +230,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest,
   });
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, NonNegativeIndexLearntLater) {
@@ -205,13 +247,32 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, NonNegativeIndexLearntLater) {
 TEST_F(WasmBoundsCheckEliminationReducerTest,
        NonNegativeIndexDoesNotCoverSmallerOffsets) {
   // a[i+2]; b[i+1]; b[i];
+  // On 64-bit targets, b[i+1]; b[i]; also get fallback code.
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     BoundsCheck(Asm, a, i, 2);
     BoundsCheck(Asm, b, i, 1);
     BoundsCheck(Asm, b, i, 0);
   });
   Run(test);
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NonNegativeIndexOneSidedGuard) {
+  // a[i]; b[i]; b[i+1]; b[i+2]; -> guarded by i+2 < b.length
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    BoundsCheck(Asm, b, i, 0);
+    BoundsCheck(Asm, b, i, 1);
+    BoundsCheck(Asm, b, i, 2);
+  });
+  Run(test);
+  // The first trap, and the other three in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 4u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+  // 4 original comparisons, 1 guard, 3 in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kComparison), 8u);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest,
@@ -258,6 +319,66 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, FactsFromDominatingBranch) {
   });
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 0u);
+}
+
+// b[i] shows that i is non-negative. Then a[i+5]; a[i+6]; a[i+7] and
+// a[i-1]; a[i-2]; a[i-3] give two fallback sequences with a one-sided
+// guard each. The condition of a[i-1] is computed right after the trap
+// of a[i+7] when {gap} is false, and one instruction later otherwise.
+template <typename Asm_t>
+static void TwoSequences(Asm_t& Asm, V<WasmArrayNullable> a,
+                         V<WasmArrayNullable> b, V<Word32> i, bool gap) {
+  using Test = WasmBoundsCheckEliminationReducerTest;
+  Test::BoundsCheck(Asm, b, i, 0);
+  Test::BoundsCheck(Asm, a, i, 5);
+  Test::BoundsCheck(Asm, a, i, 6);
+  V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+  V<Word32> index = __ Word32Add(i, __ Word32Constant(-1));
+  Test::BoundsCheck(Asm, a, i, 7);
+  if (gap) __ Word32Add(i, __ Word32Constant(42));
+  __ TrapIfNot(__ Uint32LessThan(index, length), TrapId::kTrapArrayOutOfBounds);
+  Test::BoundsCheck(Asm, a, i, -2);
+  Test::BoundsCheck(Asm, a, i, -3);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, CoalesceTouchingSequences) {
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    TwoSequences(Asm, a, b, i, /*gap*/ false);
+  });
+  Run(test);
+  // A single fallback sequence, with a two-sided guard, covers the
+  // six bounds checks of {a}.
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 7u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NoCoalescingAcrossGap) {
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    TwoSequences(Asm, a, b, i, /*gap*/ true);
+  });
+  Run(test);
+  // The two sequences do not overlap, so they are kept separate.
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 7u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, FallbackSequenceStartingAtTrap) {
+  // a[i]; b[i]; b[i+1]; b[i+2]; where the condition of the check of b[i]
+  // is not right before its trap, so the fallback code starts at the
+  // trap.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    V<Word32> length = __ ArrayLength(b, compiler::kWithNullCheck);
+    V<Word32> condition = __ Uint32LessThan(i, length);
+    __ Word32Add(i, __ Word32Constant(42));
+    __ TrapIfNot(condition, TrapId::kTrapArrayOutOfBounds);
+    BoundsCheck(Asm, b, i, 1);
+    BoundsCheck(Asm, b, i, 2);
+  });
+  Run(test);
+  // The first trap, and the other three in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 4u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, OCamlBoundsCheck) {
@@ -476,6 +597,122 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, NestedConstantAdditions) {
   });
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, ConstantIndexOneSidedGuard) {
+  // a[0]; a[1]; a[2]; -> guarded by 2 < a.length
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    BoundsCheck(Asm, a, {}, 1);
+    BoundsCheck(Asm, a, {}, 2);
+  });
+  Run(test);
+  // The traps are only in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+  // 3 original comparisons, 1 guard, 3 in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kComparison), 7u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NoFallbackForSingleCheck) {
+  // a[0]; a[1]; could be guarded by 1 < a.length, but this only
+  // eliminates one bounds check.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    BoundsCheck(Asm, a, {}, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForTwoChecks) {
+  // a[i]; a[i+1]; needs a guard checking both bounds. With a single
+  // comparison, it eliminates one check, which is enough for such a
+  // guard.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    BoundsCheck(Asm, a, i, 1);
+  });
+  Run(test);
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForTwoChecksBelow) {
+  // a[i+1]; a[i];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 1);
+    BoundsCheck(Asm, a, i, 0);
+  });
+  Run(test);
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       NoFallbackForOneSidedGuardEliminatingOneCheck) {
+  // a[i]; b[i]; b[i+1]; could be guarded by i+1 < b.length, since i
+  // is known to be non-negative, but this only eliminates one check.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    BoundsCheck(Asm, b, i, 0);
+    BoundsCheck(Asm, b, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForFourChecks) {
+  // a[i]; a[i+1]; a[i+2]; a[i+3];
+  // -> guarded by i < a.length && i+3 < a.length, or on 64-bit targets
+  // by zext(i) + 3 < zext(a.length)
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    BoundsCheck(Asm, a, i, 1);
+    BoundsCheck(Asm, a, i, 2);
+    BoundsCheck(Asm, a, i, 3);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 4u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+  // 4 original comparisons, the guard, 4 in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kComparison), 8u + kTwoSidedGuardComparisons);
+  ASSERT_EQ(CountWord64Comparisons(test),
+            FallbackInstructionSequence::kSingleComparisonTwoSidedGuard);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForThreeChecks) {
+  // a[i]; a[i+1]; a[i+2];
+  // With a single comparison for the guard, it eliminates two checks.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    BoundsCheck(Asm, a, i, 1);
+    BoundsCheck(Asm, a, i, 2);
+  });
+  Run(test);
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
+  ASSERT_EQ(CountWord64Comparisons(test), fallback ? 1u : 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TwoSidedGuardForChainBelow) {
+  // a[i+7]; a[i+5]; a[i+3]; a[i+1];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 7);
+    BoundsCheck(Asm, a, i, 5);
+    BoundsCheck(Asm, a, i, 3);
+    BoundsCheck(Asm, a, i, 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 4u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+  ASSERT_EQ(test.CountOp(Opcode::kComparison), 8u + kTwoSidedGuardComparisons);
 }
 
 // The sign extension of a 31-bit integer, as done by wasm_of_ocaml.
@@ -545,7 +782,9 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedAdditions) {
     BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
   });
   Run(test);
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
 
 TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedSubtractions) {
@@ -575,6 +814,76 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedAdditionsNoBase) {
   });
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedAdditionsAfterBranch) {
+  // if (c) a[trunc(x)]; a[trunc(x + 2)]; a[trunc(x + 1)];
+  // The operation computing trunc(x) in the branch does not dominate the
+  // other accesses, but it identifies their base, trunc(x). On 64-bit
+  // targets, they get fallback code, whose guard is computed from the
+  // index trunc(x + 2) of the first access.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    If(Asm, c, [&] { BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 0), 0); });
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 2), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+  });
+  Run(test);
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       TruncatedAdditionsAfterBranchAndAccess) {
+  // if (c) a[trunc(x)]; a[trunc(x)]; a[trunc(x + 2)]; a[trunc(x + 1)];
+  // The last check is redundant, although the first operation computing
+  // trunc(x) does not dominate it.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    If(Asm, c, [&] { BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 0), 0); });
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 0), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 2), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+  });
+  Run(test);
+  // The check in the branch, and those of a[trunc(x)] and a[trunc(x + 2)]
+  // (in fallback code on 64-bit targets).
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       TruncatedAdditionsBeforeBaseInBlock) {
+  // for (k = 0; ; k++) {
+  //   x = zext(k); a[trunc(x + 1)]; a[trunc(x + 3)];
+  //   if (trunc(x) >=s a.length) break; ...
+  // }
+  // The loop header processes the exit test, and so sees trunc(x), before
+  // the accesses that precede it in the same block. trunc(x) is their
+  // base, although it is computed after them, but the guard of their
+  // fallback sequence (on 64-bit targets) is computed from the index
+  // trunc(x + 1) of the first access.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    Loop(
+        Asm, 0, 1,
+        [&](V<Word32> k) {
+          V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+          return __ Int32LessThanOrEqual(
+              length, TruncatedIndex(Asm, __ ChangeUint32ToUint64(k), 0));
+        },
+        [&](V<Word32> k) {},
+        [&](V<Word32> k) {
+          V<Word64> x = __ ChangeUint32ToUint64(k);
+          BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+          BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 3), 0);
+        });
+  });
+  Run(test);
+  bool fallback = FallbackInstructionSequence::kSingleComparisonTwoSidedGuard;
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), fallback ? 1u : 0u);
 }
 
 // {i31.get_s(x)}, as compiled by the graph builder: a bitcast of the
@@ -1405,8 +1714,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest,
   // if (zext(a.length) <=u x) fail;
   // a[trunc(x + 1)]; a[trunc(x + 2)]; a[trunc(x + 3)];
   // No operation computes trunc(x), so it cannot be the base of the
-  // accesses (a DCHECK in {DecomposeIndex} checks that the base of a
-  // 32-bit index is a 32-bit value).
+  // accesses, nor of the guard of a fallback sequence.
   auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
     V<Word64> x = Wide(Asm, i, c);
     V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
@@ -1417,6 +1725,7 @@ TEST_F(WasmBoundsCheckEliminationReducerTest,
   });
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
 }
 
 // Loops over {k}, starting at {init} and adding {step}, with {exit}
@@ -1653,6 +1962,116 @@ TEST_F(WasmBoundsCheckEliminationReducerTest,
   });
   Run(test);
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, CoalescingMovesTheGuard) {
+  // if (i + 7 <u a.length) { a[i]; a[i+9]; a[i+11]; a[i-2]; }
+  // The bounds known when entering the block come from the branch, so
+  // a[i] and a[i+9] start no sequence. The sequence from a[i+9] to
+  // a[i+11] is then coalesced with the one from a[i] to a[i-2], which
+  // starts earlier: the guard is emitted before a[i], and its indices
+  // must be computed from i, as i + 9 is only computed later.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> length = __ ArrayLength(a, compiler::kWithNullCheck);
+    If(Asm, __ Uint32LessThan(__ Word32Add(i, __ Word32Constant(7)), length),
+       [&] {
+         BoundsCheck(Asm, a, i, 0);
+         BoundsCheck(Asm, a, i, 9);
+         BoundsCheck(Asm, a, i, 11);
+         BoundsCheck(Asm, a, i, -2);
+       });
+  });
+  Run(test);
+  // The four checks are in fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 4u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, GuardLengthFromFirstTrap) {
+  // n = x | y (64-bit);
+  // if (c) { a[trunc(n)]; }
+  // else {
+  //   z = new T[trunc(n)];
+  //   if (0 <s trunc(n - 1)) { z[i]; z[i+1]; z[i+2]; }
+  // }
+  // The length of z is trunc(n), whose canonical value is the one of the
+  // truncation in the other branch, which is found as the base of the
+  // length in the condition. The guard of the fallback sequence must use
+  // the length operand of z[i], not that truncation, which does not
+  // dominate it.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> n = Wide(Asm, i, c);
+    Label<> done(&Asm);
+    IF (c) {
+      BoundsCheck(Asm, a, __ TruncateWord64ToWord32(n), 0);
+      GOTO(done);
+    } ELSE {
+      V<WasmArrayNullable> z =
+          AllocateArray(Asm, b, __ TruncateWord64ToWord32(n));
+      If(Asm,
+         __ Int32LessThan(__ Word32Constant(0), TruncatedIndex(Asm, n, -1)),
+         [&] {
+           BoundsCheck(Asm, z, i, 0);
+           BoundsCheck(Asm, z, i, 1);
+           BoundsCheck(Asm, z, i, 2);
+         });
+      GOTO(done);
+    }
+    BIND(done);
+  });
+  // Dominance of the guard's inputs is checked by the run.
+  RunWithLoadElimination(test);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, InterleavedSequences) {
+  // if (i <s 0) fail; if (c <s 0) fail;
+  // a[i]; b[c]; a[i+1]; b[c+1]; a[i+2]; b[c+2];
+  // The sequence for b starts within the one for a. Its fallback code
+  // is emitted on the fast path of the sequence for a, so it does not
+  // contain the checks of a, while the fallback code of the sequence
+  // for a contains the first two checks of b.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    FailIf(Asm, __ Int32LessThan(i, __ Word32Constant(0)));
+    FailIf(Asm, __ Int32LessThan(c, __ Word32Constant(0)));
+    for (int32_t offset = 0; offset < 3; offset++) {
+      BoundsCheck(Asm, a, i, offset);
+      BoundsCheck(Asm, b, c, offset);
+    }
+  });
+  Run(test);
+  // Two FailIf, and two fallback sequences.
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 4u);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 5u + 3u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NoCoalescingBeyondBudget) {
+  // if (i <s 0) fail; a[i]; a[i+1]; a[i+2]; f = c * c * ... * c;
+  // a[i+3]; b[f];
+  // Merging the sequence for a[i] to a[i+2] with the one for a[i+2] and
+  // a[i+3] would duplicate the computation of f, which exceeds the
+  // budget, and the latter does not eliminate enough checks on its own.
+  static constexpr int kFillerSize = 70;
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    FailIf(Asm, __ Int32LessThan(i, __ Word32Constant(0)));
+    for (int32_t offset = 0; offset < 3; offset++) {
+      BoundsCheck(Asm, a, i, offset);
+    }
+    V<Word32> f = c;
+    for (int k = 0; k < kFillerSize; k++) f = __ Word32Mul(f, c);
+    BoundsCheck(Asm, a, i, 3);
+    BoundsCheck(Asm, b, f, 0);
+  });
+  Run(test);
+  size_t multiplications = 0;
+  for (const Operation& op : test.graph().AllOperations()) {
+    const WordBinopOp* binop = op.TryCast<WordBinopOp>();
+    if (binop && binop->kind == WordBinopOp::Kind::kMul) multiplications++;
+  }
+  ASSERT_EQ(multiplications, static_cast<size_t>(kFillerSize));
+  // A FailIf, and one fallback sequence.
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 2u);
+  // a[i+3] and b[f], and the three checks in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 5u);
 }
 
 // for (k = init; k != hi; k++) body, where the loop is only entered if
@@ -1941,6 +2360,42 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, LoopWithPhiOfLengthsReversed) {
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
 }
 
+TEST_F(WasmBoundsCheckEliminationReducerTest, FallbackSequenceAfterPhiBound) {
+  // hi = (c ? a.length : 0) - 1; if (0 <= hi) for (k = 0; ; k++) {
+  //   a[k]; if (k == hi) break; a[k+1]; a[k+5]; a[k+6]; a[k+7];
+  // }
+  // The length of a used by the phi is not available in the loop, so the
+  // guard of the fallback sequence must use another one.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    Label<Word32> merge(&Asm);
+    IF (c) {
+      GOTO(merge, __ ArrayLength(a, compiler::kWithNullCheck));
+    } ELSE {
+      GOTO(merge, __ Word32Constant(0));
+    }
+    BIND(merge, length);
+    V<Word32> hi = __ Word32Sub(length, __ Word32Constant(1));
+    Label<> done(&Asm);
+    GOTO_IF_NOT(__ Int32LessThanOrEqual(__ Word32Constant(0), hi), done);
+    LoopLabel<Word32> loop(&Asm);
+    GOTO(loop, __ Word32Constant(0));
+    BIND_LOOP(loop, k) {
+      BoundsCheck(Asm, a, k, 0);
+      GOTO_IF(__ Word32Equal(k, hi), done);
+      BoundsCheck(Asm, a, k, 1);
+      BoundsCheck(Asm, a, k, 5);
+      BoundsCheck(Asm, a, k, 6);
+      BoundsCheck(Asm, a, k, 7);
+      GOTO(loop, __ Word32Add(k, __ Word32Constant(1)));
+    }
+    BIND(done);
+  });
+  Run(test);
+  // a[k+5], a[k+6] and a[k+7] in the fallback code.
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+}
+
 TEST_F(WasmBoundsCheckEliminationReducerTest, LoopWithLoopPhiBound) {
   // for (arr = a, len = 0; c; arr = b, len = arr.length) {
   //   hi = len - 1; if (0 <= hi) for (k = 0; ; k++) {
@@ -2116,6 +2571,38 @@ TEST_F(WasmBoundsCheckEliminationReducerTest, LengthAliasAtLoopExit) {
   Run(test);
   // Only a[i] is checked.
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, FallbackSequenceWithAliasLength) {
+  // hi = c ? a.length : 0; if (1 <= hi) for (k = 1; ; k++) {
+  //   if (!(k < hi)) trap; a[k+1]; a[k+2]; if (k == hi) break;
+  // }
+  // In the loop, hi is a.length, so the first check is a bounds check of
+  // a. The array length of the phi is not available in the loop, but the
+  // guard of the fallback sequence starting at the first check uses its
+  // length operand, hi, which is.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    Label<Word32> merge(&Asm);
+    IF (c) {
+      GOTO(merge, __ ArrayLength(a, compiler::kWithNullCheck));
+    } ELSE {
+      GOTO(merge, __ Word32Constant(0));
+    }
+    BIND(merge, hi);
+    NotEqualLoop(
+        Asm, hi, 1, 1,
+        [&] { return __ Int32LessThanOrEqual(__ Word32Constant(1), hi); },
+        [&](V<Word32> k) {
+          __ TrapIfNot(__ Uint32LessThan(k, hi), TrapId::kTrapArrayOutOfBounds);
+          BoundsCheck(Asm, a, k, 1);
+          BoundsCheck(Asm, a, k, 2);
+        });
+  });
+  Run(test);
+  // The three checks are in fallback code, whose guard only checks the
+  // upper bound, as k is non-negative.
+  ASSERT_EQ(test.CountOp(Opcode::kUnreachable), 1u);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 3u);
 }
 
 // for (k = init; ; k -= step) { body(k); if (exit(k)) break; }, where
