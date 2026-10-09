@@ -463,6 +463,299 @@ TEST_F(WasmBoundsCheckEliminationReducerTest,
   ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
 }
 
+TEST_F(WasmBoundsCheckEliminationReducerTest, NestedConstantAdditions) {
+  // a[(i+1)+1]; a[i+2]; a[(i+3)-1]; as produced for instance by loop
+  // unrolling: all three indices are i+2.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word32> j = __ Word32Add(i, __ Word32Constant(1));
+    BoundsCheck(Asm, a, j, 1);
+    BoundsCheck(Asm, a, i, 2);
+    V<Word32> k = __ Word32Sub(__ Word32Add(i, __ Word32Constant(3)),
+                               __ Word32Constant(1));
+    BoundsCheck(Asm, a, k, 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+// The sign extension of a 31-bit integer, as done by wasm_of_ocaml.
+template <typename Asm_t>
+static V<Word32> SignExtend31(Asm_t& Asm, V<Word32> value, int shift = 1) {
+  return __ Word32ShiftRightArithmetic(
+      __ Word32ShiftLeft(value, __ Word32Constant(shift)),
+      __ Word32Constant(shift));
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, DuplicatedComputations) {
+  // a[0]; if (a.length - 1 <= sext(i - c)) fail; a[sext(i - c) + 1];
+  // where {sext(i - c)} is computed twice. Both computations have the
+  // same value, so the OCaml bounds check covers the Wasm one.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm,
+           __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1),
+                                    SignExtend31(Asm, __ Word32Sub(i, c))));
+    BoundsCheck(Asm, a, SignExtend31(Asm, __ Word32Sub(i, c)), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, CommutedComputations) {
+  // a[0]; if (a.length - 1 <= i * c) fail; a[c * i + 1];
+  // Both products have the same value.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1),
+                                         __ Word32Mul(i, c)));
+    BoundsCheck(Asm, a, __ Word32Mul(c, i), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, DifferentComputations) {
+  // a[0]; if (a.length - 1 <= sext(i)) fail; a[sext2(i) + 1];
+  // where {sext2} shifts by 2 instead of 1: the values differ.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm, __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1),
+                                         SignExtend31(Asm, i)));
+    BoundsCheck(Asm, a, SignExtend31(Asm, i, 2), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+// {trunc(x + offset)}, for a 64-bit {x}, as computed by languages with
+// 64-bit integers for the index of {a[x + offset]}.
+template <typename Asm_t>
+static V<Word32> TruncatedIndex(Asm_t& Asm, V<Word64> x, int64_t offset) {
+  return __ TruncateWord64ToWord32(
+      offset == 0 ? x : __ Word64Add(x, __ Word64Constant(offset)));
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedAdditions) {
+  // a[trunc(x)]; a[trunc(x + 2)]; a[trunc(x + 1)];
+  // As for a[i]; a[i+2]; a[i+1]: the last check is redundant.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 0), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 2), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedSubtractions) {
+  // a[trunc(x)]; a[trunc(x + 2)]; a[trunc(x - (-1))];
+  // The last index is trunc(x) + 1, between the first two.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 0), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 2), 0);
+    BoundsCheck(Asm, a,
+                __ TruncateWord64ToWord32(
+                    __ Word64Sub(x, __ Word64Constant(int64_t{-1}))),
+                0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TruncatedAdditionsNoBase) {
+  // a[trunc(x + 2)]; a[trunc(x + 1)];
+  // No operation computes trunc(x), so the indices are not decomposed,
+  // and the second check stays.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 2), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+// {i31.get_s(x)}, as compiled by the graph builder: a bitcast of the
+// reference, and a shift.
+template <typename Asm_t>
+static V<Word32> I31GetS(Asm_t& Asm, V<Object> x) {
+  return __ Word32ShiftRightArithmeticShiftOutZeros(
+      __ TruncateWordPtrToWord32(__ BitcastTaggedToWordPtr(x)),
+      kSmiTagSize + kSmiShiftSize);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, SmiBitcastsShared) {
+  // x = b!, for b of type (ref null i31); a[0];
+  // if (a.length - 1 <= i31.get_s(x)) fail; a[i31.get_s(x) + 1];
+  // A non-null i31 reference is a Smi, so the two bitcasts of x, and
+  // the two shifts, have the same value.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Object> x =
+        __ AssertNotNull(b, wasm::ValueType::RefNull(wasm::kWasmI31Ref),
+                         TrapId::kTrapNullDereference);
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm,
+           __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), I31GetS(Asm, x)));
+    BoundsCheck(Asm, a, I31GetS(Asm, x), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       SmiBitcastsSharedThroughAnnotation) {
+  // x = b annotated with type (ref i31); a[0];
+  // if (a.length - 1 <= i31.get_s(x)) fail; a[i31.get_s(x) + 1];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Object> object = b;
+    V<Object> x =
+        __ AnnotateWasmType(object, wasm::ValueType::Ref(wasm::kWasmI31Ref));
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm,
+           __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), I31GetS(Asm, x)));
+    BoundsCheck(Asm, a, I31GetS(Asm, x), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, NullableI31BitcastsNotShared) {
+  // x = b annotated with type (ref null i31); a[0];
+  // if (a.length - 1 <= i31.get_s(x)) fail; a[i31.get_s(x) + 1];
+  // x may be null, a heap object.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Object> object = b;
+    V<Object> x = __ AnnotateWasmType(
+        object, wasm::ValueType::RefNull(wasm::kWasmI31Ref));
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm,
+           __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), I31GetS(Asm, x)));
+    BoundsCheck(Asm, a, I31GetS(Asm, x), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, DifferentShiftsNotShared) {
+  // a[i >>> c]; a[i >> c];
+  // The shifts have the same inputs, but are of different kinds.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, __ Word32ShiftRightLogical(i, c), 0);
+    BoundsCheck(Asm, a, __ Word32ShiftRightArithmetic(i, c), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, SubtractionsNotCommuted) {
+  // a[i - c]; a[c - i];
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, __ Word32Sub(i, c), 0);
+    BoundsCheck(Asm, a, __ Word32Sub(c, i), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+static constexpr wasm::ArrayType kI32ArrayType(wasm::kWasmI32, true);
+
+TEST_F(WasmBoundsCheckEliminationReducerTest,
+       AllocatedWithLengthOfAnotherArray) {
+  // a[i]; x = new T[a.length]; x[i];
+  // Load elimination replaces x.length by a.length, so that the lengths
+  // of a and x have the same canonical value.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 0);
+    V<WasmArrayNullable> x = __ WasmAllocateArray(
+        V<Map>::Cast(b), __ ArrayLength(a, compiler::kWithNullCheck),
+        &kI32ArrayType, SharedFlag{false});
+    BoundsCheck(Asm, x, i, 0);
+  });
+  RunWithLoadElimination(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, SmiBitcastsSharedThroughCast) {
+  // x = (b cast to (ref null i31))!, the assertion being typed anyref;
+  // a[0]; if (a.length - 1 <= i31.get_s(x)) fail; a[i31.get_s(x) + 1];
+  // The cast allows null, but the non-null assertion does not.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Object> object = b;
+    V<Object> cast =
+        __ WasmTypeCast(object, OptionalV<Map>::Nullopt(),
+                        {wasm::ValueType::RefNull(wasm::kWasmAnyRef),
+                         wasm::ValueType::RefNull(wasm::kWasmI31Ref)});
+    V<Object> x =
+        __ AssertNotNull(cast, wasm::ValueType::RefNull(wasm::kWasmAnyRef),
+                         TrapId::kTrapNullDereference);
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm,
+           __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), I31GetS(Asm, x)));
+    BoundsCheck(Asm, a, I31GetS(Asm, x), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, TruncationInSiblingBranch) {
+  // if (c) a[trunc(x)]; a[trunc(x + 1)]; a[trunc(x + 1)];
+  // The base of the last two accesses is trunc(x), found in the branch,
+  // which does not leak facts after it: only the last check is
+  // redundant.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    If(Asm, c, [&] { BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 0), 0); });
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, Truncated64BitConstant) {
+  // a[trunc(x + 1)]; a[trunc(x + 2^32 + 1)];
+  // Both indices are the same 32-bit value.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    V<Word64> x = __ ChangeUint32ToUint64(i);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 0), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, 1), 0);
+    BoundsCheck(Asm, a, TruncatedIndex(Asm, x, (int64_t{1} << 32) + 1), 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, DeeplyNestedAdditions) {
+  // a[i+8]; a[((i+1)+1)...+1] (8 additions);
+  // The nested additions are folded up to a depth of 8.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, i, 8);
+    V<Word32> index = i;
+    for (int k = 0; k < 8; k++) {
+      index = __ Word32Add(index, __ Word32Constant(1));
+    }
+    BoundsCheck(Asm, a, index, 0);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 1u);
+}
+
+TEST_F(WasmBoundsCheckEliminationReducerTest, HeapObjectBitcastsNotShared) {
+  // a[0]; if (a.length - 1 <= i31.get_s(b)) fail; a[i31.get_s(b) + 1];
+  // b is not known to be a Smi: its address may change between the two
+  // bitcasts.
+  auto test = CreateTest([](auto& Asm, auto a, auto b, auto i, auto c) {
+    BoundsCheck(Asm, a, {}, 0);
+    FailIf(Asm,
+           __ Uint32LessThanOrEqual(ReducedLength(Asm, a, 1), I31GetS(Asm, b)));
+    BoundsCheck(Asm, a, I31GetS(Asm, b), 1);
+  });
+  Run(test);
+  ASSERT_EQ(test.CountOp(Opcode::kTrapIf), 2u);
+}
+
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"
 
 }  // namespace v8::internal::compiler::turboshaft

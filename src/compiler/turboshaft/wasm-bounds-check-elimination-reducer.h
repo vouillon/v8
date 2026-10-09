@@ -71,30 +71,33 @@ namespace v8::internal::compiler::turboshaft {
 // the Wasm access {a[i+1]} is within bounds, as long as some previous
 // access to {a} showed that its length is at least 1.
 //
-// The analysis also tracks a lower bound on the length of each array,
+// The analysis also tracks a lower bound on each array length,
 // which bounds checks raise: any successful bounds check of {a} shows
 // that its length is at least 1, and {n < a.length - r} for a constant
 // {n} that it is at least {n + r + 1}. It shows that the constant
 // indices below it are within bounds, and that {a.length - r} does not
 // wrap around when it is at least {r}.
 //
-// Bounds checks are grouped by array: the ArrayLength operations of the
-// same array, possibly through casts, non-null assertions and type
-// annotations, or values
-// replaced by load elimination, compute the same length (see
-// {LengthKey}).
+// Facts are about values: a bounds check {base + n < l} depends on the
+// value {l}, not on the array whose length it is. Bounds checks are
+// thus grouped by the canonical value of the length (see
+// {CanonicalValue}), which is the same for all the ArrayLength
+// operations of an array, and for arrays that load elimination knows to
+// have the same length, as an array allocated with the length of
+// another one: in {b = new T[a.length]; for (i = 0; i <u a.length; i++)
+// b[i] = a[i];}, the condition covers the accesses to both arrays.
+// Bases are canonical values too, so that the same value computed twice
+// (as the index of an OCaml bounds check and of the access it protects)
+// is the same base, and nested additions of constants, as produced by
+// loop unrolling, are folded into a single offset. An index
+// {trunc(Y + n)}, as computed by languages with 64-bit integers, is
+// {trunc(Y) + n} when an operation computing {trunc(Y)} already exists
+// (for the index of a previous access {a[trunc(Y)]}).
 //
 // Facts are recorded at the point where a condition is known to hold:
 // right after a trap, or at the start of a branch target. They are only
-// used in blocks dominated by that point (see {BeginBlock}), and they
-// are about values used at that point, or values equal to them that
-// dominate them (the objects of casts, non-null assertions and type
-// annotations, and the
-// replacements of load elimination), which are therefore defined in
-// dominators of it. Such a value is not computed again between the
-// last execution of that point and a use of the fact: as the point
-// dominates the use, a path from the definition to the use goes through
-// the point, which records the fact again.
+// used in blocks dominated by that point (see {BeginBlock}), where they
+// still hold (see {CanonicalValue}).
 //
 // Limits
 //
@@ -108,10 +111,13 @@ namespace v8::internal::compiler::turboshaft {
 // constants are useful. It keeps the range of offsets from {n} to
 // {n + r} shown by such a condition valid.
 
-// Key for grouping bounds checks by base and array (see {LengthKey}).
+// Key for grouping bounds checks by base and array length. The length
+// is the canonical value of an array length (see {LengthKey}): a bounds
+// check {base + n < l} only depends on the value {l}, which may be the
+// length of several arrays.
 struct BoundsCheckKey {
-  OpIndex base;    // Invalid means that we do not have a base.
-  OpIndex length;  // The array whose length it is (see {LengthKey}).
+  OpIndex base;  // Invalid means that we do not have a base.
+  OpIndex length;
 
   bool operator==(const BoundsCheckKey& other) const = default;
 
@@ -195,7 +201,7 @@ class OffsetRange {
       uint32_t size = std::max(first->upper_ - first->lower_, second_upper);
       // The hull would span more than 2^31 values, and would not be a
       // valid range. This cannot happen for two ranges of offsets within the
-      // bounds of the same array for the same base (as array lengths are
+      // bounds of the same array length for the same base (as they are
       // less than 2^30), nor for two ranges of non-negative offsets of the
       // same base. But it can in unreachable code, where facts may
       // contradict each other, so this check is needed.
@@ -396,6 +402,17 @@ class OffsetRange {
 //   (assert (bvult n m))
 //   (assert (not (bvult n l)))
 //   (check-sat)
+//
+// [truncated-addition] The truncation to 32 bits of a 64-bit addition
+// (or subtraction) is the addition of the truncations:
+//
+//   (declare-const x (_ BitVec 64))
+//   (declare-const c (_ BitVec 64))
+//   (assert (not (and (= ((_ extract 31 0) (bvadd x c))
+//                        (bvadd ((_ extract 31 0) x) ((_ extract 31 0) c)))
+//                     (= ((_ extract 31 0) (bvsub x c))
+//                        (bvsub ((_ extract 31 0) x) ((_ extract 31 0) c))))))
+//   (check-sat)
 
 // Maps keys of type {K} to values of type {V}. Supports snapshotting
 // for control flow merge points.
@@ -443,7 +460,7 @@ using BoundsCheckMap = KeyedSnapshotTable<BoundsCheckKey, OffsetRange>;
 // known to be non-negative.
 using NonNegativeOffsetMap = KeyedSnapshotTable<OpIndex, OffsetRange>;
 
-// Maps arrays (see {LengthKey}) to a lower bound of their length.
+// Maps array lengths (by canonical value) to a lower bound.
 using MinLengthMap = KeyedSnapshotTable<OpIndex, uint32_t>;
 
 class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
@@ -457,6 +474,9 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
         phase_zone_(phase_zone),
         load_elimination_(load_elimination),
         redundant_traps_(phase_zone),
+        canonical_values_(phase_zone),
+        values_by_structure_(phase_zone),
+        truncations_(phase_zone),
         known_bounds_checks_(phase_zone),
         known_non_negative_offsets_(phase_zone),
         known_min_lengths_(phase_zone),
@@ -466,6 +486,11 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
         predecessor_min_length_snapshots_(phase_zone) {}
 
   void Run() {
+    // On wasm_of_ocaml programs, about one operation in 10 gets a canonical
+    // value, and one in 30 a structural key: reserving that much avoids
+    // most of the rehashing as the maps grow.
+    canonical_values_.reserve(graph_.op_id_count() / 8);
+    values_by_structure_.reserve(graph_.op_id_count() / 32);
     LoopFinder loop_finder(phase_zone_, &graph_, LoopFinder::Config{});
     AnalyzerIterator iterator(phase_zone_, graph_, loop_finder);
 
@@ -524,11 +549,33 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
     uint32_t reduction;
   };
 
-  // An index decomposed as {base + offset}, where {base} is the
-  // operation computing the base (invalid for a constant index).
+  // An index decomposed as {base + offset}. {base} is the canonical
+  // value of {base_value} (see {CanonicalValue}), an operation computing
+  // the base, which is only used to recognize array lengths, and is not
+  // necessarily available where the index is (see {ExistingTruncation}).
   struct BaseAndOffset {
     OpIndex base;
+    OpIndex base_value;
     uint32_t offset;
+  };
+
+  // Identifies an operation whose value only depends on its inputs (see
+  // {CanonicalValue}) by its opcode, options and the canonical values of
+  // its inputs.
+  struct StructuralKey {
+    Opcode opcode;
+    uint64_t options;
+    uint64_t constant;
+    OpIndex left;
+    OpIndex right;
+
+    bool operator==(const StructuralKey& other) const = default;
+
+    template <typename H>
+    friend H AbslHashValue(H h, const StructuralKey& key) {
+      return H::combine(std::move(h), key.opcode, key.options, key.constant,
+                        key.left, key.right);
+    }
   };
 
   void ProcessBlock(const Block& block);
@@ -564,8 +611,14 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   bool IsArrayLengthWithoutWrapAround(OpIndex length) const;
   std::optional<BaseAndOffset> TryExtractNonNegativeIndex(
       const Relation& relation) const;
+  BaseAndOffset ExtractBaseAndOffset(OpIndex index) const;
   BaseAndOffset DecomposeIndex(OpIndex index) const;
+  OpIndex CanonicalValue(OpIndex value, int depth = 0) const;
+  bool IsKnownSmi(OpIndex object) const;
   std::optional<uint32_t> TryExtractI32Const(OpIndex expr) const;
+  std::optional<uint32_t> TryExtractI64ConstLow(OpIndex expr) const;
+  static uint64_t ChangeOptions(const ChangeOp& change);
+  OpIndex ExistingTruncation(OpIndex x) const;
 
   const Graph& graph_;
   Zone* phase_zone_;
@@ -573,6 +626,15 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
 
   // Set of traps identified as redundant by the analysis.
   ZoneAbslFlatHashSet<OpIndex> redundant_traps_;
+
+  // Memoized canonical values, and the canonical value of each
+  // structure (the first operation found with this structure).
+  mutable ZoneAbslFlatHashMap<OpIndex, OpIndex> canonical_values_;
+  mutable ZoneAbslFlatHashMap<StructuralKey, OpIndex> values_by_structure_;
+  // The first TruncateWord64ToWord32 operation found for each canonical
+  // value of its input (see {ExistingTruncation}), which may be in any
+  // block.
+  mutable ZoneAbslFlatHashMap<OpIndex, OpIndex> truncations_;
 
   // Summary of all the bounds check information collected so far.
   BoundsCheckMap known_bounds_checks_;
