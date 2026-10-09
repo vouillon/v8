@@ -442,7 +442,17 @@ class V8_EXPORT_PRIVATE WasmLoadEliminationAnalyzer {
 
   void Run();
 
-  OpIndex Replacement(OpIndex index) { return replacements_[index]; }
+  // The replacement of the operation {index}, if any: a value equal to
+  // the value of {index} wherever {index} is used, computed at a point
+  // that dominates it. The reducer does not substitute every replacement
+  // (not those of phis and non-null assertions, which the analysis only
+  // uses to find equal objects), and an unreachable struct.set is
+  // "replaced" by itself. Other reducers of the phase rely on this
+  // contract (Wasm bounds check elimination takes a value and its
+  // replacement to be equal): a replacement that is not equal to the
+  // operation, such as a stored value that still needs to be extended,
+  // must not be recorded here.
+  OpIndex Replacement(OpIndex index) const { return replacements_[index]; }
 
  private:
   void ProcessBlock(const Block& block, bool compute_start_snapshot);
@@ -526,6 +536,13 @@ class V8_EXPORT_PRIVATE WasmLoadEliminationReducer : public Next {
       analyzer_.Run();
     }
     Next::Analyze();
+  }
+
+  // Gives other reducers of the same phase access to the replacements
+  // computed by the analysis, once {Analyze} has run.
+  const WasmLoadEliminationAnalyzer* GetWasmLoadEliminationAnalyzer() const {
+    if (!v8_flags.turboshaft_wasm_load_elimination) return nullptr;
+    return &analyzer_;
   }
 
 #if DEBUG
