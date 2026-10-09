@@ -88,7 +88,8 @@ namespace v8::internal::compiler::turboshaft {
 // comes from bounds checks, from conditions {n <= a.length - r} for a
 // constant {n}, and from tests {a.length - r != n} when the length is
 // known to be at least {n + r} (for instance, {a.length != 0} shows that
-// the length is at least 1).
+// the length is at least 1). A constant length is its own minimum
+// length.
 //
 // Signed conditions {base + n <s a.length - r}, as produced by languages
 // with signed integers (Java, Kotlin, Dart...), are taken into account
@@ -121,9 +122,13 @@ namespace v8::internal::compiler::turboshaft {
 // thus grouped by the canonical value of the length (see
 // {CanonicalValue}), which is the same for all the ArrayLength
 // operations of an array, and for arrays that load elimination knows to
-// have the same length, as an array allocated with the length of
-// another one: in {b = new T[a.length]; for (i = 0; i <u a.length; i++)
-// b[i] = a[i];}, the condition covers the accesses to both arrays.
+// have the same length. This is the case for an array allocated with
+// the length of another one: in
+// {b = new T[a.length]; for (i = 0; i < a.length; i++) b[i] = a[i];},
+// the condition covers the accesses to both arrays. A condition
+// {i < n} is also recognized as a bounds check after an allocation of
+// length {n}, as in {b = new T[n]; for (i = 0; i < n; i++) b[i] = ...}.
+//
 // Bases are canonical values too, so that the same value computed twice
 // (as the index of an OCaml bounds check and of the access it protects)
 // is the same base, and nested additions of constants, as produced by
@@ -179,8 +184,9 @@ namespace v8::internal::compiler::turboshaft {
 // does not apply.
 //
 // Facts are recorded at the point where a condition is known to hold:
-// right after a trap, or at the start of a branch target, and at loop
-// headers for facts shown by induction (see {ProcessLoopHeader}). They
+// right after a trap, or at the start of a branch target, at loop
+// headers for facts shown by induction (see {ProcessLoopHeader}), and
+// right after an allocation for its length (see {RecordKnownLength}). They
 // are only used in blocks dominated by that point (see {BeginBlock}),
 // where they still hold (see {CanonicalValue}, and {LengthAliasMap} for
 // length aliases).
@@ -202,6 +208,21 @@ namespace v8::internal::compiler::turboshaft {
 // constants are useful. It keeps the range of offsets from {n} to
 // {n + r} shown by such a condition valid, and {a.length - r} is then
 // negative, as a signed integer, when {a.length < r}.
+//
+// A value {n} is also known to be an array length after an allocation
+// {WasmAllocateArray} of length {n} (as for {array.new} or
+// {array.new_fixed}), which traps when {n} exceeds the maximum length of
+// the array type ([allocation-length]): {n} is then at most
+// {WasmArray::MaxLength}, and so less than 2^30, which is all that the
+// analysis assumes about array lengths. The check is only emitted when
+// the operation is lowered, after this phase, so this relies on the
+// allocation being kept until then, even when its result is unused (a
+// static_assert in {RecordKnownLength} checks that it is required when
+// unused). For the same reason, a constant {c < 2^30} is used as an
+// array length, whose minimum length is {c} ([constant-length]): load
+// elimination replaces the length of an array allocated with a constant
+// length by this constant, which is then the key of its bounds checks
+// (see {LengthKey}).
 
 // Key for grouping bounds checks by base and array length. The length
 // is the canonical value of an array length (see {LengthKey}): a bounds
@@ -288,10 +309,11 @@ class OffsetRange {
       if (second_lower > second_upper) continue;
       uint32_t size = std::max(first->upper_ - first->lower_, second_upper);
       // The hull would span more than 2^31 values, and would not be a
-      // valid range. This cannot happen for two ranges of offsets within the
-      // bounds of the same array length for the same base (as they are
-      // less than 2^30), nor for two ranges of non-negative offsets of the
-      // same base. But it can in unreachable code, where facts may
+      // valid range. This cannot happen for two ranges of offsets within
+      // the bounds of the same array length for the same base (as array
+      // lengths, and constants used as lengths, are less than 2^30, see
+      // [constant-length]), nor for two ranges of non-negative offsets of
+      // the same base. But it can in unreachable code, where facts may
       // contradict each other, so this check is needed.
       if (static_cast<int32_t>(size) < 0) continue;
       if (!result.has_value() || size < result->upper_ - result->lower_) {
@@ -317,10 +339,12 @@ class OffsetRange {
 };
 
 // The correctness of the analysis is supported by the following Z3
-// proofs, which are referred to by their names in brackets. Preceded by
-// the shared definitions below, each one is a complete SMT-LIB query: it
-// asserts some assumptions and the negation of a conclusion, and Z3
-// reports it unsatisfiable (unsat). The shared definitions are:
+// proofs, which are referred to by their names in brackets (except
+// [allocation-length] and [constant-length], which refer to assumptions
+// stated in "Limits" above). Preceded by the shared definitions below,
+// each one is a complete SMT-LIB query: it asserts some assumptions and
+// the negation of a conclusion, and Z3 reports it unsatisfiable (unsat).
+// The shared definitions are:
 //
 //   (define-fun valid-range ((n1 (_ BitVec 32)) (n2 (_ BitVec 32))) Bool
 //     (bvsge (bvsub n2 n1) #x00000000))
@@ -793,7 +817,9 @@ class KeyedSnapshotTable : public SnapshotTable<std::optional<V>> {
 };
 
 // An array length minus a constant, {length - reduction}, where
-// {length} is an ArrayLength operation.
+// {length} is an ArrayLength operation, a value known to be the length
+// of an array (see {IsKnownLength}), or a value equal to a constant
+// below 2^30 (with a reduction of 0).
 struct ReducedLength {
   OpIndex length;
   uint32_t reduction;
@@ -809,7 +835,10 @@ using BoundsCheckMap = KeyedSnapshotTable<BoundsCheckKey, OffsetRange>;
 // known to be non-negative.
 using NonNegativeOffsetMap = KeyedSnapshotTable<OpIndex, OffsetRange>;
 
-// Maps array lengths (by canonical value) to a lower bound.
+// Maps array lengths (by canonical value) to their minimum length. Only
+// array lengths have entries, so that a value with an entry, possibly
+// 0, is known to be an array length, as the length of an allocated
+// array (see {IsKnownLength}).
 using MinLengthMap = KeyedSnapshotTable<OpIndex, uint32_t>;
 
 // Maps values to an array length minus a constant that they are equal
@@ -1047,6 +1076,8 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   void RecordNonNegativeOffset(OpIndex base, uint32_t offset);
   uint32_t MinLength(OpIndex length) const;
   void RecordMinLength(OpIndex length, uint64_t min_length);
+  bool IsKnownLength(OpIndex value) const;
+  void RecordKnownLength(OpIndex value);
 
   std::optional<BoundsCheckCondition> TryExtractBoundsCheckCondition(
       const Relation& relation) const;
@@ -1099,6 +1130,8 @@ class V8_EXPORT_PRIVATE WasmBoundsCheckEliminationAnalyzer {
   // offsets, minimum lengths and length aliases.
   BoundsCheckMap known_bounds_checks_;
   NonNegativeOffsetMap known_non_negative_offsets_;
+  // Also the set of known array lengths: an entry, even 0, shows that its
+  // key is an array length (see {MinLengthMap}).
   MinLengthMap known_min_lengths_;
   LengthAliasMap known_length_aliases_;
   // Whether some length alias has been recorded.
