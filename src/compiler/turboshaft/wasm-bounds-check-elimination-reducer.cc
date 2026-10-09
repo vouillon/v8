@@ -4,6 +4,7 @@
 
 #include "src/compiler/turboshaft/wasm-bounds-check-elimination-reducer.h"
 
+#include "src/compiler/turboshaft/opmasks.h"
 #include "src/wasm/wasm-objects.h"
 
 namespace v8::internal::compiler::turboshaft {
@@ -59,8 +60,10 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
     // When we visit a loop header, its back edge hasn't been visited
     // yet, so we ignore it: what is known at the header is what is
     // known at the end of its forward predecessor. This remains true in
-    // later iterations: these facts were recorded in dominators of the
-    // header, and facts are never propagated along back edges.
+    // later iterations. The leaves of these facts (see {CanonicalValue})
+    // are defined in dominators of the header, and so are not computed
+    // again in the loop, and facts are never propagated along back
+    // edges.
     DCHECK_IMPLIES(!pred_snapshots.has_value(),
                    block->IsLoop() && block->LastPredecessor() == p);
     if (!pred_snapshots.has_value()) {
@@ -80,7 +83,7 @@ void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
   // predecessors, and thus the current block (for a loop header, as it
   // dominates its back edge, any path to it enters it first from its
   // forward predecessor): facts known at the start of a block were
-  // recorded in its dominators (see "General overview" in the header).
+  // recorded in its dominators, as {CanonicalValue} requires.
   known_bounds_checks_.StartNewSnapshot(
       base::VectorOf(predecessor_bounds_check_snapshots_));
   known_non_negative_offsets_.StartNewSnapshot(
@@ -328,7 +331,7 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractBoundsCheckCondition(
   }
   std::optional<ReducedLength> length = TryExtractArrayLength(relation.right);
   if (!length) return std::nullopt;
-  auto [base, offset] = DecomposeIndex(relation.left);
+  auto [base, base_value, offset] = ExtractBaseAndOffset(relation.left);
   return BoundsCheckCondition{
       BoundsCheck(BoundsCheckKey(base, LengthKey(length->length)), offset),
       length->reduction};
@@ -340,21 +343,21 @@ std::optional<ReducedLength>
 WasmBoundsCheckEliminationAnalyzer::TryExtractArrayLength(
     OpIndex length) const {
   BaseAndOffset b = DecomposeIndex(length);
-  if (!b.base.valid() || !graph_.Get(b.base).Is<ArrayLengthOp>()) {
+  if (!b.base_value.valid() || !graph_.Get(b.base_value).Is<ArrayLengthOp>()) {
     return std::nullopt;
   }
   uint32_t reduction = 0u - b.offset;
   // Only small reductions are useful (see "Limits" in the header).
   if (reduction > kMaxReduction) return std::nullopt;
-  return ReducedLength{b.base, reduction};
+  return ReducedLength{b.base_value, reduction};
 }
 
-// The key of the length {length}, an ArrayLength operation: its array,
-// through casts, non-null assertions and replacements by load
-// elimination, so that all the ArrayLength operations of an array have
-// the same key. The length of an array never changes.
+// The key of an array length: its canonical value, which is the same for
+// all the ArrayLength operations of an array, and for the length given
+// to {array.new} when load elimination replaced the length of the new
+// array by it.
 OpIndex WasmBoundsCheckEliminationAnalyzer::LengthKey(OpIndex length) const {
-  return ResolveAliases(graph_.Get(length).Cast<ArrayLengthOp>().array());
+  return CanonicalValue(length);
 }
 
 // Whether {length} is {a.length - r}, with {a.length} known to be at
@@ -387,42 +390,282 @@ WasmBoundsCheckEliminationAnalyzer::TryExtractNonNegativeIndex(
     uint32_t limit = relation.is_strict() ? 1u << 31 : kMaxInt;
     if (*bound > limit) return std::nullopt;
   }
-  BaseAndOffset result = DecomposeIndex(relation.left);
+  BaseAndOffset result = ExtractBaseAndOffset(relation.left);
   if (!result.base.valid()) return std::nullopt;
   return result;
 }
 
-// Decomposes {index} as {base + offset}, where {base} is the operation
-// computing the base, which is also its key.
+// Extract base expression and constant offset from an index expression.
+WasmBoundsCheckEliminationAnalyzer::BaseAndOffset
+WasmBoundsCheckEliminationAnalyzer::ExtractBaseAndOffset(OpIndex index) const {
+  BaseAndOffset result = DecomposeIndex(index);
+  if (result.base_value.valid()) {
+    result.base = CanonicalValue(result.base_value);
+  }
+  return result;
+}
+
+// Decomposes {index} as {base_value + offset}, without computing the
+// canonical value of the base, which is left invalid.
 WasmBoundsCheckEliminationAnalyzer::BaseAndOffset
 WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
-  // An array length is kept as the base, even when load elimination
-  // replaced it (for instance, by the length given to {array.new}), so
-  // that conditions on it are recognized as bounds checks (see
-  // {TryExtractArrayLength}).
-  if (graph_.Get(index).Is<ArrayLengthOp>()) return {index, 0};
-  index = ResolveReplacements(index);
-  // a[n]
-  if (auto constant = TryExtractI32Const(index)) {
-    return {OpIndex::Invalid(), *constant};
-  }
-  // a[base + n] / a[base - n]. We are using modular arithmetic, so a
-  // subtraction can be replaced by the addition of the opposite.
-  if (const WordBinopOp* op = graph_.Get(index).TryCast<WordBinopOp>();
-      op != nullptr && op->rep == WordRepresentation::Word32() &&
-      (op->kind == WordBinopOp::Kind::kAdd ||
-       op->kind == WordBinopOp::Kind::kSub)) {
-    if (std::optional<uint32_t> constant = TryExtractI32Const(op->right())) {
-      OpIndex base = op->left();
-      if (!graph_.Get(base).Is<ArrayLengthOp>()) {
-        base = ResolveReplacements(base);
-      }
-      return {base,
-              op->kind == WordBinopOp::Kind::kAdd ? *constant : -*constant};
+  // Nested additions of constants, as produced for instance by loop
+  // unrolling, are folded into a single offset, so that
+  // {(base + n) + m} and {base + (n + m)} have the same base. We are
+  // using modular arithmetic, so a subtraction can be replaced by the
+  // addition of the opposite. The depth is bounded to keep the cost
+  // linear.
+  static constexpr int kMaxDepth = 8;
+  uint32_t offset = 0;
+  for (int depth = 0;; depth++) {
+    // An array length is kept as the base, even when load elimination
+    // replaced it (for instance, by the length given to {array.new}), so
+    // that conditions on it are recognized as bounds checks (see
+    // {TryExtractArrayLength}). Its canonical value is still the one of
+    // its replacement.
+    if (graph_.Get(index).Is<ArrayLengthOp>()) break;
+    index = ResolveReplacements(index);
+    // a[n]
+    if (auto constant = TryExtractI32Const(index)) {
+      return {OpIndex::Invalid(), OpIndex::Invalid(), offset + *constant};
     }
+    if (depth == kMaxDepth) break;
+    // a[trunc(base64 + n)]: languages with 64-bit integers compute the
+    // index of {a[i + 1]} as {trunc(i + 1)}, which is {trunc(i) + 1}
+    // ([truncated-addition]). The base is then an operation computing
+    // {trunc(i)}, which must already have been seen (as for the index of
+    // a previous access {a[i]}).
+    if (const ChangeOp* truncation =
+            graph_.Get(index).TryCast<Opmask::kTruncateWord64ToWord32>()) {
+      const WordBinopOp* op =
+          graph_.Get(ResolveReplacements(truncation->input()))
+              .TryCast<WordBinopOp>();
+      if (op == nullptr || op->rep != WordRepresentation::Word64() ||
+          (op->kind != WordBinopOp::Kind::kAdd &&
+           op->kind != WordBinopOp::Kind::kSub)) {
+        break;
+      }
+      std::optional<uint32_t> constant = TryExtractI64ConstLow(op->right());
+      if (!constant.has_value()) break;
+      OpIndex base = ExistingTruncation(op->left());
+      if (!base.valid()) break;
+      offset += op->kind == WordBinopOp::Kind::kAdd ? *constant : -*constant;
+      index = base;
+      continue;
+    }
+    // a[base + n] / a[base - n]
+    const WordBinopOp* op = graph_.Get(index).TryCast<WordBinopOp>();
+    if (op == nullptr || op->rep != WordRepresentation::Word32()) break;
+    std::optional<uint32_t> constant = TryExtractI32Const(op->right());
+    if (!constant.has_value()) break;
+    if (op->kind == WordBinopOp::Kind::kAdd) {
+      offset += *constant;
+    } else if (op->kind == WordBinopOp::Kind::kSub) {
+      offset -= *constant;
+    } else {
+      break;
+    }
+    index = op->left();
   }
   // Default: a[base]
-  return {index, 0};
+  return {OpIndex::Invalid(), index, offset};
+}
+
+// Returns a canonical representative of {value}: constants, and
+// operations whose value only depends on their inputs (arithmetic,
+// shifts, conversions, the length of an array, and the bitcast of a
+// Smi) with the same options and inputs with the same canonical values
+// compute the same value, and so have the same canonical value. Value
+// numbering, which runs before this phase, merges most duplicated
+// computations, but not those on values that load elimination finds
+// equal in this phase, nor those on bitcasts of a reference to a heap
+// object, which it never merges (see the TaggedBitcast case below), as
+// for an {i31.get_s} of the same reference done once for an OCaml bounds
+// check and once for the access it protects. Casts, non-null assertions
+// and type annotations return their input, and values replaced by load
+// elimination are the same as their replacement, which dominates them,
+// is equal to them, and is what the output graph computes.
+//
+// Facts about canonical values are sound because a fact recorded at a
+// point {p} is only used at points {q} dominated by {p} (see
+// {BeginBlock}), and none of its leaves (the operations whose canonical
+// value is not structural: phis, loads, parameters...) is defined at a
+// point strictly dominated by {p}: they are defined in dominators of
+// {p}. Such a leaf is then not executed again between the last
+// execution of {p} and {q}: as {p} does not dominate it, there is a path
+// to it that avoids {p}, which, followed by the execution from the leaf
+// to {q}, would reach {q} without going through {p}. By induction on
+// canonical values, a value used at {q} (and so computed in a dominator
+// of {q}) is equal to its canonical value, computed from the current
+// values of its leaves, and so two values used at {q} with the same
+// canonical value are equal. This holds with the representatives of
+// structural keys, and with the depth limit below, whose cut-off values
+// are leaves, computed in dominators of the values that use them. In
+// particular, phis are never looked through.
+OpIndex WasmBoundsCheckEliminationAnalyzer::CanonicalValue(OpIndex value,
+                                                           int depth) const {
+  // Bound the depth of the recursion. Deeper values are their own
+  // canonical value, which is always correct. They are not memoized, so
+  // that they may get another canonical value when reached at a lower
+  // depth: two operations computing the same value may then get
+  // different canonical values, which only loses precision.
+  static constexpr int kMaxDepth = 16;
+  value = ResolveReplacements(value);
+  if (auto it = canonical_values_.find(value); it != canonical_values_.end()) {
+    return it->second;
+  }
+  if (depth == kMaxDepth) return value;
+  const Operation& op = graph_.Get(value);
+  std::optional<StructuralKey> key;
+  switch (op.opcode) {
+    case Opcode::kWasmTypeCast:
+    case Opcode::kAssertNotNull:
+    case Opcode::kWasmTypeAnnotation: {
+      // {ResolveAliases} goes through at least this operation.
+      OpIndex object = ResolveAliases(value);
+      DCHECK_NE(object, value);
+      OpIndex result = CanonicalValue(object, depth + 1);
+      canonical_values_.emplace(value, result);
+      return result;
+    }
+    case Opcode::kConstant: {
+      const ConstantOp& constant = op.Cast<ConstantOp>();
+      if (constant.kind != ConstantOp::Kind::kWord32 &&
+          constant.kind != ConstantOp::Kind::kWord64) {
+        break;
+      }
+      key = StructuralKey{op.opcode, static_cast<uint64_t>(constant.kind),
+                          constant.integral(), OpIndex::Invalid(),
+                          OpIndex::Invalid()};
+      break;
+    }
+    case Opcode::kWordBinop: {
+      const WordBinopOp& binop = op.Cast<WordBinopOp>();
+      OpIndex left = CanonicalValue(binop.left(), depth + 1);
+      OpIndex right = CanonicalValue(binop.right(), depth + 1);
+      // {a + b} and {b + a} compute the same value.
+      if (WordBinopOp::IsCommutative(binop.kind) && right < left) {
+        std::swap(left, right);
+      }
+      key = StructuralKey{op.opcode,
+                          static_cast<uint64_t>(binop.kind) |
+                              static_cast<uint64_t>(binop.rep.value()) << 8,
+                          0, left, right};
+      break;
+    }
+    case Opcode::kShift: {
+      const ShiftOp& shift = op.Cast<ShiftOp>();
+      key = StructuralKey{op.opcode,
+                          static_cast<uint64_t>(shift.kind) |
+                              static_cast<uint64_t>(shift.rep.value()) << 8,
+                          0, CanonicalValue(shift.left(), depth + 1),
+                          CanonicalValue(shift.right(), depth + 1)};
+      break;
+    }
+    case Opcode::kChange: {
+      const ChangeOp& change = op.Cast<ChangeOp>();
+      OpIndex input = CanonicalValue(change.input(), depth + 1);
+      key = StructuralKey{op.opcode, ChangeOptions(change), 0, input,
+                          OpIndex::Invalid()};
+      if (change.Is<Opmask::kTruncateWord64ToWord32>()) {
+        truncations_.emplace(input, value);
+      }
+      break;
+    }
+    case Opcode::kArrayLength:
+      // The length of an array never changes, so the ArrayLength
+      // operations of the same array compute the same value.
+      key = StructuralKey{
+          op.opcode, 0, 0,
+          CanonicalValue(op.Cast<ArrayLengthOp>().array(), depth + 1),
+          OpIndex::Invalid()};
+      break;
+    case Opcode::kTaggedBitcast: {
+      const TaggedBitcastOp& bitcast = op.Cast<TaggedBitcastOp>();
+      // The bitcast of a reference to a heap object is its address, which
+      // a moving GC can change, so two bitcasts of the same reference may
+      // give different values. This is not the case for a Smi, such as a
+      // non-null i31 reference, which {i31.get} converts this way.
+      if (bitcast.from.IsTaggedOrCompressed() &&
+          bitcast.kind != TaggedBitcastOp::Kind::kSmi &&
+          !IsKnownSmi(bitcast.input())) {
+        break;
+      }
+      key = StructuralKey{op.opcode,
+                          static_cast<uint64_t>(bitcast.kind) |
+                              static_cast<uint64_t>(bitcast.from.value()) << 8 |
+                              static_cast<uint64_t>(bitcast.to.value()) << 16,
+                          0, CanonicalValue(bitcast.input(), depth + 1),
+                          OpIndex::Invalid()};
+      break;
+    }
+    default:
+      break;
+  }
+  OpIndex result = value;
+  if (key.has_value()) {
+    result = values_by_structure_.emplace(*key, value).first->second;
+  }
+  canonical_values_.emplace(value, result);
+  return result;
+}
+
+// Whether {object} is known to be a Smi: a non-null i31 reference, as
+// shown by a cast, a type annotation or a null check.
+bool WasmBoundsCheckEliminationAnalyzer::IsKnownSmi(OpIndex object) const {
+  bool non_null = false;
+  while (true) {
+    object = ResolveReplacements(object);
+    const Operation& op = graph_.Get(object);
+    wasm::ValueType type;
+    if (const WasmTypeCastOp* cast = op.TryCast<WasmTypeCastOp>()) {
+      type = cast->config.to;
+      object = cast->object();
+    } else if (const AssertNotNullOp* check = op.TryCast<AssertNotNullOp>()) {
+      type = check->type;
+      non_null = true;
+      object = check->object();
+    } else if (const WasmTypeAnnotationOp* annotation =
+                   op.TryCast<WasmTypeAnnotationOp>()) {
+      type = annotation->type;
+      object = annotation->value();
+    } else {
+      return false;
+    }
+    if (type.is_reference_to(wasm::GenericKind::kI31) &&
+        (non_null || type.is_non_nullable())) {
+      return true;
+    }
+  }
+}
+
+// The options of a Change, in the structural key of its canonical value.
+uint64_t WasmBoundsCheckEliminationAnalyzer::ChangeOptions(
+    const ChangeOp& change) {
+  return static_cast<uint64_t>(change.kind) |
+         static_cast<uint64_t>(change.assumption) << 8 |
+         static_cast<uint64_t>(change.from.value()) << 16 |
+         static_cast<uint64_t>(change.to.value()) << 24;
+}
+
+// A TruncateWord64ToWord32 operation of {x} (or of a value with the same
+// canonical value), if one has been seen already (see {CanonicalValue}).
+// All the truncations of {x} have the same canonical value (up to the
+// depth limit of {CanonicalValue}, which only loses precision).
+OpIndex WasmBoundsCheckEliminationAnalyzer::ExistingTruncation(
+    OpIndex x) const {
+  auto it = truncations_.find(CanonicalValue(x));
+  return it == truncations_.end() ? OpIndex::Invalid() : it->second;
+}
+
+// The low 32 bits of a 64-bit constant.
+std::optional<uint32_t>
+WasmBoundsCheckEliminationAnalyzer::TryExtractI64ConstLow(OpIndex expr) const {
+  if (const ConstantOp* constant = graph_.Get(expr).TryCast<ConstantOp>();
+      constant && constant->kind == ConstantOp::Kind::kWord64) {
+    return static_cast<uint32_t>(constant->integral());
+  }
+  return std::nullopt;
 }
 
 std::optional<uint32_t> WasmBoundsCheckEliminationAnalyzer::TryExtractI32Const(
