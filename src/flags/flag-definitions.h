@@ -1674,6 +1674,15 @@ DEFINE_BOOL(turboshaft_enable_debug_features, false,
 DEFINE_BOOL(turboshaft_wasm_load_elimination, true,
             "enable Turboshaft's WasmLoadElimination")
 
+DEFINE_EXPERIMENTAL_FEATURE(turboshaft_wasm_bounds_check_elimination,
+                            "enable Turboshaft's WasmBoundsCheckElimination")
+DEFINE_WEAK_IMPLICATION(experimental_fuzzing,
+                        turboshaft_wasm_bounds_check_elimination)
+DEFINE_BOOL(turboshaft_verify_wasm_bounds_check_elimination, false,
+            "insert runtime checks to verify WasmBoundsCheckElimination")
+DEFINE_WEAK_IMPLICATION(experimental_fuzzing,
+                        turboshaft_verify_wasm_bounds_check_elimination)
+
 DEFINE_BOOL(
     wasm_in_js_inlining_body, true,
     "inline Wasm code into JS functions via Turboshaft. This requires "
@@ -1811,6 +1820,8 @@ DEFINE_DEVELOPER_FLAG(turboshaft_trace_store_store_elimination,
 DEFINE_DEVELOPER_FLAG(turboshaft_trace_if_else_to_switch,
                       "trace Turboshaft's if-else to switch reducer")
 DEFINE_DEVELOPER_FLAG(turboshaft_trace_gvn, "trace Turboshaft's GVN reducer")
+DEFINE_DEVELOPER_FLAG(turboshaft_trace_wasm_bounds_check_elimination,
+                      "trace Turboshaft's WasmBoundsCheckElimination")
 
 DEFINE_DEVELOPER_FLAG(
     trace_turbolev_graph_building,

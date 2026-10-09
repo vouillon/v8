@@ -1225,6 +1225,11 @@ void EnableExperimentalWasmFeatures(v8::Isolate* isolate) {
       // fuzzing, the JS-related part (prototypes etc) not yet.
       v8_flags.wasm_custom_descriptors = true;
 
+      // Fuzz bounds check elimination for Wasm GC arrays, with its verifier,
+      // which turns a wrong elimination into an abort.
+      v8_flags.turboshaft_wasm_bounds_check_elimination = true;
+      v8_flags.turboshaft_verify_wasm_bounds_check_elimination = true;
+
 #ifdef V8_ENABLE_WASM_SIMD256_REVEC
       // Fuzz revectorization, which is otherwise still considered experimental.
       v8_flags.wasm_revectorize = true;
