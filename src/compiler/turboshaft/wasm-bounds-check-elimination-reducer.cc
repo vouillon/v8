@@ -45,8 +45,8 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessTrapIf(
 
   // Past the trap, the condition holds if the trap is negated, and
   // does not hold otherwise.
-  ProcessComparison(is_bounds_check ? op_idx : OpIndex::Invalid(),
-                    trap_if.condition(), trap_if.negated);
+  ProcessCondition(is_bounds_check ? op_idx : OpIndex::Invalid(),
+                   trap_if.condition(), trap_if.negated);
 }
 
 void WasmBoundsCheckEliminationAnalyzer::BeginBlock(const Block* block) {
@@ -115,28 +115,64 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBranch(const Block* block) {
 
   TRACE("ProcessBranch (" << block->index() << ")");
 
-  ProcessComparison(/*Not a TrapIf*/ OpIndex::Invalid(), branch->condition(),
-                    block == branch->if_true);
+  ProcessCondition(/*Not a TrapIf*/ OpIndex::Invalid(), branch->condition(),
+                   block == branch->if_true);
 }
 
 // Records what we learn from {condition}, which holds if {holds}, and
 // does not hold otherwise. For an array bounds check trap, {trap_if} is
 // the trap. For a branch or another trap, it is OpIndex::Invalid().
+void WasmBoundsCheckEliminationAnalyzer::ProcessCondition(OpIndex trap_if,
+                                                          OpIndex condition,
+                                                          bool holds) {
+  ForEachCondition(condition, holds, [&](OpIndex part, bool part_holds) {
+    // Only a trap whose condition is a single comparison can be
+    // eliminated.
+    ProcessComparison(part == condition ? trap_if : OpIndex::Invalid(), part,
+                      part_holds);
+  });
+}
+
 void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
                                                            OpIndex condition,
                                                            bool holds) {
   std::optional<Relation> relation = Normalize(condition, holds);
-  if (!relation.has_value() || relation->is_signed()) return;
+  if (!relation.has_value()) {
+    // A value that holds is not 0, for instance an array length tested
+    // directly, or with {eqz}.
+    if (holds) {
+      if (auto length = TryExtractArrayLength(condition)) {
+        ProcessNotEqualToConstant(*length, 0);
+      }
+    }
+    return;
+  }
+  if (relation->not_equal) {
+    ProcessNotEqual(*relation);
+    return;
+  }
   if (auto decoded = TryExtractBoundsCheckCondition(*relation)) {
-    const auto& [bounds_check, reduction] = *decoded;
+    const auto& [bounds_check, reduction, is_signed] = *decoded;
     const auto& [key, offset] = bounds_check;
-    // Unless the length is known to be at least {r}, {a.length - r} may
+    // A signed comparison {x + n < a.length - r}, where {x + n} is known
+    // to be non-negative, shows that {a.length - r} is positive, and so
+    // that it does not wrap around, and that {x + n < a.length - r} as
+    // unsigned integers ([signed-check]). For an unsigned comparison,
+    // unless the length is known to be at least {r}, {a.length - r} may
     // wrap around, and we learn nothing.
-    if (reduction == 0 || MinLength(key.length) >= reduction) {
-      // Only a comparison with the length itself is an actual bounds
-      // check, which can be eliminated. Other conditions are only used
-      // for what they show, even for a trap.
-      ProcessBoundsCheck(reduction == 0 ? trap_if : OpIndex::Invalid(),
+    if (is_signed ? IsKnownNonNegative(key, offset)
+                  : reduction == 0 || MinLength(key.length) >= reduction) {
+      if (is_signed) TRACE("  Signed bounds check");
+      // Only an unsigned comparison with the length itself is an actual
+      // bounds check, which can be eliminated. Other conditions,
+      // including non-strict comparisons rewritten as strict ones (see
+      // {TryExtractBoundsCheckCondition}), are only used for what they
+      // show, even for a trap.
+      // Nor is a narrowed 64-bit comparison, which also fails when
+      // its 64-bit index is 2^32 or more.
+      bool is_bounds_check = relation->is_strict() && !is_signed &&
+                             reduction == 0 && !relation->narrowed;
+      ProcessBoundsCheck(is_bounds_check ? trap_if : OpIndex::Invalid(),
                          bounds_check, reduction);
       // With {index < a.length - reduction}, the length is at least
       // {reduction + 1}, and more for a constant index
@@ -153,6 +189,46 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessComparison(OpIndex trap_if,
     RecordNonNegativeOffset(non_negative_index->base,
                             non_negative_index->offset);
   }
+}
+
+// {x + k != a.length - r}: if {x + k + r - 1} is known to be within
+// bounds, then so is {x + k + r} ([not-equal-length]).
+void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqual(
+    const Relation& relation) {
+  for (auto [index, length] : {std::pair{relation.left, relation.right},
+                               std::pair{relation.right, relation.left}}) {
+    std::optional<ReducedLength> array_length = TryExtractArrayLength(length);
+    if (!array_length) continue;
+    auto [base, base_value, offset] = ExtractBaseAndOffset(index);
+    if (!base.valid()) {
+      ProcessNotEqualToConstant(*array_length, offset);
+      return;
+    }
+    BoundsCheckKey key(base, LengthKey(array_length->length));
+    uint32_t last = offset + array_length->reduction - 1;
+    std::optional<OffsetRange> known =
+        KnownOffsets(key, NonNegativeOffsets(base));
+    if (!known.has_value() || !known->Contains(last) ||
+        known->Contains(last + 1)) {
+      continue;
+    }
+    TRACE("  Not equal to the array length");
+    ProcessBoundsCheck(OpIndex::Invalid(), BoundsCheck(key, last + 1), 0);
+    return;
+  }
+}
+
+// {a.length - r != n} for a constant {n}: if {a.length} is known to be
+// at least {n + r}, it is at least {n + r + 1} ([not-equal-min-length]).
+// This is [not-equal-length] for a constant index, whose known offsets
+// are those below the min length (see {KnownOffsets}).
+void WasmBoundsCheckEliminationAnalyzer::ProcessNotEqualToConstant(
+    const ReducedLength& length, uint32_t n) {
+  OpIndex length_key = LengthKey(length.length);
+  uint64_t excluded = uint64_t{n} + length.reduction;
+  if (excluded != MinLength(length_key)) return;
+  TRACE("  Not equal to the min length");
+  RecordMinLength(length_key, excluded + 1);
 }
 
 void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
@@ -210,38 +286,95 @@ void WasmBoundsCheckEliminationAnalyzer::ProcessBoundsCheck(
   known_bounds_checks_.Set(key, *offsets);
 }
 
+template <typename F>
+void WasmBoundsCheckEliminationAnalyzer::ForEachCondition(OpIndex condition,
+                                                          bool holds,
+                                                          const F& f,
+                                                          int depth) const {
+  // {a | b} does not hold (is 0) when neither {a} nor {b} holds,
+  // {a & b} only holds (is not 0) when both {a} and {b} hold, and
+  // {a == 0} holds when {a} does not.
+  static constexpr int kMaxDepth = 4;
+  if (depth < kMaxDepth) {
+    const Operation& op = graph_.Get(condition);
+    if (const WordBinopOp* binop = op.TryCast<WordBinopOp>();
+        binop && binop->rep == WordRepresentation::Word32()) {
+      if (binop->kind == WordBinopOp::Kind::kBitwiseOr && !holds) {
+        ForEachCondition(binop->left(), false, f, depth + 1);
+        ForEachCondition(binop->right(), false, f, depth + 1);
+        return;
+      }
+      if (binop->kind == WordBinopOp::Kind::kBitwiseAnd && holds) {
+        ForEachCondition(binop->left(), true, f, depth + 1);
+        ForEachCondition(binop->right(), true, f, depth + 1);
+        return;
+      }
+    }
+    if (const ComparisonOp* comparison = op.TryCast<ComparisonOp>();
+        comparison && comparison->rep == RegisterRepresentation::Word32() &&
+        comparison->kind == ComparisonOp::Kind::kEqual) {
+      if (auto constant = TryExtractI32Const(comparison->right());
+          constant.has_value() && *constant == 0) {
+        ForEachCondition(comparison->left(), !holds, f, depth + 1);
+        return;
+      }
+    }
+  }
+  f(condition, holds);
+}
+
 std::optional<WasmBoundsCheckEliminationAnalyzer::Relation>
 WasmBoundsCheckEliminationAnalyzer::Normalize(OpIndex condition,
                                               bool holds) const {
   using Kind = ComparisonOp::Kind;
   const ComparisonOp* comparison =
       graph_.Get(condition).TryCast<ComparisonOp>();
-  if (!comparison || comparison->rep != RegisterRepresentation::Word32()) {
+  if (!comparison || (comparison->rep != RegisterRepresentation::Word32() &&
+                      comparison->rep != RegisterRepresentation::Word64())) {
     return std::nullopt;
   }
-  // Equality tests show nothing about bounds.
-  if (comparison->kind == Kind::kEqual) return std::nullopt;
-  if (holds) {
-    return Relation{comparison->kind, comparison->left(), comparison->right()};
+  Relation relation{comparison->kind, /*not_equal=*/false, comparison->left(),
+                    comparison->right()};
+  if (!holds) {
+    switch (comparison->kind) {
+      case Kind::kEqual:
+        relation.not_equal = true;
+        break;
+      // !(a < b) is (b <= a), and !(a <= b) is (b < a).
+      case Kind::kSignedLessThan:
+        relation = Relation{Kind::kSignedLessThanOrEqual, /*not_equal=*/false,
+                            comparison->right(), comparison->left()};
+        break;
+      case Kind::kSignedLessThanOrEqual:
+        relation = Relation{Kind::kSignedLessThan, /*not_equal=*/false,
+                            comparison->right(), comparison->left()};
+        break;
+      case Kind::kUnsignedLessThan:
+        relation = Relation{Kind::kUnsignedLessThanOrEqual, /*not_equal=*/false,
+                            comparison->right(), comparison->left()};
+        break;
+      case Kind::kUnsignedLessThanOrEqual:
+        relation = Relation{Kind::kUnsignedLessThan, /*not_equal=*/false,
+                            comparison->right(), comparison->left()};
+        break;
+    }
   }
-  switch (comparison->kind) {
-    case Kind::kEqual:
-      UNREACHABLE();
-    // !(a < b) is (b <= a), and !(a <= b) is (b < a).
-    case Kind::kSignedLessThan:
-      return Relation{Kind::kSignedLessThanOrEqual, comparison->right(),
-                      comparison->left()};
-    case Kind::kSignedLessThanOrEqual:
-      return Relation{Kind::kSignedLessThan, comparison->right(),
-                      comparison->left()};
-    case Kind::kUnsignedLessThan:
-      return Relation{Kind::kUnsignedLessThanOrEqual, comparison->right(),
-                      comparison->left()};
-    case Kind::kUnsignedLessThanOrEqual:
-      return Relation{Kind::kUnsignedLessThan, comparison->right(),
-                      comparison->left()};
+  if (comparison->rep == RegisterRepresentation::Word32()) return relation;
+  // A 64-bit comparison {X < zext(y)} or {X <= zext(y)} (unsigned) shows
+  // that {X} is less than 2^32, and is then the same as the comparison of
+  // {trunc(X)} with {y} ([narrowed-comparison]). This must be done on the
+  // normalized relation: when {X < zext(y)} does not hold, {zext(y) <= X}
+  // says nothing about {trunc(X)}. The left side remains {X}, which is
+  // read as its truncation (see {DecomposeIndex}).
+  if (relation.kind != Kind::kUnsignedLessThan &&
+      relation.kind != Kind::kUnsignedLessThanOrEqual) {
+    return std::nullopt;
   }
-  UNREACHABLE();
+  const ChangeOp* zext = graph_.Get(ResolveReplacements(relation.right))
+                             .TryCast<Opmask::kChangeUint32ToUint64>();
+  if (zext == nullptr) return std::nullopt;
+  return Relation{relation.kind, /*not_equal=*/false, relation.left,
+                  zext->input(), /*narrowed=*/true};
 }
 
 // If {base + n} is known to be non-negative for some {n} below
@@ -291,6 +424,19 @@ WasmBoundsCheckEliminationAnalyzer::NonNegativeOffsets(OpIndex base) const {
   return known_non_negative_offsets_.Get(base);
 }
 
+// Whether {key.base + offset} is known to be non-negative.
+bool WasmBoundsCheckEliminationAnalyzer::IsKnownNonNegative(
+    const BoundsCheckKey& key, uint32_t offset) const {
+  std::optional<OffsetRange> non_negative = NonNegativeOffsets(key.base);
+  if (non_negative.has_value() && non_negative->Contains(offset)) return true;
+  if (!key.base.valid()) return false;
+  // If {base + m} is within the bounds of an array, {base + m + d} is
+  // non-negative for {0 <= d <= kMaxArrayLength}
+  // ([non-negative-near-bounds]).
+  std::optional<OffsetRange> known = known_bounds_checks_.Get(key);
+  return known.has_value() && offset - known->upper() <= kMaxArrayLength;
+}
+
 void WasmBoundsCheckEliminationAnalyzer::RecordNonNegativeOffset(
     OpIndex base, uint32_t offset) {
   std::optional<OffsetRange> known = known_non_negative_offsets_.Get(base);
@@ -321,20 +467,38 @@ void WasmBoundsCheckEliminationAnalyzer::RecordMinLength(OpIndex length,
 }
 
 // Attempts to decode a bounds check condition of the form:
-//     n <u a.length - r   or   base + n <u a.length - r
-// where {r} is a constant (usually 0).
+//     n < a.length - r   or   base + n < a.length - r
+// (signed or unsigned), where {r} is a constant (usually 0). A
+// non-strict comparison {x <= a.length - r} is rewritten as
+// {x < a.length - (r - 1)} when {r >= 1}, provided that {a.length - r}
+// does not wrap around (which is always the case for a signed
+// comparison), and {n <= a.length - r} as {n - 1 < a.length - r} for a
+// constant {n >= 1} ([non-strict-length], [non-strict-constant]).
 std::optional<WasmBoundsCheckEliminationAnalyzer::BoundsCheckCondition>
 WasmBoundsCheckEliminationAnalyzer::TryExtractBoundsCheckCondition(
     const Relation& relation) const {
-  if (relation.kind != ComparisonOp::Kind::kUnsignedLessThan) {
-    return std::nullopt;
-  }
+  if (relation.kind == ComparisonOp::Kind::kEqual) return std::nullopt;
   std::optional<ReducedLength> length = TryExtractArrayLength(relation.right);
   if (!length) return std::nullopt;
-  auto [base, base_value, offset] = ExtractBaseAndOffset(relation.left);
+  OpIndex length_key = LengthKey(length->length);
+  auto [base, base_value, offset] =
+      ExtractBaseAndOffset(relation.left, relation.narrowed);
+  uint32_t reduction = length->reduction;
+  if (!relation.is_strict()) {
+    if (reduction >= 1 &&
+        (relation.is_signed() || MinLength(length_key) >= reduction)) {
+      reduction--;
+    } else if (!base.valid() &&
+               (relation.is_signed() ? static_cast<int32_t>(offset) >= 1
+                                     : offset >= 1)) {
+      offset--;
+    } else {
+      return std::nullopt;
+    }
+  }
   return BoundsCheckCondition{
-      BoundsCheck(BoundsCheckKey(base, LengthKey(length->length)), offset),
-      length->reduction};
+      BoundsCheck(BoundsCheckKey(base, length_key), offset), reduction,
+      relation.is_signed()};
 }
 
 // Recognizes {a.length - r} for a small constant {r} (possibly written
@@ -376,30 +540,58 @@ bool WasmBoundsCheckEliminationAnalyzer::IsArrayLengthWithoutWrapAround(
 //     base + n < b    or   base + n <= b   (unsigned)
 // where {b} is an array length (possibly minus a constant, if the
 // length is known to be at least that constant), or a small enough
-// constant.
+// constant, or
+//     c < base + n    or   c <= base + n   (signed)
+// where {c} is a large enough constant.
 std::optional<WasmBoundsCheckEliminationAnalyzer::BaseAndOffset>
 WasmBoundsCheckEliminationAnalyzer::TryExtractNonNegativeIndex(
     const Relation& relation) const {
-  DCHECK(!relation.is_signed());
-  // The index is at most {b}, which must be less than 2^31, or at most
-  // {b - 1} for a strict comparison. Array lengths are less than 2^31,
-  // and so are reduced array lengths that do not wrap around.
-  if (!IsArrayLengthWithoutWrapAround(relation.right)) {
-    std::optional<uint32_t> bound = TryExtractI32Const(relation.right);
-    if (!bound.has_value()) return std::nullopt;
-    uint32_t limit = relation.is_strict() ? 1u << 31 : kMaxInt;
-    if (*bound > limit) return std::nullopt;
+  using Kind = ComparisonOp::Kind;
+  OpIndex index;
+  switch (relation.kind) {
+    case Kind::kEqual:
+      return std::nullopt;
+    case Kind::kUnsignedLessThan:
+    case Kind::kUnsignedLessThanOrEqual: {
+      // The index is at most {b}, which must be less than 2^31, or at
+      // most {b - 1} for a strict comparison. Array lengths are less
+      // than 2^31, and so are reduced array lengths that do not wrap
+      // around.
+      if (!IsArrayLengthWithoutWrapAround(relation.right)) {
+        std::optional<uint32_t> bound = TryExtractI32Const(relation.right);
+        if (!bound.has_value()) return std::nullopt;
+        uint32_t limit = relation.is_strict() ? 1u << 31 : kMaxInt;
+        if (*bound > limit) return std::nullopt;
+      }
+      index = relation.left;
+      break;
+    }
+    case Kind::kSignedLessThan:
+    case Kind::kSignedLessThanOrEqual: {
+      // The index is at least {c + 1}, respectively {c}, which must be
+      // non-negative.
+      std::optional<uint32_t> bound = TryExtractI32Const(relation.left);
+      if (!bound.has_value()) return std::nullopt;
+      int32_t limit = relation.is_strict() ? -1 : 0;
+      if (static_cast<int32_t>(*bound) < limit) return std::nullopt;
+      index = relation.right;
+      break;
+    }
   }
-  BaseAndOffset result = ExtractBaseAndOffset(relation.left);
+
+  // Only the left side of a narrowed relation is a 64-bit value.
+  BaseAndOffset result = ExtractBaseAndOffset(index, relation.narrowed);
   if (!result.base.valid()) return std::nullopt;
   return result;
 }
 
-// Extracts the base and the constant offset of an index expression; the
-// base is the canonical value of the decomposed base.
+// Extracts the base and the constant offset of an index expression (a
+// 64-bit value if {wide}, see {DecomposeIndex}); the base is the
+// canonical value of the decomposed base.
 WasmBoundsCheckEliminationAnalyzer::BaseAndOffset
-WasmBoundsCheckEliminationAnalyzer::ExtractBaseAndOffset(OpIndex index) const {
-  BaseAndOffset result = DecomposeIndex(index);
+WasmBoundsCheckEliminationAnalyzer::ExtractBaseAndOffset(OpIndex index,
+                                                         bool wide) const {
+  BaseAndOffset result = DecomposeIndex(index, wide);
   if (result.base_value.valid()) {
     result.base = CanonicalValue(result.base_value);
   }
@@ -407,9 +599,15 @@ WasmBoundsCheckEliminationAnalyzer::ExtractBaseAndOffset(OpIndex index) const {
 }
 
 // Decomposes {index} as {base_value + offset}, without computing the
-// canonical value of the base, which is left invalid.
+// canonical value of the base, which is left invalid. {index} is a 64-bit
+// value if {wide} (the left side of a narrowed relation), and a 32-bit
+// value otherwise. In wide mode, {base_value} is already a canonical
+// value (see {TruncationKey}).
 WasmBoundsCheckEliminationAnalyzer::BaseAndOffset
-WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
+WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index,
+                                                   bool wide) const {
+  DCHECK_IMPLIES(wide, graph_.Get(index).outputs_rep() ==
+                           base::VectorOf({RegisterRepresentation::Word64()}));
   // Nested additions of constants, as produced for instance by loop
   // unrolling, are folded into a single offset, so that
   // {(base + n) + m} and {base + (n + m)} have the same base. We are
@@ -426,9 +624,46 @@ WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
     // its replacement.
     if (graph_.Get(index).Is<ArrayLengthOp>()) break;
     index = ResolveReplacements(index);
+    // Only the left side of a narrowed relation, and the 64-bit values it
+    // is computed from, are 64-bit values.
+    DCHECK_IMPLIES(!wide,
+                   graph_.Get(index).outputs_rep() !=
+                       base::VectorOf({RegisterRepresentation::Word64()}));
     // a[n]
     if (auto constant = TryExtractI32Const(index)) {
       return {OpIndex::Invalid(), OpIndex::Invalid(), offset + *constant};
+    }
+    // A 64-bit value {X} ({wide}), the left side of a narrowed comparison
+    // (see {Normalize}), is read as its truncation to 32 bits: {trunc(n)} for
+    // a constant {n}, {x} for {zext(x)} or {sext(x)}
+    // ([narrowed-comparison]), {trunc(Y) + n} for {Y + n}
+    // ([truncated-addition]), and otherwise a value whose canonical value
+    // is the one of {trunc(X)} (see {TruncationKey}).
+    if (wide) {
+      const Operation& op = graph_.Get(index);
+      if (auto constant = TryExtractI64ConstLow(index)) {
+        return {OpIndex::Invalid(), OpIndex::Invalid(), offset + *constant};
+      }
+      if (depth < kMaxDecompositionDepth) {
+        if (const ChangeOp* change = op.TryCast<ChangeOp>();
+            change && (change->Is<Opmask::kChangeUint32ToUint64>() ||
+                       change->Is<Opmask::kChangeInt32ToInt64>())) {
+          index = change->input();
+          wide = false;
+          continue;
+        }
+        if (const WordBinopOp* binop = op.TryCast<WordBinopOp>();
+            binop && (binop->kind == WordBinopOp::Kind::kAdd ||
+                      binop->kind == WordBinopOp::Kind::kSub)) {
+          if (auto constant = TryExtractI64ConstLow(binop->right())) {
+            offset +=
+                binop->kind == WordBinopOp::Kind::kAdd ? *constant : -*constant;
+            index = binop->left();
+            continue;
+          }
+        }
+      }
+      return {OpIndex::Invalid(), TruncationKey(index), offset};
     }
     if (depth == kMaxDecompositionDepth) break;
     // a[trunc(base64 + n)]: languages with 64-bit integers compute the
@@ -504,7 +739,15 @@ WasmBoundsCheckEliminationAnalyzer::DecomposeIndex(OpIndex index) const {
 // canonical value are equal. This holds with the representatives of
 // structural keys, and with the depth limit below, whose cut-off values
 // are leaves, computed in dominators of the values that use them. The
-// base of a truncated addition found by {ExistingTruncation} (see
+// canonical value of a truncation {trunc(X)} to 32 bits may instead be
+// the canonical value of its 64-bit input {X} (see {TruncationKey}): the
+// truncation is then equal to the truncation of its canonical value,
+// which is enough, as the options of structural keys include the
+// representations of their inputs, so that no other 32-bit value, and no
+// operation not using a truncation of {X}, has the same canonical value
+// as one using it.
+//
+// The base of a truncated addition found by {ExistingTruncation} (see
 // {DecomposeIndex}), which may be computed in another branch, is only
 // used through its canonical value, the truncation of the canonical
 // value of the index's input: its leaves are those of that input. Phis
@@ -653,10 +896,39 @@ bool WasmBoundsCheckEliminationAnalyzer::IsKnownSmi(OpIndex object) const {
 // The options of a Change, in the structural key of its canonical value.
 uint64_t WasmBoundsCheckEliminationAnalyzer::ChangeOptions(
     const ChangeOp& change) {
-  return static_cast<uint64_t>(change.kind) |
-         static_cast<uint64_t>(change.assumption) << 8 |
-         static_cast<uint64_t>(change.from.value()) << 16 |
-         static_cast<uint64_t>(change.to.value()) << 24;
+  return ChangeOptions(change.kind, change.assumption, change.from, change.to);
+}
+
+uint64_t WasmBoundsCheckEliminationAnalyzer::ChangeOptions(
+    ChangeOp::Kind kind, ChangeOp::Assumption assumption,
+    RegisterRepresentation from, RegisterRepresentation to) {
+  return static_cast<uint64_t>(kind) | static_cast<uint64_t>(assumption) << 8 |
+         static_cast<uint64_t>(from.value()) << 16 |
+         static_cast<uint64_t>(to.value()) << 24;
+}
+
+// A value whose canonical value is the one of the truncation to 32 bits
+// of the 64-bit value {x}. This is the first TruncateWord64ToWord32
+// operation of {x} found (see {CanonicalValue}), if any. Otherwise, the
+// canonical value of {x} becomes the canonical value of its truncation.
+// This 64-bit operation is only used to compare canonical values: as
+// the options of the structural keys include the representations of the
+// inputs, no 32-bit value other than a truncation of {x} has the same
+// canonical value, and no operation has the same canonical value as an
+// operation where {trunc(x)} replaces {x}. It is never used as a 32-bit
+// value: {ExistingTruncation}, which finds the bases of 32-bit indices,
+// only returns actual truncations.
+OpIndex WasmBoundsCheckEliminationAnalyzer::TruncationKey(OpIndex x) const {
+  OpIndex canonical = CanonicalValue(x);
+  return values_by_structure_
+      .emplace(StructuralKey{Opcode::kChange,
+                             ChangeOptions(ChangeOp::Kind::kTruncate,
+                                           ChangeOp::Assumption::kNoAssumption,
+                                           RegisterRepresentation::Word64(),
+                                           RegisterRepresentation::Word32()),
+                             0, canonical, OpIndex::Invalid()},
+               canonical)
+      .first->second;
 }
 
 // A TruncateWord64ToWord32 operation of {x} (or of a value with the same
